@@ -39,16 +39,18 @@ class ExecuteRunRequest(BaseModel):
 
     The plan supplies ``target_url``, scope, and credentials. The executor
     walks the plan's TC tree, running every step where ``selectable_default``
-    is True and no ancestor was deselected.
+    is True (or every id in ``selected_step_ids`` if that override is set).
 
-    ``selected_step_ids`` overrides the ``selectable_default`` semantics — if
-    provided, exactly those step ids are run (modulo the ancestor cut). The
-    UI uses this for "re-run failed steps" without flipping every checkbox.
+    ``speed`` controls pacing — slow_mo, cursor glide steps, per-character
+    type delay, network-idle wait timeout, and auto-retry count. Default
+    ``"slow"`` because heavy-data sites need the longer settle window;
+    ``"fast"`` skips the visible-typing animation and shortens timeouts.
     """
 
     plan_id: int = Field(..., gt=0)
     selected_step_ids: list[int] | None = Field(default=None, min_length=1)
     headless: bool = Field(default=False)
+    speed: Literal["slow", "normal", "fast"] = Field(default="slow")
 
 
 # ── Responses ─────────────────────────────────────────────────────

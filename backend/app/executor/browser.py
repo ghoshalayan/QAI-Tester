@@ -37,6 +37,8 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from app.executor.pacing import Speed, get_speed_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +78,7 @@ def chromium_installed() -> bool:
 def browser_session(
     *,
     headless: bool = False,
+    speed: Speed | str | None = None,
     viewport_width: int = DEFAULT_VIEWPORT_WIDTH,
     viewport_height: int = DEFAULT_VIEWPORT_HEIGHT,
     locale: str = DEFAULT_LOCALE,
@@ -85,8 +88,10 @@ def browser_session(
 
     Args:
         headless: Run without a visible window. Default False — week 5 ships
-            with the window visible so the user can see what's happening
-            (HITL in week 6 needs this anyway).
+            with the window visible so the user can see what's happening.
+        speed: Speed preset name (``"slow"``/``"normal"``/``"fast"``) or
+            None for the default (slow). Maps to Playwright's ``slow_mo``
+            launch argument so every click/type/navigation is paced.
         viewport_width / viewport_height: Browser viewport in CSS pixels.
         locale: BCP-47 locale, used for ``Accept-Language`` and JS ``navigator.language``.
         default_timeout_ms: Default timeout for selectors / actions on the
@@ -97,6 +102,7 @@ def browser_session(
         RuntimeError: For any other Playwright launch failure (e.g. permission
             issues, port conflicts).
     """
+    config = get_speed_config(speed)
     pw: Playwright | None = None
     browser: Browser | None = None
     context: BrowserContext | None = None
@@ -107,7 +113,10 @@ def browser_session(
             raise RuntimeError(f"Failed to start Playwright: {e}") from e
 
         try:
-            browser = pw.chromium.launch(headless=headless)
+            browser = pw.chromium.launch(
+                headless=headless,
+                slow_mo=config.slow_mo_ms,
+            )
         except Exception as e:
             msg = str(e).lower()
             if (

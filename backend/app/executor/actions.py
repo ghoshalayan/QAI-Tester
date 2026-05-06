@@ -26,7 +26,9 @@ from typing import Any, Literal
 
 from playwright.sync_api import Page
 
-from app.executor.selectors import SelectorNotFound, resolve
+from app.executor.overlay import highlight_target
+from app.executor.pacing import SLOW, SpeedConfig
+from app.executor.selectors import ResolvedTarget, SelectorNotFound, resolve
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,12 @@ class ActionContext:
 
     The orchestrator builds this from the step's tc_node + the plan's
     target_url before calling :func:`execute_action`.
+
+    ``speed_config`` controls the pacing handlers apply: cursor glide
+    interpolation steps for clicks, per-character typing delay, and the
+    network-idle wait timeout used by the orchestrator before each action.
+    Defaults to :data:`SLOW` so callers that don't pass one (e.g. unit
+    tests, dispatcher smoke calls) get the safest behavior.
     """
 
     plan_target_url: str
@@ -76,6 +84,7 @@ class ActionContext:
     narrative: str | None
     expected: str | None
     data_needs: list[dict[str, Any]]
+    speed_config: SpeedConfig = SLOW
 
 
 @dataclass
@@ -89,6 +98,30 @@ class ActionResult:
 
 
 # ── Helpers ───────────────────────────────────────────────────────
+
+
+def _glide_cursor(page: Page, target: ResolvedTarget, config: SpeedConfig) -> None:
+    """Animate the visible cursor to the target's center.
+
+    Calls ``page.mouse.move(x, y, steps=N)`` which dispatches synthesized
+    ``mousemove`` events along the interpolated path — the on-page overlay
+    cursor (installed in ``app.executor.overlay``) listens to these and
+    visibly travels rather than teleporting on the next action.
+
+    Errors are swallowed: a missing bounding box (off-screen / display:none)
+    or a closed page must not derail the action call that follows.
+    """
+    if config.mouse_steps <= 0:
+        return
+    try:
+        box = target.locator.bounding_box()
+        if not box:
+            return
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        page.mouse.move(cx, cy, steps=config.mouse_steps)
+    except Exception as e:
+        logger.debug("cursor glide suppressed: %s: %s", type(e).__name__, e)
 
 
 def _check_data_block(ctx: ActionContext) -> ActionResult | None:
@@ -209,6 +242,7 @@ def _do_click(page: Page, ctx: ActionContext) -> ActionResult:
     target, fail = _resolve_or_fail(page, ctx, "click")
     if fail:
         return fail
+    _glide_cursor(page, target, ctx.speed_config)
     try:
         target.locator.click()
     except Exception as e:
@@ -241,12 +275,24 @@ def _do_type(page: Page, ctx: ActionContext) -> ActionResult:
     target, fail = _resolve_or_fail(page, ctx, "type")
     if fail:
         return fail
+
+    _glide_cursor(page, target, ctx.speed_config)
+
+    delay_ms = ctx.speed_config.type_delay_ms
     try:
-        target.locator.fill(text)
+        if delay_ms > 0:
+            # Visible typing: focus the field, clear it, then send keystrokes
+            # one at a time so a viewer sees characters appearing.
+            target.locator.click()
+            target.locator.fill("")
+            target.locator.press_sequentially(text, delay=delay_ms)
+        else:
+            # Fast mode: instant set-value, no per-key event sequence.
+            target.locator.fill(text)
     except Exception as e:
         return ActionResult(
             status="failed",
-            narration=f"fill failed: {ctx.target_hint!r}",
+            narration=f"type failed: {ctx.target_hint!r}",
             error_message=f"{type(e).__name__}: {e}",
             details={"strategy": target.strategy},
         )
@@ -256,6 +302,7 @@ def _do_type(page: Page, ctx: ActionContext) -> ActionResult:
         details={
             "strategy": target.strategy,
             "text_length": len(text),  # never log the text itself
+            "type_delay_ms": delay_ms,
         },
     )
 
@@ -276,6 +323,7 @@ def _do_select(page: Page, ctx: ActionContext) -> ActionResult:
     target, fail = _resolve_or_fail(page, ctx, "select")
     if fail:
         return fail
+    _glide_cursor(page, target, ctx.speed_config)
     # Try by label first (visible text in the dropdown), fall back to value
     try:
         target.locator.select_option(label=text)
@@ -321,6 +369,11 @@ def _do_verify(page: Page, ctx: ActionContext) -> ActionResult:
                 error_message=str(e),
                 details={"target_hint": ctx.target_hint},
             )
+        # Visibly mark the verified element with a green ring that fades.
+        # Without this, verify steps look like "the page just sat there".
+        # 1.5s is long enough that the per-step screenshot taken right
+        # after this catches the ring at full opacity.
+        highlight_target(page, target.locator, duration_ms=1500)
         parts.append(f"{ctx.target_hint!r} visible (via {target.strategy})")
         details["strategy"] = target.strategy
 

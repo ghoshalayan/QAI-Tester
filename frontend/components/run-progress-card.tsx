@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Sparkles, X } from "lucide-react";
+import { Loader2, Pause, Play, Sparkles, X } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -59,9 +59,10 @@ export function RunProgressCard({
     onSuccess: () => {
       toast.success("Cancel requested", {
         description:
-          "Will take effect at the next phase boundary (week 3 doesn't interrupt mid-LLM).",
+          "Will take effect at the next step boundary.",
       });
       qc.invalidateQueries({ queryKey: ["agent-runs", projectId] });
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId] });
     },
     onError: (e: Error) => {
       const msg = e instanceof ApiError ? e.message : e.message;
@@ -69,8 +70,40 @@ export function RunProgressCard({
     },
   });
 
+  const pauseMutation = useMutation({
+    mutationFn: () => api.pauseAgentRun(projectId, run.id),
+    onSuccess: () => {
+      toast.success("Pause requested", {
+        description: "Run will halt after the current step finishes.",
+      });
+      qc.invalidateQueries({ queryKey: ["agent-runs", projectId] });
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId] });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Pause failed", { description: msg });
+    },
+  });
+
+  const resumeMutation = useMutation({
+    mutationFn: () => api.resumeAgentRun(projectId, run.id),
+    onSuccess: () => {
+      toast.success("Resumed");
+      qc.invalidateQueries({ queryKey: ["agent-runs", projectId] });
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId] });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Resume failed", { description: msg });
+    },
+  });
+
   const isFrdToTc = run.kind === "frd_to_tc";
   const isExecute = run.kind === "execute";
+  const isRunning = run.status === "running";
+  const isPaused = run.status === "paused";
+  const canPause = isExecute && isRunning;
+  const canResume = isExecute && isPaused;
 
   const sourceDocsCount = Array.isArray(run.input_json?.source_document_ids)
     ? (run.input_json.source_document_ids as number[]).length
@@ -195,6 +228,9 @@ export function RunProgressCard({
             {isExecute && (
               <> · {headless ? "headless" : "headed"}</>
             )}
+            {isExecute && typeof run.input_json?.speed === "string" && (
+              <> · {run.input_json.speed as string}</>
+            )}
             {isExecute && selectedStepIdsCount !== null && (
               <>
                 {" · "}
@@ -207,22 +243,57 @@ export function RunProgressCard({
           </p>
         </div>
         {isActive && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={(e) => {
-              // Stop the click bubbling to any parent <Link> wrapper
-              // (Runs tab wraps each card in a Link to the detail page).
-              e.preventDefault();
-              e.stopPropagation();
-              cancelMutation.mutate();
-            }}
-            disabled={cancelMutation.isPending}
-            aria-label="Cancel run"
-          >
-            <X className="size-4" />
-            Cancel
-          </Button>
+          <div className="flex shrink-0 items-center gap-1">
+            {canPause && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  pauseMutation.mutate();
+                }}
+                disabled={pauseMutation.isPending}
+                aria-label="Pause run"
+                title="Halt at the next step boundary"
+              >
+                <Pause className="size-4" />
+                Pause
+              </Button>
+            )}
+            {canResume && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  resumeMutation.mutate();
+                }}
+                disabled={resumeMutation.isPending}
+                aria-label="Resume run"
+              >
+                <Play className="size-4" />
+                Resume
+              </Button>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => {
+                // Stop the click bubbling to any parent <Link> wrapper
+                // (Runs tab wraps each card in a Link to the detail page).
+                e.preventDefault();
+                e.stopPropagation();
+                cancelMutation.mutate();
+              }}
+              disabled={cancelMutation.isPending}
+              aria-label="Cancel run"
+            >
+              <X className="size-4" />
+              {isPaused ? "Stop" : "Cancel"}
+            </Button>
+          </div>
         )}
       </div>
 

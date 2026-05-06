@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Play } from "lucide-react";
+import { Eye, EyeOff, Gauge, Play, Turtle, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -11,6 +11,34 @@ import {
   PLAN_STATUS_LABELS,
   type PlanReadCompact,
 } from "@/lib/api";
+
+type Speed = "slow" | "normal" | "fast";
+
+const SPEED_OPTIONS: {
+  value: Speed;
+  label: string;
+  icon: typeof Turtle;
+  hint: string;
+}[] = [
+  {
+    value: "slow",
+    label: "Slow",
+    icon: Turtle,
+    hint: "Visible cursor glide, slow typing, 8s settle. Heavy SPAs friendly.",
+  },
+  {
+    value: "normal",
+    label: "Normal",
+    icon: Gauge,
+    hint: "Balanced. 5s settle, smaller cursor glide.",
+  },
+  {
+    value: "fast",
+    label: "Fast",
+    icon: Zap,
+    hint: "No typing animation, 2s settle. May fail on lazy-loading sites.",
+  },
+];
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -40,11 +68,13 @@ export function StartExecuteDialog({
   const qc = useQueryClient();
   const [planId, setPlanId] = useState<number | null>(defaultPlanId ?? null);
   const [headless, setHeadless] = useState(false);
+  const [speed, setSpeed] = useState<Speed>("slow");
 
   useEffect(() => {
     if (open) {
       setPlanId(defaultPlanId ?? null);
       setHeadless(false);
+      setSpeed("slow");
     }
   }, [open, defaultPlanId]);
 
@@ -71,6 +101,7 @@ export function StartExecuteDialog({
       api.startExecute(projectId, {
         plan_id: planId!,
         headless,
+        speed,
       }),
     onSuccess: (run) => {
       toast.success("Execution queued", {
@@ -136,6 +167,11 @@ export function StartExecuteDialog({
             {selectedPlan && (
               <PlanSummary plan={selectedPlan} />
             )}
+
+            {/* Speed knob — slow is the default for heavy-data sites where
+                an over-eager click on a skeleton row beats the actual data.
+                Keep this prominent so it isn't accidentally skipped. */}
+            <SpeedPicker value={speed} onChange={setSpeed} />
 
             <div className="flex items-start gap-3 rounded-md border p-3">
               <button
@@ -218,6 +254,47 @@ function PlanSummary({ plan }: { plan: PlanReadCompact }) {
           Scope: {plan.scope.length} module
           {plan.scope.length === 1 ? "" : "s"}
         </p>
+      )}
+    </div>
+  );
+}
+
+function SpeedPicker({
+  value,
+  onChange,
+}: {
+  value: Speed;
+  onChange: (next: Speed) => void;
+}) {
+  const active = SPEED_OPTIONS.find((o) => o.value === value);
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">Speed</label>
+      <div className="grid grid-cols-3 gap-2">
+        {SPEED_OPTIONS.map((opt) => {
+          const Icon = opt.icon;
+          const isActive = opt.value === value;
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              onClick={() => onChange(opt.value)}
+              aria-pressed={isActive}
+              className={cn(
+                "flex flex-col items-center gap-1 rounded-md border px-3 py-2 text-xs font-medium transition-colors",
+                isActive
+                  ? "border-primary/50 bg-primary/10 text-primary"
+                  : "hover:border-input hover:bg-muted/50 text-muted-foreground",
+              )}
+            >
+              <Icon className="size-4" />
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+      {active && (
+        <p className="text-xs text-muted-foreground">{active.hint}</p>
       )}
     </div>
   );

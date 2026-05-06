@@ -58,6 +58,12 @@ def request_cancel(run_id: int) -> None:
     """
     with _cancel_lock:
         _cancelled_runs.add(run_id)
+    # Wake any pause-waiter so it can observe the cancel and exit cleanly
+    # instead of waiting on the resume event indefinitely.
+    with _pause_lock:
+        ev = _resume_events.get(run_id)
+    if ev:
+        ev.set()
 
 
 def _is_cancelled(run_id: int) -> bool:
@@ -68,6 +74,67 @@ def _is_cancelled(run_id: int) -> bool:
 def _drop_cancel(run_id: int) -> None:
     with _cancel_lock:
         _cancelled_runs.discard(run_id)
+
+
+# ── Pause registry ───────────────────────────────────────────────
+
+_paused_runs: set[int] = set()
+_resume_events: dict[int, "threading.Event"] = {}
+_pause_lock = threading.Lock()
+
+
+def request_pause(run_id: int) -> None:
+    """Signal a run to pause at the next safe checkpoint.
+
+    Pause takes effect between steps (the orchestrator polls at the same
+    boundary as cancellation — mid-step pause is deferred). Idempotent.
+    Cancel-while-paused wakes the waiter via :func:`request_cancel`.
+    """
+    with _pause_lock:
+        _paused_runs.add(run_id)
+        if run_id not in _resume_events:
+            _resume_events[run_id] = threading.Event()
+
+
+def request_resume(run_id: int) -> None:
+    """Resume a paused run. Idempotent on non-paused runs."""
+    with _pause_lock:
+        _paused_runs.discard(run_id)
+        ev = _resume_events.pop(run_id, None)
+    if ev:
+        ev.set()
+
+
+def _is_paused(run_id: int) -> bool:
+    with _pause_lock:
+        return run_id in _paused_runs
+
+
+def _wait_until_resumed_or_cancelled(
+    run_id: int, *, poll_interval_s: float = 0.5,
+) -> bool:
+    """Block until the run is resumed or cancelled.
+
+    Returns True on resume, False on cancel. Polls every ``poll_interval_s``
+    so a cancel arriving via :func:`request_cancel` (which sets the same
+    event) wakes us promptly.
+    """
+    with _pause_lock:
+        ev = _resume_events.get(run_id)
+    if ev is None:
+        return True  # not paused — nothing to wait for
+    while True:
+        if ev.wait(poll_interval_s):
+            # Set by either request_resume (resumed) or request_cancel (cancelled)
+            return not _is_cancelled(run_id)
+        if _is_cancelled(run_id):
+            return False
+
+
+def _drop_pause(run_id: int) -> None:
+    with _pause_lock:
+        _paused_runs.discard(run_id)
+        _resume_events.pop(run_id, None)
 
 
 # ── SSE topic helpers ────────────────────────────────────────────
@@ -229,6 +296,7 @@ def execute_brd_to_frd(run_id: int) -> None:
 
     finally:
         _drop_cancel(run_id)
+        _drop_pause(run_id)
         db.close()
 
 
@@ -348,6 +416,7 @@ def execute_frd_to_tc(run_id: int) -> None:
 
     finally:
         _drop_cancel(run_id)
+        _drop_pause(run_id)
         db.close()
 
 
@@ -430,6 +499,13 @@ def execute_run(run_id: int) -> None:
 
         headless = bool(input_data.get("headless", False))
 
+        speed_raw = input_data.get("speed")
+        if speed_raw is not None and not isinstance(speed_raw, str):
+            _mark_failed(
+                db, run, "input.speed must be omitted or a string",
+            )
+            return
+
         # ── Run the orchestrator ───────────────────────────────
         try:
             result = execute_plan(
@@ -438,8 +514,11 @@ def execute_run(run_id: int) -> None:
                 plan_id=plan_id,
                 selected_step_ids=selected_step_ids,
                 headless=headless,
+                speed=speed_raw,
                 emit_event=lambda et, data: _emit_run_event(run, et, data),
                 is_cancelled=lambda: _is_cancelled(run.id),
+                is_paused=lambda: _is_paused(run.id),
+                wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
             )
         except AgentCancelled as e:
             _mark_cancelled(db, run, str(e))
@@ -479,4 +558,5 @@ def execute_run(run_id: int) -> None:
 
     finally:
         _drop_cancel(run_id)
+        _drop_pause(run_id)
         db.close()

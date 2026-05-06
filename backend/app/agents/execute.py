@@ -51,10 +51,13 @@ from app.executor import (
     BrowserNotInstalledError,
     browser_session,
     execute_action,
+    get_speed_config,
     hide_narration,
     install_overlay,
     update_narration,
+    wait_for_settled,
 )
+from app.models.agent_run import AgentRun
 from app.models.execution_step import ExecutionStep
 from app.models.tc_node import TcNode
 from app.models.test_plan import TestPlan
@@ -189,7 +192,10 @@ def _create_pending_rows(
 
 
 def _build_action_context(
-    db: Session, row: ExecutionStep, plan: TestPlan,
+    db: Session,
+    row: ExecutionStep,
+    plan: TestPlan,
+    speed_config,
 ) -> ActionContext:
     """Assemble the per-step context for the action dispatcher.
 
@@ -210,7 +216,85 @@ def _build_action_context(
         narrative=row.narrative_snapshot,
         expected=row.expected_snapshot,
         data_needs=data_needs,
+        speed_config=speed_config,
     )
+
+
+def _execute_with_retry(
+    page,
+    row: ExecutionStep,
+    ctx: ActionContext,
+    speed_config,
+    *,
+    is_cancelled: Callable[[], bool] | None,
+    emit_event: Callable[[str, dict], None] | None,
+) -> tuple[Any, list[dict]]:
+    """Run the action with auto-retry on failure.
+
+    Retries up to ``speed_config.retry_count`` additional times on
+    ``status == 'failed'``. Skips retry on ``passed`` (no need) and
+    ``blocked`` (HITL territory — that's the AI-assist + intervention
+    flow, not a flake). Cancellation between attempts breaks out cleanly.
+
+    Backoff is exponential: ``backoff_ms × 2^(attempt-1)`` between attempts.
+    Before each retry, ``wait_for_settled`` runs again so a slow XHR doesn't
+    immediately re-trigger the same selector miss.
+
+    Returns the final :class:`ActionResult` plus the per-attempt log
+    (one dict per attempt: ``{attempt, status, narration}``) which the
+    caller folds into ``details_json`` when there was more than one try.
+    """
+    attempts: list[dict] = []
+    max_attempts = max(1, speed_config.retry_count + 1)
+    last_result = None
+
+    for attempt_idx in range(max_attempts):
+        if attempt_idx > 0:
+            if is_cancelled and is_cancelled():
+                break
+            backoff_ms = speed_config.retry_backoff_ms * (2 ** (attempt_idx - 1))
+            time.sleep(backoff_ms / 1000.0)
+            wait_for_settled(page, speed_config)
+            _emit(emit_event, "step_retry", {
+                "step_id": row.id,
+                "attempt": attempt_idx + 1,
+                "max_attempts": max_attempts,
+                "backoff_ms": backoff_ms,
+                "prior_error": (last_result.error_message if last_result else None),
+            })
+
+        try:
+            result = execute_action(page, row.action_type_snapshot, ctx)
+        except Exception as e:
+            logger.exception(
+                "Unhandled error in step %s attempt %d", row.id, attempt_idx + 1,
+            )
+            from app.executor import ActionResult as _AR
+            result = _AR(
+                status="failed",
+                narration="unhandled error in dispatcher",
+                error_message=f"{type(e).__name__}: {e}",
+            )
+
+        attempts.append({
+            "attempt": attempt_idx + 1,
+            "status": result.status,
+            "narration": result.narration,
+        })
+        last_result = result
+
+        # Don't retry on success or HITL block.
+        if result.status in ("passed", "blocked"):
+            break
+
+    if last_result is None:
+        from app.executor import ActionResult as _AR
+        last_result = _AR(
+            status="failed",
+            narration="no attempts ran (cancelled before first try?)",
+        )
+
+    return last_result, attempts
 
 
 def _take_screenshot(
@@ -244,8 +328,11 @@ def execute_plan(
     plan_id: int,
     selected_step_ids: list[int] | None = None,
     headless: bool = False,
+    speed: str | None = None,
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    is_paused: Callable[[], bool] | None = None,
+    wait_for_resume: Callable[[], bool] | None = None,
 ) -> ExecutionResult:
     """Run the executor agent against the plan.
 
@@ -255,9 +342,12 @@ def execute_plan(
             ``execution_steps`` rows referencing it and use it for the
             screenshot directory.
         plan_id: ``test_plans.id``.
-        selected_step_ids: Optional override; if provided, skip the
-            ``selectable_default`` ancestor cut and run exactly those steps.
+        selected_step_ids: Optional override; if provided, run exactly
+            those steps (skipping the ``selectable_default`` filter).
         headless: Whether to launch Chromium without a visible window.
+        speed: Speed preset name — ``"slow"`` (default), ``"normal"``, or
+            ``"fast"``. Controls slow_mo, cursor glide, type delay, and
+            the network-idle timeout used by :func:`wait_for_settled`.
         emit_event: Optional SSE callback ``(event_type, data) -> None``.
         is_cancelled: Optional callback polled between steps.
 
@@ -271,6 +361,7 @@ def execute_plan(
         RuntimeError: Anything else (browser launch, screenshot dir, etc.).
     """
     t0 = time.monotonic()
+    speed_config = get_speed_config(speed)
 
     plan = db.get(TestPlan, plan_id)
     if not plan:
@@ -315,16 +406,17 @@ def execute_plan(
         "phase": "opening_browser",
         "message": (
             f"Launching {'headless' if headless else 'headed'} Chromium · "
-            f"{len(rows)} steps queued"
+            f"{len(rows)} steps queued · speed={speed or 'slow'}"
         ),
         "total": len(rows),
+        "speed": speed or "slow",
     })
 
     counts = {"passed": 0, "failed": 0, "skipped": 0, "blocked": 0}
     cancelled = False
 
     try:
-        with browser_session(headless=headless) as page:
+        with browser_session(headless=headless, speed=speed) as page:
             # Install the visible cursor + narration overlay. Always-on so
             # per-step screenshots inherit the cursor position + banner text
             # without any extra plumbing on the timeline side.
@@ -334,6 +426,34 @@ def execute_plan(
                 if is_cancelled and is_cancelled():
                     cancelled = True
                     break
+
+                # Pause checkpoint — block until resume or cancel.
+                # The browser session stays open so the user can poke at
+                # the page; on resume we pick up exactly where we stopped.
+                if is_paused and is_paused():
+                    run_record = db.get(AgentRun, run_id)
+                    if run_record:
+                        run_record.status = "paused"
+                        db.commit()
+                    _emit(emit_event, "paused", {
+                        "step_id": row.id,
+                        "ordinal": idx + 1,
+                        "total": len(rows),
+                        "status": "paused",
+                    })
+                    resumed = wait_for_resume() if wait_for_resume else True
+                    if not resumed:
+                        cancelled = True
+                        break
+                    if run_record:
+                        run_record.status = "running"
+                        db.commit()
+                    _emit(emit_event, "resumed", {
+                        "step_id": row.id,
+                        "ordinal": idx + 1,
+                        "total": len(rows),
+                        "status": "running",
+                    })
 
                 # ── pending → running ─────────────────────────
                 row.status = "running"
@@ -349,36 +469,55 @@ def execute_plan(
                     "action_type": row.action_type_snapshot,
                 })
 
-                # Push the step's metadata into the on-page banner.
-                # Done before the action so the screenshot taken after it
-                # captures the matching narration text.
+                # Push the step's metadata into the on-page banner — neutral
+                # blue ("about to do this") so the viewer sees the agent's
+                # intent before it acts.
                 update_narration(
                     page,
                     ordinal=idx + 1,
                     total=len(rows),
                     title=row.title_snapshot,
                     action_type=row.action_type_snapshot,
+                    phase="about_to",
                 )
 
                 step_t0 = time.monotonic()
-                ctx = _build_action_context(db, row, plan)
-                try:
-                    result = execute_action(
-                        page, row.action_type_snapshot, ctx,
-                    )
-                except Exception as e:
-                    logger.exception(
-                        "Unhandled error in step %s of run %s", row.id, run_id,
-                    )
-                    result_status = "failed"
-                    narration = f"unhandled error in dispatcher"
-                    error_msg = f"{type(e).__name__}: {e}"
-                    details: dict[str, Any] = {}
-                else:
-                    result_status = result.status
-                    narration = result.narration
-                    error_msg = result.error_message
-                    details = dict(result.details)
+                ctx = _build_action_context(db, row, plan, speed_config)
+
+                # Settle gate: wait for DOM + networkidle before acting.
+                # On heavy-data sites the element may be a loading skeleton
+                # that satisfies wait_for(visible) but isn't yet bound to
+                # real data. wait_for_settled is best-effort — chatty SPAs
+                # never reach networkidle and we proceed anyway.
+                wait_for_settled(page, speed_config)
+
+                result, attempt_log = _execute_with_retry(
+                    page, row, ctx, speed_config,
+                    is_cancelled=is_cancelled,
+                    emit_event=emit_event,
+                )
+                result_status = result.status
+                narration = result.narration
+                error_msg = result.error_message
+                details: dict[str, Any] = dict(result.details)
+                if len(attempt_log) > 1:
+                    details["attempts"] = attempt_log
+
+                # Flip the banner to the outcome state BEFORE the screenshot
+                # so the per-step PNG carries the green ✓ / red ✗ marker.
+                _PHASE_BY_STATUS = {
+                    "passed": "did",
+                    "failed": "failed",
+                    "blocked": "blocked",
+                }
+                update_narration(
+                    page,
+                    ordinal=idx + 1,
+                    total=len(rows),
+                    title=row.title_snapshot,
+                    action_type=row.action_type_snapshot,
+                    phase=_PHASE_BY_STATUS.get(result_status, "did"),
+                )
 
                 screenshot_path = _take_screenshot(page, run_id, row.id)
 

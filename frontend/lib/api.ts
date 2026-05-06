@@ -320,6 +320,7 @@ export interface ExecuteRunRequest {
   plan_id: number;
   selected_step_ids?: number[] | null;
   headless?: boolean;
+  speed?: "slow" | "normal" | "fast";
 }
 
 // ── Execution steps (per-run results) ─────────────────────────────
@@ -737,6 +738,16 @@ export const api = {
   cancelAgentRun: (projectId: number, runId: number) =>
     apiFetch<AgentRunRead>(
       `/api/projects/${projectId}/agent-runs/${runId}/cancel`,
+      { method: "POST" },
+    ),
+  pauseAgentRun: (projectId: number, runId: number) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/pause`,
+      { method: "POST" },
+    ),
+  resumeAgentRun: (projectId: number, runId: number) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/resume`,
       { method: "POST" },
     ),
   /** Absolute URL for a screenshot at the relative path the backend stores. */

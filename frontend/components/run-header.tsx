@@ -1,6 +1,16 @@
 "use client";
 
-import { Calendar, ExternalLink, Eye, EyeOff, Layers, Timer } from "lucide-react";
+import {
+  Calendar,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  Gauge,
+  Layers,
+  Timer,
+  Turtle,
+  Zap,
+} from "lucide-react";
 
 import type { AgentRunRead } from "@/lib/api";
 
@@ -15,8 +25,25 @@ interface Props {
   plan: PlanLike | null;
 }
 
+const SPEED_LABEL: Record<string, string> = {
+  slow: "Slow",
+  normal: "Normal",
+  fast: "Fast",
+};
+
+const SPEED_ICON: Record<string, typeof Turtle> = {
+  slow: Turtle,
+  normal: Gauge,
+  fast: Zap,
+};
+
 export function RunHeader({ run, plan }: Props) {
   const headless = !!run.input_json?.headless;
+  const speedRaw =
+    typeof run.input_json?.speed === "string"
+      ? (run.input_json.speed as string)
+      : "slow";
+  const SpeedIcon = SPEED_ICON[speedRaw] ?? Gauge;
   const wallClockMs = computeWallClockMs(run);
   const stepDurationMs =
     typeof run.output_summary_json?.duration_ms === "number"
@@ -48,6 +75,13 @@ export function RunHeader({ run, plan }: Props) {
         <Field icon={headless ? EyeOff : Eye} label="Browser">
           <span className="font-medium">
             {headless ? "Headless" : "Headed"} Chromium
+          </span>
+        </Field>
+
+        {/* Speed preset */}
+        <Field icon={SpeedIcon} label="Speed">
+          <span className="font-medium">
+            {SPEED_LABEL[speedRaw] ?? speedRaw}
           </span>
         </Field>
 

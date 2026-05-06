@@ -148,6 +148,14 @@ export function useAgentRunsEvents(projectId: number) {
       qc.invalidateQueries({ queryKey: ["run-steps", projectId] });
     };
 
+    // Pause / resume — the orchestrator flips run.status itself, so we
+    // just refetch the run rows to pick up the change. Same payload shape
+    // as `started` (no progress fields), so the runs query is enough.
+    const onPauseEvent = () => {
+      qc.invalidateQueries({ queryKey: ["agent-runs", projectId] });
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId] });
+    };
+
     es.addEventListener("started", onStarted);
     es.addEventListener("phase", onProgress as EventListener);
     es.addEventListener("done", onProgress as EventListener);
@@ -155,6 +163,8 @@ export function useAgentRunsEvents(projectId: number) {
     es.addEventListener("module_completed", onProgress as EventListener);
     es.addEventListener("step_started", onStepEvent);
     es.addEventListener("step_completed", onStepEvent);
+    es.addEventListener("paused", onPauseEvent);
+    es.addEventListener("resumed", onPauseEvent);
     es.addEventListener("completed", onTerminal as EventListener);
     es.addEventListener("failed", onTerminal as EventListener);
     es.addEventListener("cancelled", onTerminal as EventListener);

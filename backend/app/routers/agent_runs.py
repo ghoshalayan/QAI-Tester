@@ -46,6 +46,8 @@ from app.services.agent_run_service import (
     execute_frd_to_tc,
     execute_run,
     request_cancel,
+    request_pause,
+    request_resume,
     topic_for_project_agent_runs,
     topic_for_run,
 )
@@ -257,6 +259,7 @@ def start_execute(
             "plan_id": plan.id,
             "selected_step_ids": payload.selected_step_ids,
             "headless": payload.headless,
+            "speed": payload.speed,
         },
         output_summary_json={},
     )
@@ -417,6 +420,54 @@ def cancel_run(
     request_cancel(run.id)
     logger.info("Cancel requested for run %s (current status=%s)",
                 run.id, run.status)
+    return run
+
+
+@router.post("/{run_id}/pause", response_model=AgentRunRead)
+def pause_run(
+    project_id: int, run_id: int, db: Session = Depends(get_db),
+):
+    """Signal a running run to pause at the next step boundary.
+
+    Pause takes effect *between* steps (mid-step pause is deferred — see
+    futurescope.md). The orchestrator flips ``run.status='paused'`` itself
+    when it actually halts, so a freshly-pause-requested run still shows
+    ``running`` until the current step finishes.
+
+    No-op when:
+    - the run is already paused, or
+    - the run is in a terminal state (completed / failed / cancelled).
+
+    Returns the current row so the caller can read the live state.
+    """
+    run = _require_run(db, project_id, run_id)
+
+    if run.status in ("completed", "failed", "cancelled", "paused"):
+        return run  # already terminal or already paused — no-op
+
+    request_pause(run.id)
+    logger.info("Pause requested for run %s (current status=%s)",
+                run.id, run.status)
+    return run
+
+
+@router.post("/{run_id}/resume", response_model=AgentRunRead)
+def resume_run(
+    project_id: int, run_id: int, db: Session = Depends(get_db),
+):
+    """Wake a paused run.
+
+    The pause vault sets the resume Event; the orchestrator unblocks at
+    its checkpoint, flips ``run.status`` back to ``running``, and emits a
+    ``resumed`` SSE event. Idempotent on already-running or terminal runs.
+    """
+    run = _require_run(db, project_id, run_id)
+
+    if run.status != "paused":
+        return run  # not paused — no-op
+
+    request_resume(run.id)
+    logger.info("Resume requested for run %s", run.id)
     return run
 
 

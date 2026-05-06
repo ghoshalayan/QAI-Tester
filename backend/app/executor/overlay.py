@@ -1,34 +1,36 @@
 """Visible cursor + narration overlay — the "watch the agent work" UX.
 
-Two pieces are injected into every page the executor visits:
+Three pieces are injected into every page the executor visits:
 
-1. **Cursor ring** — a circular indicator that tracks ``mousemove`` and
-   pulses on click. Lets a viewer see where the agent is looking, even
-   between actions, and shows up in the per-step screenshot so the
-   run-detail timeline thumbnails inherit it.
+1. **Cursor ring** — visible from page load (centered in the viewport),
+   tracks ``mousemove`` between actions, pulses on click, and runs a
+   continuous "breathing" animation so it always looks alive even when
+   nothing is moving. Lets a viewer see where the agent is looking.
 
-2. **Narration banner** — a translucent dark pill anchored to the bottom
-   of the viewport, with an action-type chip, the step title, and an
-   N/M step counter on the right.
+2. **Narration banner** — translucent dark pill at the bottom with an
+   action-type chip, title, and N/M counter. **Phase-aware**: shows
+   ``About to click X`` before the action and ``Clicked X ✓`` /
+   ``Click failed`` after, so each step has clear before/after states.
+
+3. **Target highlight** — a green outline ring drawn around the element
+   the agent just verified or about to act on. Auto-fades after 1.5s.
+   Verify steps stop being silent.
 
 Wiring
 ------
 - :func:`install_overlay` is called once per browser session, after the
   page is created. It registers the JS as an init-script so it re-runs on
   every navigation automatically.
-- :func:`update_narration` is called at each ``step_started`` boundary by
-  the orchestrator. Errors are swallowed — a page closing or navigating
-  mid-call must not derail the run.
-- :func:`hide_narration` clears the banner at run end so the final
-  screenshot doesn't carry stale text.
+- :func:`update_narration` is called by the orchestrator at each step
+  boundary with a ``phase`` of ``"about_to"`` / ``"did"`` / ``"failed"``.
+- :func:`highlight_target` is called by the verify action handler to
+  draw the green ring around the verified element.
+- :func:`hide_narration` clears the banner at run end.
 
 Always-on
 ---------
-The overlay installs in both headed and headless modes. Headed gives the
-visible UX during the run; headless still benefits because the per-step
-PNGs in ``data/screenshots/<run_id>/`` capture the cursor position and
-narration that was active when the screenshot fired. The runtime cost of
-the JS is negligible.
+The overlay installs in both headed and headless modes so per-step PNGs
+in ``data/screenshots/<run_id>/`` capture the cursor + banner + highlights.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from __future__ import annotations
 import json
 import logging
 
-from playwright.sync_api import Page
+from playwright.sync_api import Locator, Page
 
 logger = logging.getLogger(__name__)
 
@@ -49,19 +51,54 @@ _OVERLAY_Z_INDEX = 2147483647
 # fires before or after DOMContentLoaded.
 OVERLAY_INIT_SCRIPT = r"""
 (() => {
-  if (window.__qaiOverlayInstalled) return;
-  window.__qaiOverlayInstalled = true;
+  // Idempotence guard: gate on the cursor element being present in THIS
+  // document, not on a window flag. set_content (and other same-window
+  // content swaps) replace the document body but reuse the window object,
+  // so a window flag would survive while the elements get garbage-collected.
+  // Checking the element catches that case correctly.
+  if (document.getElementById('__qai-cursor')) return;
+  window.__qaiOverlayInstalled = true;  // kept for back-compat introspection
 
   const Z_TOP = """ + str(_OVERLAY_Z_INDEX) + r""";
 
+  // Build the style element in memory; it gets appended later by install()
+  // alongside the cursor + banner. At init-script time on a fresh navigation,
+  // BOTH document.head AND document.documentElement can be null, which would
+  // throw and abort the IIFE before any later code (incl __qaiNarrate)
+  // runs. Deferring the append solves that.
+  const style = document.createElement('style');
+  style.id = '__qai-overlay-style';
+  style.textContent = `
+    @keyframes __qai-breathe {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(56, 132, 255, 0.10),
+                              0 1px 4px rgba(0, 0, 0, 0.25); }
+      50%      { box-shadow: 0 0 0 9px rgba(56, 132, 255, 0.06),
+                              0 1px 4px rgba(0, 0, 0, 0.25); }
+    }
+    @keyframes __qai-banner-pulse {
+      0%   { transform: scale(0.99); }
+      40%  { transform: scale(1.005); }
+      100% { transform: scale(1.0); }
+    }
+    @keyframes __qai-highlight-fade {
+      0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.85),
+                          0 0 0 6px rgba(34, 197, 94, 0.45); }
+      100% { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0.0),
+                          0 0 0 14px rgba(34, 197, 94, 0.0); }
+    }
+  `;
+
   // ── Cursor ring ───────────────────────────────────────────────
+  // Default to viewport center so it's visible from page load (rather
+  // than waiting for the first mousemove). The on-page agent ALWAYS has
+  // a visible position, even on navigate-only / verify-only steps.
   const cursor = document.createElement('div');
   cursor.id = '__qai-cursor';
   cursor.setAttribute('aria-hidden', 'true');
   cursor.style.cssText = `
     position: fixed;
-    left: -100px;
-    top: -100px;
+    left: 50vw;
+    top: 50vh;
     width: 22px;
     height: 22px;
     margin: 0;
@@ -74,9 +111,10 @@ OVERLAY_INIT_SCRIPT = r"""
     box-shadow: 0 0 0 4px rgba(56, 132, 255, 0.10),
                 0 1px 4px rgba(0, 0, 0, 0.25);
     transition: transform 80ms ease-out, background 140ms ease,
-                box-shadow 140ms ease;
+                box-shadow 140ms ease, left 50ms linear, top 50ms linear;
     transform: translate(-50%, -50%) scale(1);
     will-change: left, top, transform;
+    animation: __qai-breathe 2.4s ease-in-out infinite;
   `;
 
   // ── Narration banner ──────────────────────────────────────────
@@ -104,9 +142,23 @@ OVERLAY_INIT_SCRIPT = r"""
     pointer-events: none;
     z-index: ${Z_TOP - 1};
     opacity: 0;
-    transition: opacity 220ms ease;
+    transition: opacity 220ms ease, border-color 220ms ease;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.30);
     max-width: calc(100vw - 32px);
+    transform-origin: center bottom;
+  `;
+
+  const phaseDot = document.createElement('span');
+  phaseDot.id = '__qai-phase';
+  phaseDot.style.cssText = `
+    display: inline-block;
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgba(56, 132, 255, 0.85);
+    box-shadow: 0 0 6px rgba(56, 132, 255, 0.6);
+    transition: background 220ms ease, box-shadow 220ms ease;
   `;
 
   const actionChip = document.createElement('span');
@@ -122,6 +174,7 @@ OVERLAY_INIT_SCRIPT = r"""
     font: 600 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     letter-spacing: 0.06em;
     text-transform: uppercase;
+    transition: background 220ms ease, color 220ms ease;
   `;
   actionChip.textContent = 'idle';
 
@@ -146,56 +199,115 @@ OVERLAY_INIT_SCRIPT = r"""
   `;
   counter.textContent = '';
 
+  banner.appendChild(phaseDot);
   banner.appendChild(actionChip);
   banner.appendChild(textSpan);
   banner.appendChild(counter);
 
-  // ── Mount when the body exists ────────────────────────────────
-  function mount() {
+  // ── Install (style + cursor + banner) ─────────────────────────
+  // Single deferred function: needs document.body to exist before any
+  // DOM insertion is safe on a fresh navigation. Falls back to
+  // DOMContentLoaded if called too early.
+  function install() {
     if (!document.body) return false;
+    // Once body exists, head/documentElement also exist — pick whichever
+    // takes the style element first.
+    const styleParent = document.head || document.documentElement
+                        || document.body;
+    if (styleParent && !document.getElementById('__qai-overlay-style')) {
+      styleParent.appendChild(style);
+    }
     if (!document.body.contains(cursor)) document.body.appendChild(cursor);
     if (!document.body.contains(banner)) document.body.appendChild(banner);
     return true;
   }
-  if (!mount()) {
-    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  if (!install()) {
+    document.addEventListener('DOMContentLoaded', install, { once: true });
   }
-
-  // Re-mount if the page nukes our nodes (rare but cheap to defend against)
-  const remountOnVisibility = () => {
-    if (document.visibilityState === 'visible') mount();
-  };
-  document.addEventListener('visibilitychange', remountOnVisibility);
+  // Re-install if the page nukes our nodes (rare but cheap to defend against)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') install();
+  });
 
   // ── Cursor tracking ───────────────────────────────────────────
-  // Use capture-phase listeners so the page can't stopPropagation us out.
   document.addEventListener('mousemove', (e) => {
     cursor.style.left = e.clientX + 'px';
     cursor.style.top = e.clientY + 'px';
   }, { capture: true, passive: true });
 
-  const onPress = () => {
+  document.addEventListener('mousedown', () => {
     cursor.style.transform = 'translate(-50%, -50%) scale(1.6)';
     cursor.style.background = 'rgba(56, 132, 255, 0.42)';
     cursor.style.boxShadow = '0 0 0 8px rgba(56, 132, 255, 0.14),' +
                              '0 1px 6px rgba(0, 0, 0, 0.30)';
-  };
-  const onRelease = () => {
+  }, { capture: true, passive: true });
+
+  document.addEventListener('mouseup', () => {
     cursor.style.transform = 'translate(-50%, -50%) scale(1)';
     cursor.style.background = 'rgba(56, 132, 255, 0.18)';
     cursor.style.boxShadow = '0 0 0 4px rgba(56, 132, 255, 0.10),' +
                              '0 1px 4px rgba(0, 0, 0, 0.25)';
-  };
-  document.addEventListener('mousedown', onPress,
-    { capture: true, passive: true });
-  document.addEventListener('mouseup', onRelease,
-    { capture: true, passive: true });
+  }, { capture: true, passive: true });
 
-  // ── Public API for the orchestrator ───────────────────────────
+  // ── Phase-aware narration ─────────────────────────────────────
+  // Phases:
+  //   "about_to": neutral blue, chip says lower-case action_type
+  //   "did":      green tint, chip prefix " ✓ ", banner border green
+  //   "failed":   red tint, chip prefix " ✗ ", banner border red
+  //   "blocked":  amber tint
+  // Old callers omit phase → behaves like "about_to" (the default).
+  const PHASE_STYLES = {
+    about_to: {
+      dot: 'rgba(56, 132, 255, 0.85)',
+      dotShadow: 'rgba(56, 132, 255, 0.6)',
+      chipBg: 'rgba(56, 132, 255, 0.22)',
+      chipColor: '#7fb6ff',
+      border: 'rgba(255, 255, 255, 0.08)',
+    },
+    did: {
+      dot: 'rgba(34, 197, 94, 0.95)',
+      dotShadow: 'rgba(34, 197, 94, 0.65)',
+      chipBg: 'rgba(34, 197, 94, 0.22)',
+      chipColor: '#7eed9d',
+      border: 'rgba(34, 197, 94, 0.45)',
+    },
+    failed: {
+      dot: 'rgba(239, 68, 68, 0.95)',
+      dotShadow: 'rgba(239, 68, 68, 0.65)',
+      chipBg: 'rgba(239, 68, 68, 0.22)',
+      chipColor: '#ff8b8b',
+      border: 'rgba(239, 68, 68, 0.45)',
+    },
+    blocked: {
+      dot: 'rgba(234, 179, 8, 0.95)',
+      dotShadow: 'rgba(234, 179, 8, 0.65)',
+      chipBg: 'rgba(234, 179, 8, 0.22)',
+      chipColor: '#facc15',
+      border: 'rgba(234, 179, 8, 0.45)',
+    },
+  };
+
   window.__qaiNarrate = function(payload) {
     if (!payload) return;
+    const phase = (typeof payload.phase === 'string'
+      ? payload.phase : 'about_to');
+    const styles = PHASE_STYLES[phase] || PHASE_STYLES.about_to;
+
+    // Apply phase styles
+    phaseDot.style.background = styles.dot;
+    phaseDot.style.boxShadow = '0 0 6px ' + styles.dotShadow;
+    actionChip.style.background = styles.chipBg;
+    actionChip.style.color = styles.chipColor;
+    banner.style.borderColor = styles.border;
+
     if (typeof payload.action === 'string' && payload.action.length > 0) {
-      actionChip.textContent = payload.action.slice(0, 24);
+      const a = payload.action.slice(0, 24);
+      // Decorate chip with a phase prefix so even a colorblind user gets it.
+      const prefix =
+        phase === 'did' ? '✓ ' :
+        phase === 'failed' ? '✗ ' :
+        phase === 'blocked' ? '⚠ ' : '';
+      actionChip.textContent = prefix + a;
     }
     if (typeof payload.title === 'string') {
       textSpan.textContent = payload.title;
@@ -207,10 +319,59 @@ OVERLAY_INIT_SCRIPT = r"""
       counter.textContent = '';
     }
     banner.style.opacity = '1';
+
+    // Brief pulse to draw the eye on each transition.
+    banner.style.animation = 'none';
+    void banner.offsetWidth; // re-trigger
+    banner.style.animation = '__qai-banner-pulse 280ms ease-out';
   };
 
   window.__qaiHideBanner = function() {
     banner.style.opacity = '0';
+  };
+
+  // ── Target highlight ──────────────────────────────────────────
+  // The verify handler calls this after resolving target_hint, so a
+  // verify step visibly does something. Pass an element directly (set
+  // by the Python side via JSHandle) or a CSS selector; we draw a
+  // green outline ring that auto-fades over 1.5s.
+  window.__qaiHighlight = function(target, opts) {
+    let el = null;
+    if (typeof target === 'string') {
+      try { el = document.querySelector(target); } catch (e) { return; }
+    } else if (target && target.nodeType === 1) {
+      el = target;
+    }
+    if (!el) return;
+
+    const ttl = (opts && opts.duration_ms) || 1500;
+    const color =
+      (opts && opts.color) ||
+      'rgba(34, 197, 94, 0.8)';   // green default
+    const ringColor =
+      (opts && opts.ringColor) ||
+      'rgba(34, 197, 94, 0.30)';
+
+    // Save the element's existing outline so we can restore it.
+    const prevOutline = el.style.outline;
+    const prevOutlineOffset = el.style.outlineOffset;
+    const prevTransition = el.style.transition;
+
+    el.style.transition = 'outline-color 200ms ease, outline-offset 200ms ease';
+    el.style.outline = '3px solid ' + color;
+    el.style.outlineOffset = '2px';
+    el.style.boxShadow = (el.style.boxShadow || '') + ', 0 0 0 6px ' + ringColor;
+    el.style.animation = '__qai-highlight-fade ' + ttl + 'ms ease-out forwards';
+
+    setTimeout(() => {
+      el.style.outline = prevOutline;
+      el.style.outlineOffset = prevOutlineOffset;
+      el.style.transition = prevTransition;
+      el.style.animation = '';
+      // Restore boxShadow by removing only our suffix
+      el.style.boxShadow = (el.style.boxShadow || '')
+        .replace(', 0 0 0 6px ' + ringColor, '');
+    }, ttl);
   };
 })();
 """
@@ -239,8 +400,18 @@ def update_narration(
     total: int,
     title: str,
     action_type: str | None,
+    phase: str = "about_to",
 ) -> None:
     """Push step metadata into the on-page banner.
+
+    ``phase`` is one of:
+    - ``"about_to"`` (default) — neutral blue, "Clicking X" tone
+    - ``"did"`` — green tint, ✓ prefix, "Clicked X" tone
+    - ``"failed"`` — red tint, ✗ prefix
+    - ``"blocked"`` — amber, ⚠ prefix
+
+    The phase styles the banner border + the action-chip color so the
+    transition is visible from across the room.
 
     Errors are swallowed — pages can close, navigate, or block JS while
     we're trying to talk to them, and a missed narration update is never
@@ -251,15 +422,46 @@ def update_narration(
         "title": title or "",
         "ordinal": ordinal,
         "total": total,
+        "phase": phase,
     }
     try:
-        # `evaluate` evaluates the JS expression in the page's context.
-        # Use json.dumps so quotes/backslashes in the title are safe.
         page.evaluate(
             f"window.__qaiNarrate && window.__qaiNarrate({json.dumps(payload)})",
         )
     except Exception as e:
         logger.debug("update_narration suppressed error: %s", e)
+
+
+def highlight_target(
+    page: Page,
+    locator: Locator,
+    *,
+    duration_ms: int = 1500,
+) -> None:
+    """Draw a green ring around the element backing ``locator`` for
+    ``duration_ms`` milliseconds.
+
+    Called by the verify handler so verify steps visibly do something
+    (and any other action that wants to draw attention to a target).
+    Works regardless of which strategy the selector waterfall used —
+    we marshal the live ElementHandle into the JS evaluate call rather
+    than re-querying by selector string.
+
+    Errors (locator no longer attached, page closed, JS blocked) are
+    swallowed silently — a missed highlight isn't worth crashing the run.
+    """
+    try:
+        handle = locator.element_handle()
+        if handle is None:
+            return
+        opts = {"duration_ms": duration_ms}
+        page.evaluate(
+            "([el, opts]) => "
+            "window.__qaiHighlight && window.__qaiHighlight(el, opts)",
+            [handle, opts],
+        )
+    except Exception as e:
+        logger.debug("highlight_target suppressed error: %s", e)
 
 
 def hide_narration(page: Page) -> None:

@@ -23,8 +23,18 @@ from app.executor.browser import (
 )
 from app.executor.overlay import (
     hide_narration,
+    highlight_target,
     install_overlay,
     update_narration,
+)
+from app.executor.pacing import (
+    FAST,
+    NORMAL,
+    SLOW,
+    Speed,
+    SpeedConfig,
+    get_speed_config,
+    wait_for_settled,
 )
 from app.executor.selectors import (
     ResolvedTarget,
@@ -37,13 +47,21 @@ __all__ = [
     "ActionResult",
     "ActionStatus",
     "BrowserNotInstalledError",
+    "FAST",
+    "NORMAL",
     "ResolvedTarget",
+    "SLOW",
     "SelectorNotFound",
+    "Speed",
+    "SpeedConfig",
     "browser_session",
     "chromium_installed",
     "execute_action",
+    "get_speed_config",
     "hide_narration",
+    "highlight_target",
     "install_overlay",
     "resolve",
     "update_narration",
+    "wait_for_settled",
 ]
