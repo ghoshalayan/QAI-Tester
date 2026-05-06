@@ -4,7 +4,14 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Check, ClipboardList, ListTree, Sparkles } from "lucide-react";
+import {
+  Check,
+  ClipboardList,
+  FileJson,
+  FileText,
+  ListTree,
+  Sparkles,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -334,18 +341,48 @@ function TreeArea({
           value={filter}
           onChange={onFilterChange}
         />
-        {draftCount > 0 && (
-          <Button
-            size="sm"
-            variant="outline"
-            className="ml-auto"
-            onClick={onBulkApproveDrafts}
-            disabled={bulkApproveDisabled}
-          >
-            <Check className="size-4" />
-            Approve all {draftCount} draft{draftCount === 1 ? "" : "s"}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {/* Download selected — `selected_only=true` so the export
+              matches what would actually run on the next execute. */}
+          <span className="text-xs text-muted-foreground">
+            Download selected:
+          </span>
+          <Button asChild size="sm" variant="outline">
+            <a
+              href={api.exportTcNodesUrl(projectId, plan.id, {
+                format: "json",
+                selectedOnly: true,
+              })}
+              download
+            >
+              <FileJson className="size-4" />
+              JSON
+            </a>
           </Button>
-        )}
+          <Button asChild size="sm" variant="outline">
+            <a
+              href={api.exportTcNodesUrl(projectId, plan.id, {
+                format: "md",
+                selectedOnly: true,
+              })}
+              download
+            >
+              <FileText className="size-4" />
+              Markdown
+            </a>
+          </Button>
+          {draftCount > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onBulkApproveDrafts}
+              disabled={bulkApproveDisabled}
+            >
+              <Check className="size-4" />
+              Approve all {draftCount} draft{draftCount === 1 ? "" : "s"}
+            </Button>
+          )}
+        </div>
       </div>
 
       {filteredTree.length === 0 ? (

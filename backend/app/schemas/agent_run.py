@@ -53,6 +53,22 @@ class ExecuteRunRequest(BaseModel):
     promoted to ``passed`` and the correction is logged in
     ``details_json["ai_correction"]``. Defaults to ``True`` — gracefully
     no-ops when no LLM is configured in app_settings.
+
+    ``auto_adjust`` controls what the AI does with its suggestion:
+
+    - ``False`` (default): the suggestion is PROPOSED — the HITL modal
+      pre-fills with it and the user accepts / edits / rejects. Vision
+      escalation is skipped (the user is already in the loop).
+    - ``True``: the AI silently auto-applies its suggestion. If the
+      text-only fix still fails AND the provider supports vision, a
+      second screenshot-attached call escalates. HITL only fires when
+      both passes still leave the step failed.
+
+    ``promote_fixes`` writes a successful correction back to the source
+    ``tc_node`` so the next run starts with the fix baked in. Applies
+    when an AI auto-applied fix passes OR when a HITL ``use_suggestion``
+    / ``retry`` with overrides passes. Off by default — promoting a
+    one-off fix can paper over a real test-case bug.
     """
 
     plan_id: int = Field(..., gt=0)
@@ -60,6 +76,8 @@ class ExecuteRunRequest(BaseModel):
     headless: bool = Field(default=False)
     speed: Literal["slow", "normal", "fast"] = Field(default="slow")
     ai_assist: bool = Field(default=True)
+    auto_adjust: bool = Field(default=False)
+    promote_fixes: bool = Field(default=False)
 
 
 class InterventionRequest(BaseModel):

@@ -41,6 +41,22 @@ RecoveryAction = Literal["retry", "replace", "give_up"]
 
 
 @dataclass
+class ImprovisationSuggestion:
+    """A concrete value the LLM picked from the live page when the test
+    case left it ambiguous (e.g. "search any product").
+
+    ``value`` is empty when the LLM couldn't decide — caller should treat
+    that as "no improvisation available" and let the action fail / HITL.
+    """
+
+    value: str
+    reasoning: str
+    confidence: float
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+@dataclass
 class RecoverySuggestion:
     """Structured proposal from the LLM after looking at a failed step."""
 
@@ -85,6 +101,45 @@ RECOVERY_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
+
+
+IMPROVISATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "value": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["value", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+
+IMPROVISATION_SYSTEM_PROMPT = """You are testing a web application like a human tester.
+
+You see a step that needs a CONCRETE VALUE to type or select, but the test
+case doesn't specify what (e.g. "search any product", "select any option").
+Look at the page's accessibility tree and pick a sensible concrete value
+FROM the page itself.
+
+Rules:
+- Pick something visible and stable that's actually on the page.
+- Don't fabricate — only use values that appear in the AX tree (product
+  names, menu options, labels, etc.).
+- For "search" / "type any X" steps: pick a real X visible on the page.
+- For dropdowns: pick an option from the listed options.
+- A human tester would naturally pick the FIRST sensible match — do that.
+- Keep the value short and exact; copy the visible text verbatim.
+- If nothing reasonable is visible, return an empty string for "value".
+
+Always set:
+- value: the concrete string to type/select, or "" if you can't decide.
+- reasoning: 1 sentence. Cite the element you saw (e.g. "first product
+  visible in the catalog grid: 'Wireless mouse'").
+- confidence: 0.0 (wild guess) to 1.0 (clearly visible match).
+
+Output JSON only.
+"""
 
 
 SYSTEM_PROMPT = """You are debugging a failed Playwright test step against a live web page.
@@ -370,4 +425,80 @@ def propose_recovery(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         used_vision=used_vision,
+    )
+
+
+def propose_improvisation(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    title: str,
+    action_type: str | None,
+    target_hint: str | None,
+    narrative: str | None,
+    expected: str | None,
+) -> ImprovisationSuggestion:
+    """Pick a concrete value for an ambiguous type/select step.
+
+    Triggered before action dispatch when the test case says e.g.
+    "search any product" but doesn't name one. The LLM looks at the
+    page's accessibility tree and picks something a human tester
+    would naturally try (first visible product, first dropdown option,
+    etc.).
+
+    Returns an :class:`ImprovisationSuggestion`. ``value == ""`` means
+    "no improvisation available" — caller should let the action proceed
+    with whatever the test case had (likely fail → recovery / HITL).
+    """
+    page_summary = _capture_page_summary(page)
+    user_lines = [
+        "STEP THAT NEEDS A CONCRETE VALUE:",
+        f"  title:        {title}",
+        f"  action_type:  {action_type or '(none)'}",
+        f"  target_hint:  {target_hint or '(none)'}",
+        f"  narrative:    {narrative or ''}",
+        f"  expected:     {expected or ''}",
+        "",
+        f"PAGE URL: {_safe_url(page)}",
+        "PAGE SUMMARY (interactive elements visible on the page):",
+        page_summary,
+        "",
+        "Pick a concrete value a human tester would naturally type or "
+        "select here. Copy the visible text verbatim.",
+    ]
+    user_prompt = "\n".join(user_lines)
+
+    try:
+        result = provider.chat_structured(
+            messages=[
+                ChatMessage(
+                    role="system",
+                    content=IMPROVISATION_SYSTEM_PROMPT,
+                ),
+                ChatMessage(role="user", content=user_prompt),
+            ],
+            schema=IMPROVISATION_SCHEMA,
+            schema_name="improvisation",
+            temperature=0.3,
+            max_output_tokens=512,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for improvisation: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"LLM returned unexpected shape for improvisation — expected "
+            f"dict, got {type(parsed).__name__}",
+        )
+
+    return ImprovisationSuggestion(
+        value=str(parsed.get("value", "")).strip(),
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
     )

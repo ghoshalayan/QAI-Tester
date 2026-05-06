@@ -46,7 +46,10 @@ from sqlalchemy.orm import Session
 
 from app.agents.brd_to_frd import AgentCancelled  # reused exception
 from app.config import settings
-from app.agents.page_intel import RecoverySuggestion, propose_recovery
+from app.agents.page_intel import (
+    propose_improvisation,
+    propose_recovery,
+)
 from app.executor import (
     ActionContext,
     BrowserNotInstalledError,
@@ -58,6 +61,7 @@ from app.executor import (
     update_narration,
     wait_for_settled,
 )
+from app.executor.actions import has_concrete_text_payload
 from app.llm.base import LLMProvider
 from app.models.agent_run import AgentRun
 from app.models.execution_step import ExecutionStep
@@ -328,6 +332,86 @@ def _take_screenshot(
         return None
 
 
+# ── AI improvisation (pre-execution) ──────────────────────────────
+
+
+def _try_improvisation(
+    page,
+    *,
+    row: ExecutionStep,
+    ctx: ActionContext,
+    provider: LLMProvider,
+    emit_event: Callable[[str, dict], None] | None,
+) -> dict[str, Any] | None:
+    """Ask the LLM for a concrete value for an ambiguous type/select step.
+
+    Triggered when the test case says e.g. "search any product" but
+    doesn't name one. The LLM looks at the live page and picks
+    something a human would naturally try (first product, first menu
+    option, etc.). The picked value is stuffed into ``ctx.improvised_value``
+    so the dispatcher uses it.
+
+    Returns a dict with keys ``value``, ``reasoning``, ``confidence``,
+    ``tokens_in``, ``tokens_out`` — folded into details_json so the
+    timeline can show "AI typed X because…". ``None`` when the call
+    raised or the LLM declined to pick (empty value).
+    """
+    _emit(emit_event, "ai_improvise_started", {
+        "step_id": row.id,
+        "ordinal": row.ordinal + 1,
+        "title": row.title_snapshot,
+    })
+
+    try:
+        suggestion = propose_improvisation(
+            provider, page,
+            title=row.title_snapshot,
+            action_type=row.action_type_snapshot,
+            target_hint=row.target_hint_snapshot,
+            narrative=row.narrative_snapshot,
+            expected=row.expected_snapshot,
+        )
+    except Exception as e:
+        logger.warning(
+            "improvisation call failed for step %s: %s", row.id, e,
+        )
+        _emit(emit_event, "ai_improvise_completed", {
+            "step_id": row.id,
+            "ordinal": row.ordinal + 1,
+            "outcome": "llm_error",
+            "error": str(e)[:300],
+        })
+        return None
+
+    if not suggestion.value:
+        _emit(emit_event, "ai_improvise_completed", {
+            "step_id": row.id,
+            "ordinal": row.ordinal + 1,
+            "outcome": "no_pick",
+            "reasoning": suggestion.reasoning[:200],
+        })
+        return None
+
+    # Mutate ctx in place so the dispatcher picks it up.
+    ctx.improvised_value = suggestion.value
+
+    _emit(emit_event, "ai_improvise_completed", {
+        "step_id": row.id,
+        "ordinal": row.ordinal + 1,
+        "outcome": "picked",
+        "value": suggestion.value[:120],
+        "confidence": suggestion.confidence,
+    })
+
+    return {
+        "value": suggestion.value,
+        "reasoning": suggestion.reasoning,
+        "confidence": suggestion.confidence,
+        "tokens_in": suggestion.input_tokens,
+        "tokens_out": suggestion.output_tokens,
+    }
+
+
 # ── AI assist on failure ──────────────────────────────────────────
 
 
@@ -342,8 +426,21 @@ def _try_ai_correction(
     original_error: str | None,
     emit_event: Callable[[str, dict], None] | None,
     include_screenshot: bool = False,
+    apply: bool = True,
 ) -> dict[str, Any] | None:
-    """Ask the LLM what to do about a failed step; run its suggestion once.
+    """Ask the LLM what to do about a failed step.
+
+    Two modes:
+
+    - ``apply=True`` (auto_adjust on): call the LLM, THEN execute its
+      suggestion in-place. Returns the dict below with the post-apply
+      ``status``. This is the "AI fixes silently if it can" flow.
+
+    - ``apply=False`` (auto_adjust off — the user-controlled flow): call
+      the LLM only. The suggestion is bundled and returned but NOT
+      executed. The orchestrator falls through to HITL with the
+      suggestion pre-filled in the modal — the human decides whether
+      to accept it.
 
     Called only after :func:`_execute_with_retry` has already burned its
     retry budget. Single-shot — if the AI's correction also fails, we
@@ -351,10 +448,10 @@ def _try_ai_correction(
 
     Returns a dict shaped like:
         {
-            "status": "passed" | "failed",
+            "status": "passed" | "failed" | "proposed",
             "narration": str,
             "error_message": str | None,
-            "correction": {              # always present, used by M4 UI
+            "correction": {              # always present, used by HITL UI
                 "action": "retry" | "replace" | "give_up",
                 "reasoning": str,
                 "confidence": float,
@@ -363,8 +460,10 @@ def _try_ai_correction(
                 "tokens_out": int | None,
             },
         }
-    Or ``None`` when the LLM call itself raised — caller leaves the
-    original failure status in place.
+    ``status="proposed"`` means apply=False ran — caller treats the row
+    as still failed, but HITL gets the suggestion. Or ``None`` when the
+    LLM call itself raised — caller leaves the original failure status
+    in place.
     """
     _emit(emit_event, "ai_assist_started", {
         "step_id": row.id,
@@ -466,6 +565,28 @@ def _try_ai_correction(
     else:
         suggestion_action_effective = "retry"
 
+    # auto_adjust=False: stop here. The HITL modal will show the user
+    # this suggestion (action + diff + reasoning) so they can accept,
+    # tweak, or reject. We do NOT mutate the page — the user is in
+    # control.
+    if not apply:
+        _emit(emit_event, "ai_assist_completed", {
+            "step_id": row.id,
+            "ordinal": row.ordinal + 1,
+            "outcome": "proposed",
+            "action": suggestion_action_effective,
+            "diff_keys": list(correction["diff"].keys()),
+            "used_vision": suggestion.used_vision,
+        })
+        return {
+            "status": "proposed",
+            "narration": (
+                f"AI proposed: {suggestion.reasoning[:200]}"
+            ),
+            "error_message": original_error,
+            "correction": correction,
+        }
+
     corrected_ctx = ActionContext(
         plan_target_url=ctx.plan_target_url,
         target_hint=new_target_hint,
@@ -539,6 +660,8 @@ def execute_plan(
     speed: str | None = None,
     provider: LLMProvider | None = None,
     ai_assist: bool = True,
+    auto_adjust: bool = False,
+    promote_fixes: bool = False,
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     is_paused: Callable[[], bool] | None = None,
@@ -559,6 +682,21 @@ def execute_plan(
         speed: Speed preset name — ``"slow"`` (default), ``"normal"``, or
             ``"fast"``. Controls slow_mo, cursor glide, type delay, and
             the network-idle timeout used by :func:`wait_for_settled`.
+        ai_assist: Enable LLM calls (improvisation + recovery + vision).
+            When False, ambiguous payloads fail the dispatcher and
+            failures escalate straight to HITL with no suggestion.
+        auto_adjust: When True, AI recovery suggestions are auto-applied
+            silently; HITL only fires if the AI's fix also fails. When
+            False (default — matches the user's "human in the loop"
+            preference), the AI suggestion is just PROPOSED — the HITL
+            modal pre-fills the suggestion and the user accepts / edits
+            / rejects.
+        promote_fixes: When True, a fix that produced a passing step
+            (whether AI-applied or HITL-confirmed) is also written back
+            to the source ``tc_nodes`` row so the next run starts with
+            the corrected target_hint / action_type / etc. Off by
+            default — promoting a one-off fix can paper over a real
+            test-case bug.
         emit_event: Optional SSE callback ``(event_type, data) -> None``.
         is_cancelled: Optional callback polled between steps.
 
@@ -718,6 +856,46 @@ def execute_plan(
                 # never reach networkidle and we proceed anyway.
                 wait_for_settled(page, speed_config)
 
+                # Pre-execution improvisation: a "type any product" step
+                # has no concrete payload — without help it'd fail with
+                # "type: cannot find text to enter". Ask the LLM to look
+                # at the page and pick a sensible value FIRST. This is
+                # the human-tester behavior the user asked for: "search
+                # any product → AI finds a product on the catalog and
+                # uses its name". Cheap (~300 input tokens) and runs
+                # only when the dispatcher would otherwise fail.
+                action_key = (row.action_type_snapshot or "").lower()
+                needs_payload = action_key in ("type", "select")
+                improvisation_record = None
+                if (
+                    needs_payload
+                    and provider is not None
+                    and ai_assist
+                    and not has_concrete_text_payload(ctx)
+                    and not (is_cancelled and is_cancelled())
+                ):
+                    improvisation_record = _try_improvisation(
+                        page,
+                        row=row,
+                        ctx=ctx,
+                        provider=provider,
+                        emit_event=emit_event,
+                    )
+                    if improvisation_record is not None:
+                        ai_calls += 1
+                        if isinstance(
+                            improvisation_record.get("tokens_in"), int,
+                        ):
+                            ai_input_tokens_total += (
+                                improvisation_record["tokens_in"]
+                            )
+                        if isinstance(
+                            improvisation_record.get("tokens_out"), int,
+                        ):
+                            ai_output_tokens_total += (
+                                improvisation_record["tokens_out"]
+                            )
+
                 result, attempt_log = _execute_with_retry(
                     page, row, ctx, speed_config,
                     is_cancelled=is_cancelled,
@@ -729,17 +907,30 @@ def execute_plan(
                 details: dict[str, Any] = dict(result.details)
                 if len(attempt_log) > 1:
                     details["attempts"] = attempt_log
+                if improvisation_record is not None:
+                    details["ai_improvisation"] = improvisation_record
 
-                # AI assist on failure. Two-pass escalation:
-                #   pass 1: text-only (accessibility tree)
-                #   pass 2: vision (text + screenshot) — only when the
-                #           provider supports it AND pass 1 didn't fix
-                #           the step. Vision tokens are ~3-5× the cost of
-                #           text-only, so we only spend them when the AX
-                #           tree alone wasn't enough.
-                # Outcome is recorded in details["ai_correction"]
-                # regardless of pass/fail so the HITL modal can render
-                # the diff + reasoning + which pass produced it.
+                # AI assist on failure.
+                #
+                # auto_adjust=True (silent self-heal):
+                #   Two-pass escalation —
+                #     pass 1: text-only (AX tree); apply suggestion
+                #     pass 2: vision (text + screenshot) IFF pass 1 didn't
+                #             fix the step AND provider supports vision.
+                #             Tokens from BOTH passes accumulate.
+                #   HITL only fires if both passes still leave the step
+                #   failed.
+                #
+                # auto_adjust=False (default — human in the loop):
+                #   One text-only call; suggestion is NOT applied to the
+                #   page. The HITL modal pre-fills with the suggestion so
+                #   the user accepts / edits / rejects it. We skip vision
+                #   here because the user is already going to see the
+                #   suggestion + screenshot in the modal — paying for a
+                #   second LLM call adds latency the user feels.
+                #
+                # Outcome is always recorded in details["ai_correction"]
+                # so the HITL modal can render the diff + reasoning.
                 if (
                     result_status == "failed"
                     and provider is not None
@@ -756,6 +947,7 @@ def execute_plan(
                         original_error=error_msg,
                         emit_event=emit_event,
                         include_screenshot=False,
+                        apply=auto_adjust,
                     )
                     if ai_outcome is not None:
                         ai_calls += 1
@@ -765,13 +957,12 @@ def execute_plan(
                         if isinstance(c.get("tokens_out"), int):
                             ai_output_tokens_total += c["tokens_out"]
 
-                    # Vision escalation: if the text-only suggestion
-                    # didn't fix the step and the provider can see images,
-                    # take another swing with the page screenshot
-                    # attached. Tokens from BOTH passes accumulate so the
-                    # cost meter reflects total LLM spend on this run.
+                    # Vision escalation only makes sense when we're
+                    # auto-applying — otherwise the user picks up after
+                    # the text-only suggestion via HITL.
                     if (
-                        ai_outcome is not None
+                        auto_adjust
+                        and ai_outcome is not None
                         and ai_outcome["status"] == "failed"
                         and getattr(provider, "supports_vision", False)
                         and not (is_cancelled and is_cancelled())
@@ -786,6 +977,7 @@ def execute_plan(
                             original_error=error_msg,
                             emit_event=emit_event,
                             include_screenshot=True,
+                            apply=True,
                         )
                         if vision_outcome is not None:
                             ai_calls += 1
@@ -800,11 +992,20 @@ def execute_plan(
                     if ai_outcome is not None:
                         details["ai_correction"] = ai_outcome["correction"]
                         if ai_outcome["status"] == "passed":
-                            # AI fixed it. Promote the row to passed and let
-                            # the live narration reflect what changed.
+                            # AI fixed it (auto_adjust path). Promote the
+                            # row to passed and let the live narration
+                            # reflect what changed.
                             result_status = "passed"
                             narration = ai_outcome["narration"]
                             error_msg = None
+                        elif ai_outcome["status"] == "proposed":
+                            # auto_adjust=False path: AI didn't touch the
+                            # page; HITL will see the suggestion. Keep
+                            # the row failed; surface the proposal in
+                            # narration so the timeline tells the story.
+                            narration = (
+                                f"{narration} · {ai_outcome['narration']}"
+                            )
                         else:
                             # AI tried but failed too. Keep the row failed,
                             # but augment narration with the AI's attempt
@@ -944,6 +1145,59 @@ def execute_plan(
                         )
                         narration = prefix + retry_result.narration
                         error_msg = retry_result.error_message
+
+                # promote_fixes: if the step passed AFTER a correction was
+                # applied (AI auto_adjust OR a HITL use_suggestion / retry
+                # with overrides), write the corrected fields back to the
+                # source tc_node so the next run starts with the fix
+                # baked in. Off by default — promoting a one-off fix can
+                # paper over a real test-case bug.
+                if (
+                    promote_fixes
+                    and result_status == "passed"
+                    and row.tc_node_id is not None
+                ):
+                    promoted_fields: dict[str, Any] = {}
+                    correction = details.get("ai_correction")
+                    if (
+                        isinstance(correction, dict)
+                        and auto_adjust
+                        and correction.get("action") == "replace"
+                    ):
+                        diff = correction.get("diff") or {}
+                        for field in (
+                            "target_hint", "action_type",
+                            "expected", "narrative",
+                        ):
+                            if field in diff and diff[field].get("new"):
+                                promoted_fields[field] = diff[field]["new"]
+
+                    intervention = details.get("intervention")
+                    if isinstance(intervention, dict):
+                        if intervention.get("override_target_hint"):
+                            promoted_fields["target_hint"] = (
+                                intervention["override_target_hint"]
+                            )
+                        if intervention.get("override_action_type"):
+                            promoted_fields["action_type"] = (
+                                intervention["override_action_type"]
+                            )
+
+                    if promoted_fields:
+                        node = db.get(TcNode, row.tc_node_id)
+                        if node is not None:
+                            for field, value in promoted_fields.items():
+                                setattr(node, field, value)
+                            db.commit()
+                            details["promoted_fix"] = {
+                                "tc_node_id": row.tc_node_id,
+                                "fields": list(promoted_fields.keys()),
+                            }
+                            _emit(emit_event, "fix_promoted", {
+                                "step_id": row.id,
+                                "tc_node_id": row.tc_node_id,
+                                "fields": list(promoted_fields.keys()),
+                            })
 
                 # Flip the banner to the outcome state BEFORE the screenshot
                 # so the per-step PNG carries the green ✓ / red ✗ marker.

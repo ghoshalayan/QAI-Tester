@@ -322,6 +322,13 @@ export interface ExecuteRunRequest {
   headless?: boolean;
   speed?: "slow" | "normal" | "fast";
   ai_assist?: boolean;
+  /** When true, AI fixes auto-apply and HITL only fires if both passes
+   * (text + vision) still leave the step failed. When false (default),
+   * the AI suggestion is just proposed and HITL pre-fills with it. */
+  auto_adjust?: boolean;
+  /** When true, a fix that produces a passing step (AI auto-applied or
+   * HITL-confirmed) is also written back to the source tc_node. */
+  promote_fixes?: boolean;
 }
 
 // ── HITL intervention ────────────────────────────────────────────
@@ -989,4 +996,25 @@ export const api = {
       `/api/projects/${projectId}/plans/${planId}/tc-nodes/bulk-update`,
       { method: "POST", body: JSON.stringify(payload) },
     ),
+  /** Absolute URL for the TC export download — pass to an `<a download>`. */
+  exportTcNodesUrl: (
+    projectId: number,
+    planId: number,
+    opts: {
+      format: "json" | "md";
+      nodeIds?: number[];
+      selectedOnly?: boolean;
+    },
+  ): string => {
+    const params = new URLSearchParams({ format: opts.format });
+    if (opts.nodeIds && opts.nodeIds.length > 0) {
+      params.set("node_ids", opts.nodeIds.join(","));
+    } else if (opts.selectedOnly) {
+      params.set("selected_only", "true");
+    }
+    return (
+      `${API_BASE}/api/projects/${projectId}/plans/${planId}` +
+      `/tc-nodes/export?${params.toString()}`
+    );
+  },
 };

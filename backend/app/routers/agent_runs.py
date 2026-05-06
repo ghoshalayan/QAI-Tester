@@ -266,6 +266,9 @@ def start_execute(
             "selected_step_ids": payload.selected_step_ids,
             "headless": payload.headless,
             "speed": payload.speed,
+            "ai_assist": payload.ai_assist,
+            "auto_adjust": payload.auto_adjust,
+            "promote_fixes": payload.promote_fixes,
         },
         output_summary_json={},
     )

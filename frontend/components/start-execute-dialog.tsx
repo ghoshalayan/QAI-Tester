@@ -2,7 +2,16 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Eye, EyeOff, Gauge, Play, Turtle, Zap } from "lucide-react";
+import {
+  Eye,
+  EyeOff,
+  Gauge,
+  GitCommit,
+  Play,
+  Sparkles,
+  Turtle,
+  Zap,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -69,12 +78,16 @@ export function StartExecuteDialog({
   const [planId, setPlanId] = useState<number | null>(defaultPlanId ?? null);
   const [headless, setHeadless] = useState(false);
   const [speed, setSpeed] = useState<Speed>("slow");
+  const [autoAdjust, setAutoAdjust] = useState(false);
+  const [promoteFixes, setPromoteFixes] = useState(false);
 
   useEffect(() => {
     if (open) {
       setPlanId(defaultPlanId ?? null);
       setHeadless(false);
       setSpeed("slow");
+      setAutoAdjust(false);
+      setPromoteFixes(false);
     }
   }, [open, defaultPlanId]);
 
@@ -102,6 +115,8 @@ export function StartExecuteDialog({
         plan_id: planId!,
         headless,
         speed,
+        auto_adjust: autoAdjust,
+        promote_fixes: promoteFixes,
       }),
     onSuccess: (run) => {
       toast.success("Execution queued", {
@@ -212,6 +227,40 @@ export function StartExecuteDialog({
                 </p>
               </div>
             </div>
+
+            <ToggleRow
+              icon={Sparkles}
+              active={autoAdjust}
+              activeTone="amber"
+              onToggle={() => setAutoAdjust(!autoAdjust)}
+              ariaLabel={autoAdjust ? "Disable auto-adjust" : "Enable auto-adjust"}
+              title={autoAdjust ? "Auto-adjust on" : "Auto-adjust off"}
+              hint={
+                autoAdjust
+                  ? "AI fixes silently when it can. HITL only fires if both text and vision passes still fail. Faster, but skips your review."
+                  : "AI suggestions are proposed only — the HITL modal pre-fills with the suggestion and you approve / edit / reject. Recommended."
+              }
+            />
+
+            <ToggleRow
+              icon={GitCommit}
+              active={promoteFixes}
+              activeTone="emerald"
+              onToggle={() => setPromoteFixes(!promoteFixes)}
+              ariaLabel={
+                promoteFixes
+                  ? "Disable promote fixes"
+                  : "Enable promote fixes"
+              }
+              title={
+                promoteFixes ? "Promote fixes to test case" : "Don't promote fixes"
+              }
+              hint={
+                promoteFixes
+                  ? "When a fix produces a passing step (AI auto or HITL override), patch the source test case so the next run starts with it."
+                  : "Fixes apply only to this run. The source test case is left as-is."
+              }
+            />
           </div>
         )}
 
@@ -233,6 +282,53 @@ export function StartExecuteDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function ToggleRow({
+  icon: Icon,
+  active,
+  onToggle,
+  ariaLabel,
+  title,
+  hint,
+  activeTone = "primary",
+}: {
+  icon: typeof Sparkles;
+  active: boolean;
+  onToggle: () => void;
+  ariaLabel: string;
+  title: string;
+  hint: string;
+  activeTone?: "primary" | "amber" | "emerald";
+}) {
+  const activeClass =
+    activeTone === "amber"
+      ? "border-amber-500/50 bg-amber-500/15 text-amber-700 dark:text-amber-300"
+      : activeTone === "emerald"
+        ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+        : "border-primary/40 bg-primary/10 text-primary";
+  return (
+    <div className="flex items-start gap-3 rounded-md border p-3">
+      <button
+        type="button"
+        onClick={onToggle}
+        className={cn(
+          "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-md border transition-colors",
+          active
+            ? activeClass
+            : "border-input bg-muted text-muted-foreground",
+        )}
+        aria-pressed={active}
+        aria-label={ariaLabel}
+      >
+        <Icon className="size-4" />
+      </button>
+      <div className="min-w-0 flex-1 text-sm">
+        <p className="font-medium">{title}</p>
+        <p className="text-xs text-muted-foreground">{hint}</p>
+      </div>
+    </div>
   );
 }
 

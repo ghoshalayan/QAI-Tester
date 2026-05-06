@@ -608,6 +608,8 @@ def execute_run(run_id: int) -> None:
             return
 
         ai_assist = bool(input_data.get("ai_assist", True))
+        auto_adjust = bool(input_data.get("auto_adjust", False))
+        promote_fixes = bool(input_data.get("promote_fixes", False))
 
         # Build the LLM provider for AI assist on failure. Missing config is
         # NOT fatal — the run continues with ai_assist disabled. This keeps
@@ -634,6 +636,8 @@ def execute_run(run_id: int) -> None:
                 speed=speed_raw,
                 provider=provider,
                 ai_assist=ai_assist,
+                auto_adjust=auto_adjust,
+                promote_fixes=promote_fixes,
                 emit_event=lambda et, data: _emit_run_event(run, et, data),
                 is_cancelled=lambda: _is_cancelled(run.id),
                 is_paused=lambda: _is_paused(run.id),

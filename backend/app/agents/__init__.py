@@ -27,21 +27,27 @@ from app.agents.frd_to_tc import (
     synthesize_tc,
 )
 from app.agents.page_intel import (
+    IMPROVISATION_SCHEMA,
     RECOVERY_SCHEMA,
+    ImprovisationSuggestion,
     RecoveryAction,
     RecoverySuggestion,
+    propose_improvisation,
     propose_recovery,
 )
 
 __all__ = [
     "AgentCancelled",
     "ExecutionResult",
+    "IMPROVISATION_SCHEMA",
+    "ImprovisationSuggestion",
     "RECOVERY_SCHEMA",
     "RecoveryAction",
     "RecoverySuggestion",
     "SynthesisResult",
     "TcSynthesisResult",
     "execute_plan",
+    "propose_improvisation",
     "propose_recovery",
     "synthesize_frd",
     "synthesize_tc",

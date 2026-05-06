@@ -29,7 +29,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,11 @@ from app.schemas.tc_node import (
     TcNodeRead,
     TcNodeTreeRead,
     TcNodeUpdate,
+)
+from app.services.tc_export_service import (
+    _select_export_nodes,
+    export_to_json,
+    export_to_markdown,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,6 +262,87 @@ def bulk_update(
         affected=len(rows),
         affected_ids=affected_ids if payload.action != "delete" else [],
         action=payload.action,
+    )
+
+
+# ── Export (literal — before /{node_id}) ──────────────────────────
+
+
+@router.get("/export")
+def export_nodes(
+    project_id: int,
+    plan_id: int,
+    fmt: str = Query(default="json", alias="format", pattern="^(json|md)$"),
+    node_ids: str | None = Query(
+        default=None,
+        description=(
+            "Optional comma-separated list of node ids. When provided, only "
+            "those nodes (plus their ancestor chain for context) are exported."
+        ),
+    ),
+    selected_only: bool = Query(
+        default=False,
+        description=(
+            "When true, export step rows with selectable_default=True plus "
+            "their ancestors. Equivalent to 'what would run on the next "
+            "execute'. Ignored when node_ids is set."
+        ),
+    ),
+    db: Session = Depends(get_db),
+):
+    """Download the plan's TC tree as ``json`` (re-importable) or
+    ``md`` (human-readable Markdown).
+
+    Selection:
+    - ``node_ids=1,2,3`` → those nodes + their ancestors
+    - ``selected_only=true`` → all selectable_default steps + ancestors
+    - neither → entire tree
+
+    Returned with ``Content-Disposition: attachment`` so a frontend ``<a
+    href download>`` triggers a download. Empty selections still return
+    a valid empty document.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+
+    parsed_ids: list[int] | None = None
+    if node_ids:
+        try:
+            parsed_ids = [
+                int(x) for x in node_ids.split(",") if x.strip()
+            ]
+        except ValueError:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "node_ids must be a comma-separated list of integers",
+            )
+
+    nodes = _select_export_nodes(
+        db,
+        plan_id=plan_id,
+        node_ids=parsed_ids,
+        selected_only=selected_only,
+    )
+
+    safe_name = "".join(
+        c if c.isalnum() or c in "-_." else "_" for c in (plan.name or "plan")
+    )[:60] or "plan"
+
+    if fmt == "md":
+        body = export_to_markdown(db, plan, nodes=nodes)
+        filename = f"{safe_name}-test-cases.md"
+        media_type = "text/markdown; charset=utf-8"
+    else:
+        body = export_to_json(db, plan, nodes=nodes)
+        filename = f"{safe_name}-test-cases.json"
+        media_type = "application/json"
+
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

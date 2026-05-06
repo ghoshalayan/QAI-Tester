@@ -77,6 +77,12 @@ class ActionContext:
     network-idle wait timeout used by the orchestrator before each action.
     Defaults to :data:`SLOW` so callers that don't pass one (e.g. unit
     tests, dispatcher smoke calls) get the safest behavior.
+
+    ``improvised_value`` is set by the orchestrator when the test case
+    left the type/select payload ambiguous (e.g. "search any product")
+    and ``app.agents.page_intel.propose_improvisation`` resolved it
+    against the live page. When set, the dispatcher uses it as the
+    text payload — overriding the quoted-narrative / data_needs fallback.
     """
 
     plan_target_url: str
@@ -85,6 +91,7 @@ class ActionContext:
     expected: str | None
     data_needs: list[dict[str, Any]]
     speed_config: SpeedConfig = SLOW
+    improvised_value: str | None = None
 
 
 @dataclass
@@ -142,11 +149,18 @@ def _extract_text_payload(ctx: ActionContext) -> str | None:
     """Find the literal text to type/select for this step.
 
     Order of evidence:
-    1. First quoted token in the narrative (LLM's most common pattern)
-    2. ``data_needs[kind='data'].notes``
+    1. ``improvised_value`` — orchestrator already asked the LLM to pick
+       a concrete value from the live page (only set when the step was
+       ambiguous and improvisation succeeded).
+    2. First quoted token in the narrative (LLM's most common pattern).
+    3. ``data_needs[kind='data'].notes``.
 
-    Returns None if neither yields anything usable.
+    Returns None if none yields anything usable.
     """
+    if ctx.improvised_value:
+        improv = ctx.improvised_value.strip()
+        if improv:
+            return improv
     if ctx.narrative:
         m = _QUOTED_TEXT_RE.search(ctx.narrative)
         if m:
@@ -157,6 +171,24 @@ def _extract_text_payload(ctx: ActionContext) -> str | None:
             if notes:
                 return notes
     return None
+
+
+def has_concrete_text_payload(ctx: ActionContext) -> bool:
+    """Public probe — does this type/select step already have a value?
+
+    Orchestrator uses this to decide whether to call
+    ``propose_improvisation`` before dispatch. Mirrors the same evidence
+    order as :func:`_extract_text_payload` *minus* the ``improvised_value``
+    branch, so the question is "would dispatch find a payload without
+    improvisation?".
+    """
+    if ctx.narrative and _QUOTED_TEXT_RE.search(ctx.narrative):
+        return True
+    for need in ctx.data_needs or ():
+        if str(need.get("kind", "")).lower() == "data":
+            if (need.get("notes") or "").strip():
+                return True
+    return False
 
 
 def _extract_url(ctx: ActionContext) -> str | None:
