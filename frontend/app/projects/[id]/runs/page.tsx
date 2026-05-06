@@ -4,14 +4,16 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Play } from "lucide-react";
+import { Play, Trash2 } from "lucide-react";
 
 import { api, type AgentRunRead } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DeleteRunDialog } from "@/components/delete-run-dialog";
 import { RunProgressCard } from "@/components/run-progress-card";
 import { StartExecuteDialog } from "@/components/start-execute-dialog";
 import { useAgentRunsEvents } from "@/hooks/use-agent-runs-events";
+import { cn } from "@/lib/utils";
 
 export default function RunsTabPage() {
   const params = useParams<{ id: string }>();
@@ -74,13 +76,51 @@ function RunRow({
   projectId: number;
   run: AgentRunRead;
 }) {
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const isActive =
+    run.status === "queued" ||
+    run.status === "running" ||
+    run.status === "paused";
+
   return (
-    <Link
-      href={`/projects/${projectId}/runs/${run.id}`}
-      className="block rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    >
-      <RunProgressCard projectId={projectId} run={run} />
-    </Link>
+    <div className="group relative">
+      <Link
+        href={`/projects/${projectId}/runs/${run.id}`}
+        className="block rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <RunProgressCard projectId={projectId} run={run} />
+      </Link>
+      {/* Trash button overlays the card. stopPropagation so clicking it
+          doesn't also follow the parent Link to the run-detail page. */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setDeleteOpen(true);
+        }}
+        disabled={isActive}
+        title={
+          isActive
+            ? "Cancel the run first before deleting"
+            : "Delete this run"
+        }
+        aria-label={`Delete run #${run.id}`}
+        className={cn(
+          "absolute right-3 top-3 z-10 inline-flex size-8 items-center justify-center rounded-md border bg-background/80 text-muted-foreground opacity-0 backdrop-blur transition-all hover:border-red-500/50 hover:bg-red-500/10 hover:text-red-700 focus:opacity-100 group-hover:opacity-100 dark:hover:text-red-400",
+          isActive && "cursor-not-allowed opacity-30 hover:border-input hover:bg-background/80 hover:text-muted-foreground",
+        )}
+      >
+        <Trash2 className="size-4" />
+      </button>
+
+      <DeleteRunDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        projectId={projectId}
+        run={run}
+      />
+    </div>
   );
 }
 

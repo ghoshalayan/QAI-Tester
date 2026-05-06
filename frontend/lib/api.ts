@@ -329,6 +329,10 @@ export interface ExecuteRunRequest {
   /** When true, a fix that produces a passing step (AI auto-applied or
    * HITL-confirmed) is also written back to the source tc_node. */
   promote_fixes?: boolean;
+  /** Run mode:
+   * - "scripted" (default): rigid step-walker with AI patches.
+   * - "agentic":   goal-oriented QA agent loop per submodule. */
+  mode?: "scripted" | "agentic";
   /** Headed Chromium window position + size, in screen pixels. The
    * frontend computes these from ``window.screen.availWidth/Height`` so
    * the browser tiles to the left and the live presenter popup fits on
@@ -368,6 +372,19 @@ export interface AiCorrection {
 
 // ── Reports ──────────────────────────────────────────────────────
 
+export interface ReportAgentTurn {
+  turn: number;
+  tool: string;
+  args: Record<string, unknown>;
+  reasoning: string;
+  confidence: number;
+  status: string; // "ok" | "failed" | "blocked" | "stop"
+  narration: string;
+  error_message: string | null;
+  page_url: string;
+  extracted_text: string;
+}
+
 export interface ReportStepRead {
   id: number;
   tc_node_id: number | null;
@@ -382,6 +399,12 @@ export interface ReportStepRead {
   narration: string | null;
   ai_helped: boolean;
   ai_used_vision: boolean;
+  // Agentic-mode (Phase C). null/empty for scripted runs.
+  mode: "scripted" | "agentic" | null;
+  halt_reason: string | null;
+  goal_description: string | null;
+  success_criteria: string[];
+  agent_log: ReportAgentTurn[];
 }
 
 export interface ReportSubmoduleRead {
@@ -463,7 +486,8 @@ export type ExecutionStepStatus =
   | "passed"
   | "failed"
   | "skipped"
-  | "blocked";
+  | "blocked"
+  | "inconclusive";
 
 export const EXECUTION_STEP_STATUS_LABELS: Record<
   ExecutionStepStatus,
@@ -475,6 +499,7 @@ export const EXECUTION_STEP_STATUS_LABELS: Record<
   failed: "Failed",
   skipped: "Skipped",
   blocked: "Blocked",
+  inconclusive: "Inconclusive",
 };
 
 export interface ExecutionStepRead {
@@ -871,6 +896,11 @@ export const api = {
     apiFetch<AgentRunRead>(
       `/api/projects/${projectId}/agent-runs/${runId}/cancel`,
       { method: "POST" },
+    ),
+  deleteAgentRun: (projectId: number, runId: number) =>
+    apiFetch<void>(
+      `/api/projects/${projectId}/agent-runs/${runId}`,
+      { method: "DELETE" },
     ),
   pauseAgentRun: (projectId: number, runId: number) =>
     apiFetch<AgentRunRead>(

@@ -18,7 +18,27 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ExecutionStepStatus = Literal[
     "pending", "running", "passed", "failed", "skipped", "blocked",
+    "inconclusive",
 ]
+
+
+class ReportAgentTurn(BaseModel):
+    """One turn from the agentic-mode log — the agent's per-LLM-call
+    breakdown of what it observed, decided, and did. Lifted from
+    ``execution_steps.details_json["agent_log"]`` so the report UI can
+    render the trail without re-fetching raw JSON.
+    """
+
+    turn: int
+    tool: str
+    args: dict = Field(default_factory=dict)
+    reasoning: str = ""
+    confidence: float = 0.0
+    status: str = ""               # "ok" | "failed" | "blocked" | "stop"
+    narration: str = ""
+    error_message: str | None = None
+    page_url: str = ""
+    extracted_text: str = ""
 AgentStatus = Literal[
     "queued", "running", "paused", "completed", "failed", "cancelled",
 ]
@@ -45,6 +65,15 @@ class ReportStepRead(BaseModel):
     ai_helped: bool = False
     # Set when AI assist used vision (text + screenshot) on its last try.
     ai_used_vision: bool = False
+
+    # ── Agentic-mode fields (Phase C) ─────────────────────────────
+    # Lifted from ``execution_steps.details_json`` when the run mode was
+    # "agentic". ``mode`` is None for scripted runs.
+    mode: Literal["scripted", "agentic"] | None = None
+    halt_reason: str | None = None
+    goal_description: str | None = None
+    success_criteria: list[str] = Field(default_factory=list)
+    agent_log: list[ReportAgentTurn] = Field(default_factory=list)
 
 
 class ReportSubmoduleRead(BaseModel):

@@ -163,7 +163,11 @@ class GeminiProvider(LLMProvider):
 
         text = (response.text or "").strip()
         try:
-            parsed = json.loads(text)
+            # Tolerant: parse the first valid JSON value and ignore any
+            # trailing chain-of-thought / stray text Gemini sometimes
+            # appends despite ``response_mime_type="application/json"``.
+            from app.llm.openai_provider import _tolerant_json_parse
+            parsed = _tolerant_json_parse(text)
         except json.JSONDecodeError as e:
             raise RuntimeError(
                 f"Gemini returned invalid JSON: {e}. "

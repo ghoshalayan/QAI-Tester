@@ -79,6 +79,15 @@ class ExecuteRunRequest(BaseModel):
     auto_adjust: bool = Field(default=False)
     promote_fixes: bool = Field(default=False)
 
+    # Run mode:
+    # - "scripted" (default): rigid step-walker; AI only intervenes on
+    #   failure (improvise / recover / vision escalation).
+    # - "agentic":  goal-oriented QA agent loop. One LLM-driven loop
+    #   per submodule (= test case). The agent observes the page,
+    #   picks tools, and self-verifies against derived success
+    #   criteria. Requires an LLM provider configured in App Settings.
+    mode: Literal["scripted", "agentic"] = Field(default="scripted")
+
     # Window geometry — set by the frontend from ``window.screen`` so the
     # headed Chromium tiles to fit the user's monitor and leaves the
     # right side free for the live presenter popup. All four are optional;

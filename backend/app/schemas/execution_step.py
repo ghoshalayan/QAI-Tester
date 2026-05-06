@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 
 ExecutionStepStatus = Literal[
     "pending", "running", "passed", "failed", "skipped", "blocked",
+    "inconclusive",
 ]
 
 

@@ -11,6 +11,7 @@ parametric ``/{run_id}`` so the router doesn't try to parse them as ints.
 from __future__ import annotations
 
 import logging
+import shutil
 
 from fastapi import (
     APIRouter,
@@ -25,6 +26,7 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.executor import chromium_installed
 from app.models.agent_run import AgentRun
@@ -269,6 +271,7 @@ def start_execute(
             "ai_assist": payload.ai_assist,
             "auto_adjust": payload.auto_adjust,
             "promote_fixes": payload.promote_fixes,
+            "mode": payload.mode,
             "window_x": payload.window_x,
             "window_y": payload.window_y,
             "window_width": payload.window_width,
@@ -434,6 +437,53 @@ def cancel_run(
     logger.info("Cancel requested for run %s (current status=%s)",
                 run.id, run.status)
     return run
+
+
+@router.delete(
+    "/{run_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+def delete_run(
+    project_id: int, run_id: int, db: Session = Depends(get_db),
+):
+    """Delete a run and its artifacts.
+
+    Refuses while the run is active (queued / running / paused) — the
+    user must cancel first, otherwise the runner thread keeps writing
+    rows that point at a deleted parent. Once terminal, the row delete
+    cascades to ``execution_steps`` (CASCADE FK), and we also remove
+    the run's screenshots directory under ``data/screenshots/{run_id}``
+    so the disk doesn't grow unbounded.
+
+    Idempotent: deleting a missing run returns 404 via ``_require_run``;
+    re-deleting an already-deleted run returns 404.
+    """
+    run = _require_run(db, project_id, run_id)
+
+    if run.status in ("queued", "running", "paused"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot delete an active run (status={run.status}). "
+            f"Cancel it first via POST /{run_id}/cancel.",
+        )
+
+    # Best-effort screenshot cleanup. Failures are logged but don't
+    # block the row delete — orphaned files on disk are recoverable
+    # (a periodic janitor / manual rm), an orphaned DB row is not.
+    try:
+        run_dir = settings.screenshots_dir / str(run.id)
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+    except Exception as e:
+        logger.warning(
+            "Failed to remove screenshots dir for run %s: %s", run.id, e,
+        )
+
+    db.delete(run)
+    db.commit()
+    logger.info("Deleted run %s (project %s)", run_id, project_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{run_id}/pause", response_model=AgentRunRead)

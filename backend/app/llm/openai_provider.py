@@ -60,6 +60,42 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+def _tolerant_json_parse(text: str) -> Any:
+    """Parse the FIRST valid JSON value in ``text`` and ignore trailing data.
+
+    Why not ``json.loads``: with strict-schema responses, we sometimes
+    get a perfectly valid JSON object followed by a trailing newline +
+    a second object (the model briefly chain-of-thought-ed before
+    closing) or by stray reasoning text. ``json.loads`` rejects this
+    with ``Extra data: line 2 column 1`` even though the first object
+    is exactly what we asked for.
+
+    ``raw_decode`` consumes only the first value and returns the
+    byte-offset where it stopped — we ignore the tail. This matches
+    what every other JSON-extraction lib does (langchain, pydantic-ai,
+    etc.) and is the standard fix.
+
+    Falls back to ``_strip_fences`` for fenced output; raises
+    ``json.JSONDecodeError`` only if NEITHER path yields a value.
+    """
+    if not text:
+        return {}
+    text = text.strip()
+    if not text:
+        return {}
+    decoder = json.JSONDecoder()
+    try:
+        value, _idx = decoder.raw_decode(text)
+        return value
+    except json.JSONDecodeError:
+        # Fence-wrapped output — strip and retry.
+        stripped = _strip_fences(text)
+        if stripped and stripped != text:
+            value, _idx = decoder.raw_decode(stripped)
+            return value
+        raise
+
+
 class OpenAIProvider(LLMProvider):
     """Backs both the ``openai`` and ``openai_compat`` settings values."""
 
@@ -211,7 +247,7 @@ class OpenAIProvider(LLMProvider):
             text = choice.message.content.strip()
 
         try:
-            parsed = json.loads(text) if text else {}
+            parsed = _tolerant_json_parse(text)
         except json.JSONDecodeError as e:
             raise RuntimeError(
                 f"OpenAI returned invalid JSON despite strict schema: {e}. "
@@ -299,11 +335,9 @@ class OpenAIProvider(LLMProvider):
                     text = choice.message.content.strip()
                 last_text = text
 
-                # Try strict parse, then fence-stripped parse
-                try:
-                    parsed = json.loads(text) if text else {}
-                except json.JSONDecodeError:
-                    parsed = json.loads(_strip_fences(text))
+                # Tolerant parse: handles fences AND trailing-data cases
+                # (model emits a valid object, newline, then stray text).
+                parsed = _tolerant_json_parse(text)
 
                 usage = getattr(response, "usage", None)
                 return ChatResult(

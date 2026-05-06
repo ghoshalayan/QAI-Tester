@@ -47,7 +47,14 @@ _ISSUES_PER_SUBMODULE = 5
 
 def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
     """Flatten an ExecutionStep into a ReportStepRead, lifting AI flags
-    out of ``details_json`` so the frontend doesn't have to re-parse JSON."""
+    out of ``details_json`` so the frontend doesn't have to re-parse JSON.
+
+    For agentic-mode rows (``details_json["mode"] == "agentic"``), also
+    lifts the goal description, success criteria, halt reason, and the
+    full per-turn agent log so the report timeline can render the
+    observe → think → act → verify trail without needing to re-fetch
+    raw JSON.
+    """
     details = step.details_json or {}
     ai = details.get("ai_correction") if isinstance(details, dict) else None
 
@@ -57,6 +64,27 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         and isinstance(ai, dict)
         and bool(ai.get("used_vision"))
     )
+
+    # Agentic-mode fields — None / empty for scripted runs.
+    mode = None
+    halt_reason = None
+    goal_description = None
+    success_criteria: list[str] = []
+    agent_log: list[dict] = []
+    if isinstance(details, dict) and details.get("mode") == "agentic":
+        mode = "agentic"
+        halt_reason = details.get("halt_reason")
+        goal = details.get("goal") or {}
+        if isinstance(goal, dict):
+            goal_description = goal.get("description")
+            sc = goal.get("success_criteria") or []
+            if isinstance(sc, list):
+                success_criteria = [str(c) for c in sc if isinstance(c, str)]
+        log = details.get("agent_log") or []
+        if isinstance(log, list):
+            # Preserve the raw dicts; Pydantic coerces them on the
+            # ReportStepRead boundary via ReportAgentTurn(**dict).
+            agent_log = [t for t in log if isinstance(t, dict)]
 
     return ReportStepRead(
         id=step.id,
@@ -72,6 +100,11 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         narration=step.narration,
         ai_helped=ai_helped,
         ai_used_vision=ai_used_vision,
+        mode=mode,  # type: ignore[arg-type]
+        halt_reason=halt_reason,
+        goal_description=goal_description,
+        success_criteria=success_criteria,
+        agent_log=agent_log,  # type: ignore[arg-type]
     )
 
 
@@ -97,13 +130,26 @@ def _split_path(path: str) -> tuple[str, str]:
 
 
 def _zero_counts() -> dict[str, int]:
-    return {"total": 0, "passed": 0, "failed": 0, "blocked": 0, "skipped": 0}
+    return {
+        "total": 0,
+        "passed": 0,
+        "failed": 0,
+        "blocked": 0,
+        "skipped": 0,
+        # Agentic-mode runs can produce ``inconclusive`` rows when a goal
+        # halts before being verified. We roll them into the report's
+        # ``failed`` bucket for the headline pass/fail charts (same as
+        # the legacy ExecutionResult does), but track them separately so
+        # the per-row status badge shows the truth.
+    }
 
 
 def _accumulate(counts: dict[str, int], status: str) -> None:
     counts["total"] += 1
     if status in ("passed", "failed", "blocked", "skipped"):
         counts[status] += 1
+    elif status == "inconclusive":
+        counts["failed"] += 1
 
 
 def _pcts(counts: dict[str, int]) -> tuple[float, float]:

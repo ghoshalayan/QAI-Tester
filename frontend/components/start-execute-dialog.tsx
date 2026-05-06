@@ -3,10 +3,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Bot,
   Eye,
   EyeOff,
   Gauge,
   GitCommit,
+  ListChecks,
   Play,
   Sparkles,
   Turtle,
@@ -80,6 +82,7 @@ export function StartExecuteDialog({
   const [speed, setSpeed] = useState<Speed>("slow");
   const [autoAdjust, setAutoAdjust] = useState(false);
   const [promoteFixes, setPromoteFixes] = useState(false);
+  const [mode, setMode] = useState<"scripted" | "agentic">("scripted");
 
   useEffect(() => {
     if (open) {
@@ -88,6 +91,7 @@ export function StartExecuteDialog({
       setSpeed("slow");
       setAutoAdjust(false);
       setPromoteFixes(false);
+      setMode("scripted");
     }
   }, [open, defaultPlanId]);
 
@@ -111,30 +115,33 @@ export function StartExecuteDialog({
 
   const startMutation = useMutation({
     mutationFn: () => {
-      // Compute screen-aware tiling once so the browser and the live
-      // panel share the same geometry contract:
-      //   browser : (0, 0) → (availWidth - PANEL, availHeight)
-      //   panel   : (availWidth - PANEL, 0) → (PANEL, availHeight)
-      // Sent to the backend as window_x / y / width / height. Headless
-      // runs and tiny screens fall through to backend defaults safely.
-      const layout = computeWindowLayout();
+      // Compute screen-aware tiling once so the headed browser and
+      // the live panel share the same geometry contract:
+      //   headed:   browser 60% × full height,  panel 40% × full height
+      //   headless: no browser, panel fills the screen
+      // Backend window_* fields are only sent when there's a headed
+      // browser to position; headless runs let the backend skip the
+      // launch flags entirely.
+      const layout = computeWindowLayout(headless);
+      const browserGeom = layout?.browser;
       return api.startExecute(projectId, {
         plan_id: planId!,
         headless,
         speed,
+        mode,
         auto_adjust: autoAdjust,
         promote_fixes: promoteFixes,
-        window_x: layout?.browser.x,
-        window_y: layout?.browser.y,
-        window_width: layout?.browser.w,
-        window_height: layout?.browser.h,
+        window_x: browserGeom?.x,
+        window_y: browserGeom?.y,
+        window_width: browserGeom?.w,
+        window_height: browserGeom?.h,
       });
     },
     onSuccess: (run) => {
-      // Open the live presenter pinned to the right of the screen, sized
-      // to exactly fill the gap left by the (left-tiled) browser window.
+      // Open the live presenter sized to match the layout used for the
+      // browser (40% on the right when headed, 100% when headless).
       try {
-        const layout = computeWindowLayout();
+        const layout = computeWindowLayout(headless);
         if (layout) {
           const { panel } = layout;
           const features = `popup=yes,width=${panel.w},height=${panel.h},left=${panel.x},top=${panel.y},resizable=yes,scrollbars=yes`;
@@ -171,7 +178,7 @@ export function StartExecuteDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl">
+      <DialogContent className="max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Play className="size-5" /> Start an execution run
@@ -214,6 +221,12 @@ export function StartExecuteDialog({
             {selectedPlan && (
               <PlanSummary plan={selectedPlan} />
             )}
+
+            {/* Mode picker — "agentic" uses the goal-oriented QA loop
+                that reasons about the page each turn; "scripted" is the
+                rigid step-walker. Agentic is much smarter on flaky or
+                evolving pages but burns ~10× more LLM tokens. */}
+            <ModePicker value={mode} onChange={setMode} />
 
             {/* Speed knob — slow is the default for heavy-data sites where
                 an over-eager click on a skeleton row beats the actual data.
@@ -366,24 +379,41 @@ function ToggleRow({
 
 /**
  * Compute side-by-side window geometry from the user's actual screen.
- * Splits ``screen.availWidth × availHeight`` into:
- *   - browser pane on the left (everything minus the panel)
- *   - panel popup on the right (PANEL_WIDTH wide, full height)
- * Returns ``null`` when there's no DOM (SSR) or the screen is too narrow
- * to usefully tile — in which case the caller skips the popup and the
- * backend uses its built-in defaults.
+ *
+ * Headed runs: 60% browser on the left, 40% panel on the right —
+ *   gives the headed Chromium room for a real desktop viewport while
+ *   the panel still fits a comfortable column of agent narration.
+ * Headless runs: panel takes the full screen — there's no headed
+ *   browser to share with, so the panel is the only window.
+ *
+ * Returns ``null`` when there's no DOM (SSR) or the screen is too
+ * small to tile — in which case the caller skips popup geometry and
+ * the backend uses its defaults.
  */
-const PANEL_WIDTH = 600;
-const MIN_BROWSER_WIDTH = 720;
-function computeWindowLayout() {
+const BROWSER_FRACTION = 0.6;  // headed: 60% browser, 40% panel
+const MIN_USEFUL_HEIGHT = 500;
+const MIN_USEFUL_WIDTH_HEADED = 1000;
+function computeWindowLayout(headless: boolean) {
   if (typeof window === "undefined" || !window.screen) return null;
   const availW = window.screen.availWidth ?? window.screen.width ?? 0;
   const availH = window.screen.availHeight ?? window.screen.height ?? 0;
-  if (availW < PANEL_WIDTH + MIN_BROWSER_WIDTH || availH < 500) return null;
-  const browserW = availW - PANEL_WIDTH;
+  if (availH < MIN_USEFUL_HEIGHT) return null;
+
+  if (headless) {
+    // No headed browser to tile against — panel fills the screen.
+    if (availW < 400) return null;
+    return {
+      browser: null as null | { x: number; y: number; w: number; h: number },
+      panel: { x: 0, y: 0, w: availW, h: availH },
+    };
+  }
+
+  // Headed: split the screen 60/40.
+  if (availW < MIN_USEFUL_WIDTH_HEADED) return null;
+  const browserW = Math.floor(availW * BROWSER_FRACTION);
   return {
     browser: { x: 0, y: 0, w: browserW, h: availH },
-    panel: { x: browserW, y: 0, w: PANEL_WIDTH, h: availH },
+    panel: { x: browserW, y: 0, w: availW - browserW, h: availH },
   };
 }
 
@@ -404,6 +434,68 @@ function PlanSummary({ plan }: { plan: PlanReadCompact }) {
         <p className="mt-2 text-xs text-muted-foreground">
           Scope: {plan.scope.length} module
           {plan.scope.length === 1 ? "" : "s"}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ModePicker({
+  value,
+  onChange,
+}: {
+  value: "scripted" | "agentic";
+  onChange: (next: "scripted" | "agentic") => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">Run mode</label>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={() => onChange("scripted")}
+          aria-pressed={value === "scripted"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "scripted"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <ListChecks className="size-4" />
+            Scripted
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            Rigid step-walker. AI only patches on failure. Fastest, cheapest.
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange("agentic")}
+          aria-pressed={value === "agentic"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "agentic"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Bot className="size-4" />
+            Agentic
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            Goal-oriented QA agent. Reasons each turn, adapts to changes.
+            Needs an LLM. ~10× more tokens.
+          </span>
+        </button>
+      </div>
+      {value === "agentic" && (
+        <p className="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-[10px] text-amber-700 dark:text-amber-300">
+          Agentic mode runs at the test-case (submodule) level. Each
+          submodule with selected steps becomes one goal the agent will
+          verify. Loop guards halt at 30 turns / 5 min / 80k tokens.
         </p>
       )}
     </div>

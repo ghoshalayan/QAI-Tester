@@ -37,6 +37,7 @@ const STATUS_ORDER: ExecutionStepStatus[] = [
   "running",
   "passed",
   "failed",
+  "inconclusive",
   "blocked",
   "skipped",
   "pending",
@@ -49,6 +50,7 @@ const STATUS_CHIP_CLASS: Record<ExecutionStepStatus, string> = {
   failed: "bg-red-500/10 text-red-700 dark:text-red-400",
   blocked: "bg-yellow-500/10 text-yellow-700 dark:text-yellow-400",
   skipped: "bg-muted text-muted-foreground",
+  inconclusive: "bg-orange-500/10 text-orange-700 dark:text-orange-400",
 };
 
 export default function RunDetailPage() {
@@ -90,6 +92,7 @@ export default function RunDetailPage() {
       failed: 0,
       blocked: 0,
       skipped: 0,
+      inconclusive: 0,
     };
     for (const s of steps ?? []) {
       c.all += 1;

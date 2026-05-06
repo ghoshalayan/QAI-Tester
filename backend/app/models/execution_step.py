@@ -121,7 +121,7 @@ class ExecutionStep(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('pending', 'running', 'passed', 'failed', "
-            "'skipped', 'blocked')",
+            "'skipped', 'blocked', 'inconclusive')",
             name="execution_step_status_valid",
         ),
         # Ordered scan within a run for the live timeline

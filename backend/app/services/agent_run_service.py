@@ -610,6 +610,9 @@ def execute_run(run_id: int) -> None:
         ai_assist = bool(input_data.get("ai_assist", True))
         auto_adjust = bool(input_data.get("auto_adjust", False))
         promote_fixes = bool(input_data.get("promote_fixes", False))
+        mode = input_data.get("mode", "scripted")
+        if mode not in ("scripted", "agentic"):
+            mode = "scripted"
 
         # Window geometry — frontend computes from screen.availWidth/Height
         # so the headed Chromium fits the user's monitor with the live
@@ -645,26 +648,58 @@ def execute_run(run_id: int) -> None:
                 )
 
         # ── Run the orchestrator ───────────────────────────────
+        # Branch on mode: scripted = rigid step-walker (legacy);
+        # agentic = goal-oriented QA agent loop per submodule.
         try:
-            result = execute_plan(
-                db=db,
-                run_id=run.id,
-                plan_id=plan_id,
-                selected_step_ids=selected_step_ids,
-                headless=headless,
-                speed=speed_raw,
-                provider=provider,
-                ai_assist=ai_assist,
-                auto_adjust=auto_adjust,
-                promote_fixes=promote_fixes,
-                window_position=window_position,
-                window_size=window_size,
-                emit_event=lambda et, data: _emit_run_event(run, et, data),
-                is_cancelled=lambda: _is_cancelled(run.id),
-                is_paused=lambda: _is_paused(run.id),
-                wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
-                wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
-            )
+            if mode == "agentic":
+                from app.agents.qa_agent import run_qa_agent_for_plan
+
+                if provider is None:
+                    _mark_failed(
+                        db, run,
+                        "Agentic mode requires an LLM provider. "
+                        "Configure one in App Settings or pick scripted mode.",
+                    )
+                    return
+
+                result = run_qa_agent_for_plan(
+                    db=db,
+                    run_id=run.id,
+                    plan_id=plan_id,
+                    selected_step_ids=selected_step_ids,
+                    headless=headless,
+                    speed=speed_raw,
+                    provider=provider,
+                    auto_adjust=auto_adjust,
+                    promote_fixes=promote_fixes,
+                    window_position=window_position,
+                    window_size=window_size,
+                    emit_event=lambda et, data: _emit_run_event(run, et, data),
+                    is_cancelled=lambda: _is_cancelled(run.id),
+                    is_paused=lambda: _is_paused(run.id),
+                    wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
+                    wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
+                )
+            else:
+                result = execute_plan(
+                    db=db,
+                    run_id=run.id,
+                    plan_id=plan_id,
+                    selected_step_ids=selected_step_ids,
+                    headless=headless,
+                    speed=speed_raw,
+                    provider=provider,
+                    ai_assist=ai_assist,
+                    auto_adjust=auto_adjust,
+                    promote_fixes=promote_fixes,
+                    window_position=window_position,
+                    window_size=window_size,
+                    emit_event=lambda et, data: _emit_run_event(run, et, data),
+                    is_cancelled=lambda: _is_cancelled(run.id),
+                    is_paused=lambda: _is_paused(run.id),
+                    wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
+                    wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
+                )
         except AgentCancelled as e:
             _mark_cancelled(db, run, str(e))
             return
@@ -690,6 +725,7 @@ def execute_run(run_id: int) -> None:
             "skipped": result.skipped,
             "blocked": result.blocked,
             "duration_ms": result.duration_ms,
+            "mode": mode,
             # AI-assist cost meter — None when no AI call happened
             "llm_input_tokens": result.llm_input_tokens,
             "llm_output_tokens": result.llm_output_tokens,

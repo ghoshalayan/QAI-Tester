@@ -5,6 +5,7 @@ import type { ComponentType } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  Bot,
   Camera,
   CheckCircle2,
   Circle,
@@ -13,6 +14,7 @@ import {
   Loader2,
   MinusCircle,
   Sparkles,
+  Target,
   XCircle,
 } from "lucide-react";
 
@@ -41,6 +43,7 @@ const STATUS_ICON: Record<
   failed: XCircle,
   blocked: AlertTriangle,
   skipped: MinusCircle,
+  inconclusive: AlertTriangle,
 };
 
 const STATUS_COLOR: Record<ExecutionStepStatus, string> = {
@@ -50,6 +53,7 @@ const STATUS_COLOR: Record<ExecutionStepStatus, string> = {
   failed: "text-red-600 dark:text-red-400",
   blocked: "text-yellow-700 dark:text-yellow-400",
   skipped: "text-muted-foreground",
+  inconclusive: "text-orange-600 dark:text-orange-400",
 };
 
 const STATUS_ROW_TINT: Record<ExecutionStepStatus, string> = {
@@ -59,6 +63,7 @@ const STATUS_ROW_TINT: Record<ExecutionStepStatus, string> = {
   failed: "border-l-red-500",
   blocked: "border-l-yellow-500",
   skipped: "border-l-muted-foreground/30",
+  inconclusive: "border-l-orange-500",
 };
 
 interface Props {
@@ -213,6 +218,7 @@ function ExecutionStepRow({
         )}
 
         <AiCorrectionSurface step={step} />
+        <AgentTurnsSurface step={step} />
 
         {step.path_snapshot &&
           step.path_snapshot !== step.title_snapshot && (
@@ -335,6 +341,174 @@ function AiCorrectionSurface({ step }: { step: ExecutionStepRead }) {
     </details>
   );
 }
+
+/**
+ * Agentic-mode surface — renders the goal, success criteria, and the
+ * full per-turn agent log when ``details_json.mode === "agentic"``.
+ *
+ * Auto-expanded for non-passed rows (failed / inconclusive / blocked)
+ * so users can immediately see what the agent tried and why it halted.
+ * Collapsed for passed rows where the trail is mostly noise.
+ */
+function AgentTurnsSurface({ step }: { step: ExecutionStepRead }) {
+  const details = step.details_json ?? {};
+  if ((details as Record<string, unknown>).mode !== "agentic") return null;
+
+  const goal = (details as Record<string, unknown>).goal as
+    | { description?: string; success_criteria?: string[] }
+    | undefined;
+  const haltReason = (details as Record<string, unknown>).halt_reason as
+    | string
+    | undefined;
+  const turnLog = (details as Record<string, unknown>).agent_log;
+  const turns: Array<Record<string, unknown>> = Array.isArray(turnLog)
+    ? (turnLog as Array<Record<string, unknown>>)
+    : [];
+
+  const passed = step.status === "passed";
+
+  return (
+    <details
+      className={cn(
+        "mt-1 rounded-md border px-2 py-1 text-[11px]",
+        passed
+          ? "border-purple-500/30 bg-purple-500/5"
+          : "border-orange-500/40 bg-orange-500/5",
+      )}
+      open={!passed}
+    >
+      <summary className="flex cursor-pointer flex-wrap items-center gap-1.5 list-none">
+        <Bot
+          className={cn(
+            "size-3",
+            passed
+              ? "text-purple-700 dark:text-purple-400"
+              : "text-orange-700 dark:text-orange-400",
+          )}
+        />
+        <span className="font-medium">Agentic run</span>
+        <span className="text-muted-foreground">
+          · {turns.length} turn{turns.length === 1 ? "" : "s"}
+        </span>
+        {haltReason && (
+          <span className="rounded border px-1 py-0.5 font-mono text-[9px] text-muted-foreground">
+            halt: {haltReason}
+          </span>
+        )}
+      </summary>
+
+      <div className="mt-1.5 space-y-2">
+        {goal?.description && (
+          <div className="flex items-start gap-1.5 rounded border bg-card p-1.5">
+            <Target className="mt-0.5 size-3 shrink-0 text-purple-600" />
+            <div className="min-w-0 flex-1">
+              <p className="break-words font-medium">
+                {goal.description}
+              </p>
+              {Array.isArray(goal.success_criteria) &&
+                goal.success_criteria.length > 0 && (
+                  <ul className="mt-1 ml-3 list-disc space-y-0.5 text-[10px] text-muted-foreground">
+                    {goal.success_criteria.map((c, i) => (
+                      <li key={i}>{c}</li>
+                    ))}
+                  </ul>
+                )}
+            </div>
+          </div>
+        )}
+
+        {turns.length === 0 ? (
+          <p className="italic text-muted-foreground">
+            No turns ran (the agent halted before its first action).
+          </p>
+        ) : (
+          <ol className="space-y-1">
+            {turns.map((t, i) => (
+              <AgentTurnRow key={i} turn={t} />
+            ))}
+          </ol>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function AgentTurnRow({ turn }: { turn: Record<string, unknown> }) {
+  const tNum = typeof turn.turn === "number" ? turn.turn : null;
+  const tool = typeof turn.tool === "string" ? turn.tool : "?";
+  const status = typeof turn.status === "string" ? turn.status : "ok";
+  const reasoning =
+    typeof turn.reasoning === "string" ? turn.reasoning : "";
+  const narration =
+    typeof turn.narration === "string" ? turn.narration : "";
+  const error =
+    typeof turn.error_message === "string" ? turn.error_message : null;
+  const args = (turn.args ?? {}) as Record<string, unknown>;
+  const confidence =
+    typeof turn.confidence === "number" ? turn.confidence : null;
+
+  // Compact one-line repr of the args the tool actually used.
+  const argSummary = Object.entries(args)
+    .filter(([_, v]) => v !== "" && v !== 0 && v !== null && v !== undefined)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? `"${v}"` : v}`)
+    .join(" ")
+    .slice(0, 200);
+
+  const Icon =
+    status === "ok"
+      ? CheckCircle2
+      : status === "blocked"
+        ? AlertTriangle
+        : status === "stop"
+          ? Sparkles
+          : XCircle;
+  const colorClass =
+    status === "ok"
+      ? "text-emerald-600"
+      : status === "blocked"
+        ? "text-amber-600"
+        : status === "stop"
+          ? "text-purple-600"
+          : "text-red-600";
+
+  return (
+    <li className="rounded border bg-card px-2 py-1.5">
+      <div className="flex flex-wrap items-baseline gap-1.5">
+        <span className="font-mono text-[10px] text-muted-foreground">
+          T{tNum ?? "?"}
+        </span>
+        <Icon className={cn("size-3", colorClass)} />
+        <span className="rounded border px-1 py-0.5 font-mono text-[10px]">
+          {tool}
+        </span>
+        {argSummary && (
+          <span className="break-all font-mono text-[10px] text-muted-foreground">
+            {argSummary}
+          </span>
+        )}
+        {confidence !== null && (
+          <span className="ml-auto text-[9px] text-muted-foreground">
+            {Math.round(confidence * 100)}%
+          </span>
+        )}
+      </div>
+      {reasoning && (
+        <p className="mt-0.5 break-words text-[11px]">{reasoning}</p>
+      )}
+      {narration && narration !== reasoning && (
+        <p className="mt-0.5 break-words text-[10px] text-muted-foreground">
+          → {narration}
+        </p>
+      )}
+      {error && (
+        <p className="mt-0.5 break-words rounded border border-red-500/30 bg-red-500/5 px-1.5 py-0.5 font-mono text-[10px] text-red-700 dark:text-red-400">
+          {error}
+        </p>
+      )}
+    </li>
+  );
+}
+
 
 function ScreenshotLightbox({
   step,

@@ -315,6 +315,12 @@ export function useAgentRunsEvents(projectId: number) {
       "ai_improvise_completed",
       "ai_assist_started",
       "ai_assist_completed",
+      // Phase C: agentic-mode events
+      "agent_goal_extracting",
+      "agent_goal_ready",
+      "agent_thought",
+      "agent_acted",
+      // HITL + control
       "needs_intervention",
       "intervention_resolved",
       "intervention_auto_applied",

@@ -491,6 +491,80 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+  // ── Agentic-mode events ──────────────────────────────────────
+  if (type === "agent_goal_extracting") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-purple-500" />}
+        label="agent · extracting goal"
+        title={
+          typeof data.ordinal === "number" && typeof data.total === "number"
+            ? `test case ${data.ordinal}/${data.total}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_goal_ready") {
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label="agent · goal"
+        title={data.description as string | undefined}
+        sublabel={
+          typeof data.criteria_count === "number"
+            ? `${data.criteria_count} success criteria`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_thought") {
+    return (
+      <Row
+        icon={<Bot className="size-3.5 text-purple-500" />}
+        label={
+          typeof data.turn === "number"
+            ? `T${data.turn} · think → ${data.tool}`
+            : `agent · ${data.tool}`
+        }
+        title={data.reasoning as string | undefined}
+        sublabel={
+          typeof data.confidence === "number"
+            ? `confidence ${Math.round(data.confidence * 100)}%`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_acted") {
+    const status = data.status as string | undefined;
+    const Icon =
+      status === "ok"
+        ? CheckCircle2
+        : status === "blocked"
+          ? AlertTriangle
+          : XCircle;
+    const colorClass =
+      status === "ok"
+        ? "text-emerald-500"
+        : status === "blocked"
+          ? "text-amber-500"
+          : "text-red-500";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={
+          typeof data.turn === "number"
+            ? `T${data.turn} · act → ${data.tool}`
+            : `agent · ${data.tool}`
+        }
+        title={data.narration as string | undefined}
+        sublabel={data.error as string | undefined}
+      />
+    );
+  }
+
   if (type === "fix_promoted") {
     return (
       <Row

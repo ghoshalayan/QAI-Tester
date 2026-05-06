@@ -6,11 +6,13 @@ import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
+  Bot,
   ChevronDown,
   ChevronRight,
   ExternalLink,
   FileSpreadsheet,
   Sparkles,
+  Target,
 } from "lucide-react";
 
 import {
@@ -38,6 +40,7 @@ const STEP_STATUS_DOT: Record<ExecutionStepStatus, string> = {
   failed: "bg-red-500",
   blocked: "bg-yellow-500",
   skipped: "bg-muted-foreground/40",
+  inconclusive: "bg-orange-500",
 };
 
 const STEP_STATUS_TEXT: Record<ExecutionStepStatus, string> = {
@@ -47,6 +50,7 @@ const STEP_STATUS_TEXT: Record<ExecutionStepStatus, string> = {
   failed: "text-red-700 dark:text-red-400",
   blocked: "text-yellow-700 dark:text-yellow-400",
   skipped: "text-muted-foreground",
+  inconclusive: "text-orange-700 dark:text-orange-400",
 };
 
 export default function RunReportPage() {
@@ -262,7 +266,13 @@ function ModuleSection({ module: mod }: { module: ReportModuleRead }) {
 }
 
 function SubmoduleRow({ submodule: sub }: { submodule: ReportSubmoduleRead }) {
-  const [expanded, setExpanded] = useState(sub.failed > 0 || sub.blocked > 0);
+  // Auto-expand submodules that ran in agentic mode — the per-turn
+  // log is the whole point of the agent, so we shouldn't make users
+  // click to discover it.
+  const hasAgenticRow = sub.steps.some((s) => s.mode === "agentic");
+  const [expanded, setExpanded] = useState(
+    sub.failed > 0 || sub.blocked > 0 || hasAgenticRow,
+  );
   const Caret = expanded ? ChevronDown : ChevronRight;
 
   return (
@@ -316,61 +326,212 @@ function SubmoduleRow({ submodule: sub }: { submodule: ReportSubmoduleRead }) {
 }
 
 function StepRow({ step }: { step: ReportStepRead }) {
+  const isAgentic = step.mode === "agentic";
   return (
-    <li className="flex items-start gap-3 px-6 py-2 text-sm">
-      <span className="mt-1.5 flex shrink-0">
-        <span
-          className={cn("size-2 rounded-full", STEP_STATUS_DOT[step.status])}
-        />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-baseline gap-2">
-          <span className="font-mono text-[10px] text-muted-foreground">
-            {step.ordinal + 1}.
-          </span>
-          <span className="font-medium">{step.title}</span>
-          {step.action_type && (
-            <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-              {step.action_type}
-            </span>
-          )}
+    <li className="px-6 py-2 text-sm">
+      <div className="flex items-start gap-3">
+        <span className="mt-1.5 flex shrink-0">
           <span
-            className={cn(
-              "text-[10px] font-medium uppercase tracking-wide",
-              STEP_STATUS_TEXT[step.status],
+            className={cn("size-2 rounded-full", STEP_STATUS_DOT[step.status])}
+          />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="font-mono text-[10px] text-muted-foreground">
+              {step.ordinal + 1}.
+            </span>
+            <span className="font-medium">{step.title}</span>
+            {step.action_type && (
+              <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                {step.action_type}
+              </span>
             )}
-          >
-            {EXECUTION_STEP_STATUS_LABELS[step.status]}
-          </span>
-          {step.duration_ms !== null && step.duration_ms > 0 && (
-            <span className="text-[10px] text-muted-foreground">
-              {formatDuration(step.duration_ms)}
-            </span>
-          )}
-          {step.ai_helped && (
+            {isAgentic && (
+              <span className="inline-flex items-center gap-0.5 rounded border border-purple-500/30 bg-purple-500/10 px-1 py-0.5 font-mono text-[10px] text-purple-700 dark:text-purple-400">
+                agentic · {step.agent_log.length} turn
+                {step.agent_log.length === 1 ? "" : "s"}
+              </span>
+            )}
             <span
-              className="inline-flex items-center gap-0.5 rounded border border-green-500/30 bg-green-500/10 px-1 py-0.5 text-[9px] font-medium text-green-700 dark:text-green-400"
-              title="AI assist fixed this step"
+              className={cn(
+                "text-[10px] font-medium uppercase tracking-wide",
+                STEP_STATUS_TEXT[step.status],
+              )}
             >
-              <Sparkles className="size-2.5" /> AI
-              {step.ai_used_vision && " · vision"}
+              {EXECUTION_STEP_STATUS_LABELS[step.status]}
             </span>
+            {step.halt_reason && (
+              <span className="rounded border px-1 py-0.5 font-mono text-[9px] text-muted-foreground">
+                halt: {step.halt_reason}
+              </span>
+            )}
+            {step.duration_ms !== null && step.duration_ms > 0 && (
+              <span className="text-[10px] text-muted-foreground">
+                {formatDuration(step.duration_ms)}
+              </span>
+            )}
+            {step.ai_helped && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-green-500/30 bg-green-500/10 px-1 py-0.5 text-[9px] font-medium text-green-700 dark:text-green-400"
+                title="AI assist fixed this step"
+              >
+                <Sparkles className="size-2.5" /> AI
+                {step.ai_used_vision && " · vision"}
+              </span>
+            )}
+          </div>
+          {step.narration && (
+            <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
+              {step.narration}
+            </p>
+          )}
+          {step.error_message && (
+            <p className="mt-0.5 break-words text-[11px] text-red-700/80 dark:text-red-400/80">
+              {step.error_message}
+            </p>
           )}
         </div>
-        {step.error_message && (
-          <p className="mt-0.5 break-words text-[11px] text-red-700/80 dark:text-red-400/80">
-            {step.error_message}
-          </p>
+        {step.screenshot_path && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={api.screenshotUrl(step.screenshot_path)}
+            alt={`step ${step.ordinal + 1} screenshot`}
+            className="h-10 w-16 shrink-0 rounded border object-cover"
+            loading="lazy"
+          />
         )}
       </div>
-      {step.screenshot_path && (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img
-          src={api.screenshotUrl(step.screenshot_path)}
-          alt={`step ${step.ordinal + 1} screenshot`}
-          className="h-10 w-16 shrink-0 rounded border object-cover"
-          loading="lazy"
+
+      {isAgentic && (
+        <ReportAgentDetail step={step} />
+      )}
+    </li>
+  );
+}
+
+function ReportAgentDetail({ step }: { step: ReportStepRead }) {
+  const passed = step.status === "passed";
+  return (
+    <details
+      className={cn(
+        "ml-6 mt-2 rounded-md border px-2 py-1.5 text-[11px]",
+        passed
+          ? "border-purple-500/30 bg-purple-500/5"
+          : "border-orange-500/40 bg-orange-500/5",
+      )}
+      open={!passed}
+    >
+      <summary className="flex cursor-pointer items-center gap-1.5 list-none">
+        <Bot
+          className={cn(
+            "size-3",
+            passed
+              ? "text-purple-700 dark:text-purple-400"
+              : "text-orange-700 dark:text-orange-400",
+          )}
         />
+        <span className="font-medium">Agent reasoning</span>
+        <span className="text-muted-foreground">
+          ({step.agent_log.length} turn
+          {step.agent_log.length === 1 ? "" : "s"})
+        </span>
+      </summary>
+
+      <div className="mt-2 space-y-2">
+        {step.goal_description && (
+          <div className="flex items-start gap-1.5 rounded border bg-card p-1.5">
+            <Target className="mt-0.5 size-3 shrink-0 text-purple-600" />
+            <div className="min-w-0 flex-1">
+              <p className="break-words font-medium">
+                {step.goal_description}
+              </p>
+              {step.success_criteria.length > 0 && (
+                <ul className="mt-1 ml-3 list-disc space-y-0.5 text-[10px] text-muted-foreground">
+                  {step.success_criteria.map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+
+        {step.agent_log.length === 0 ? (
+          <p className="italic text-muted-foreground">
+            No turns ran (agent halted before the first action).
+          </p>
+        ) : (
+          <ol className="space-y-1">
+            {step.agent_log.map((t) => (
+              <ReportAgentTurnRow key={t.turn} turn={t} />
+            ))}
+          </ol>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function ReportAgentTurnRow({
+  turn,
+}: {
+  turn: ReportStepRead["agent_log"][number];
+}) {
+  const argSummary = Object.entries(turn.args)
+    .filter(([, v]) => v !== "" && v !== 0 && v !== null && v !== undefined)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? `"${v}"` : v}`)
+    .join(" ")
+    .slice(0, 200);
+
+  const colorClass =
+    turn.status === "ok"
+      ? "text-emerald-600"
+      : turn.status === "blocked"
+        ? "text-amber-600"
+        : turn.status === "stop"
+          ? "text-purple-600"
+          : "text-red-600";
+
+  return (
+    <li className="rounded border bg-card px-2 py-1.5">
+      <div className="flex flex-wrap items-baseline gap-1.5">
+        <span className="font-mono text-[10px] text-muted-foreground">
+          T{turn.turn}
+        </span>
+        <span
+          className={cn(
+            "text-[10px] font-medium uppercase tracking-wide",
+            colorClass,
+          )}
+        >
+          {turn.status}
+        </span>
+        <span className="rounded border px-1 py-0.5 font-mono text-[10px]">
+          {turn.tool}
+        </span>
+        {argSummary && (
+          <span className="break-all font-mono text-[10px] text-muted-foreground">
+            {argSummary}
+          </span>
+        )}
+        {turn.confidence > 0 && (
+          <span className="ml-auto text-[9px] text-muted-foreground">
+            {Math.round(turn.confidence * 100)}%
+          </span>
+        )}
+      </div>
+      {turn.reasoning && (
+        <p className="mt-0.5 break-words">{turn.reasoning}</p>
+      )}
+      {turn.narration && turn.narration !== turn.reasoning && (
+        <p className="mt-0.5 break-words text-[10px] text-muted-foreground">
+          → {turn.narration}
+        </p>
+      )}
+      {turn.error_message && (
+        <p className="mt-0.5 break-words rounded border border-red-500/30 bg-red-500/5 px-1.5 py-0.5 font-mono text-[10px] text-red-700 dark:text-red-400">
+          {turn.error_message}
+        </p>
       )}
     </li>
   );
