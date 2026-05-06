@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Gemini vision support — every Gemini 1.5/2.x model family is multimodal.
+# We pattern-match conservatively rather than maintain a hard-coded list, so
+# new model names ship working without a code change.
+_GEMINI_VISION_RE = re.compile(r"^gemini-(?:1\.5|2\.\d|3\.\d)", re.IGNORECASE)
+
+
 class GeminiProvider(LLMProvider):
     provider_id = "gemini"
 
@@ -33,11 +40,43 @@ class GeminiProvider(LLMProvider):
         self._client = None
 
     @property
+    def supports_vision(self) -> bool:
+        return bool(_GEMINI_VISION_RE.match(self.model or ""))
+
+    @property
     def client(self):
         if self._client is None:
             from google import genai
             self._client = genai.Client(api_key=self.api_key)
         return self._client
+
+    @staticmethod
+    def _build_contents(turn_messages: list[ChatMessage]):
+        """Convert ChatMessage list to Gemini ``types.Content`` parts.
+
+        Each message becomes one Content with one or two parts: a text part
+        (if ``content`` is non-empty) and an inline-image part (if
+        ``image`` is set). Vision-capable Gemini models accept both in a
+        single user turn; non-vision models will reject the image part.
+        """
+        from google.genai import types
+
+        contents = []
+        for m in turn_messages:
+            parts = []
+            if m.content:
+                parts.append(types.Part(text=m.content))
+            if m.image is not None:
+                parts.append(types.Part.from_bytes(
+                    data=m.image, mime_type=m.image_mime,
+                ))
+            if not parts:
+                continue
+            contents.append(types.Content(
+                role="model" if m.role == "assistant" else "user",
+                parts=parts,
+            ))
+        return contents
 
     def chat(
         self,
@@ -52,13 +91,7 @@ class GeminiProvider(LLMProvider):
         system_parts = [m.content for m in messages if m.role == "system"]
         turn_messages = [m for m in messages if m.role != "system"]
 
-        contents = [
-            types.Content(
-                role="model" if m.role == "assistant" else "user",
-                parts=[types.Part(text=m.content)],
-            )
-            for m in turn_messages
-        ]
+        contents = self._build_contents(turn_messages)
 
         config_kwargs: dict = {}
         if system_parts:
@@ -108,13 +141,7 @@ class GeminiProvider(LLMProvider):
         system_parts = [m.content for m in messages if m.role == "system"]
         turn_messages = [m for m in messages if m.role != "system"]
 
-        contents = [
-            types.Content(
-                role="model" if m.role == "assistant" else "user",
-                parts=[types.Part(text=m.content)],
-            )
-            for m in turn_messages
-        ]
+        contents = self._build_contents(turn_messages)
 
         config_kwargs: dict[str, Any] = {
             "response_mime_type": "application/json",

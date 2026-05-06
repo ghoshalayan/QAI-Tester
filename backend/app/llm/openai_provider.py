@@ -22,14 +22,26 @@ values; we only forward ``temperature`` when the caller passes it explicitly.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
 import time
 from typing import Any
 
 from app.llm.base import ChatMessage, ChatResult, LLMProvider, TestConnectionResult
 
 logger = logging.getLogger(__name__)
+
+
+# Vision-capable model families. Native OpenAI keeps adding new ones; we
+# pattern-match conservatively rather than hard-code a list. Compat
+# providers usually opt-in by exposing a vision-capable model name —
+# matching the same patterns is a reasonable default.
+_OPENAI_VISION_RE = re.compile(
+    r"^(gpt-4o|gpt-4(?:\.\d+)?-turbo|gpt-4-vision|gpt-5|o\d)",
+    re.IGNORECASE,
+)
 
 
 def _strip_fences(text: str) -> str:
@@ -76,6 +88,39 @@ class OpenAIProvider(LLMProvider):
             self._client = OpenAI(**kwargs)
         return self._client
 
+    @property
+    def supports_vision(self) -> bool:
+        return bool(_OPENAI_VISION_RE.match(self.model or ""))
+
+    @staticmethod
+    def _to_oai_messages(
+        messages: list[ChatMessage],
+    ) -> list[dict[str, Any]]:
+        """Convert ChatMessage list to OpenAI's request shape.
+
+        Plain text messages stay as ``{"role": ..., "content": "..."}``.
+        Messages with an inline image switch to the multimodal content
+        array shape (text part + image_url part with a base64 data URI).
+        Vision-incapable models will reject the image part — callers
+        gate via :prop:`supports_vision` before passing images.
+        """
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            if m.image is None:
+                out.append({"role": m.role, "content": m.content})
+                continue
+            b64 = base64.b64encode(m.image).decode("ascii")
+            data_uri = f"data:{m.image_mime};base64,{b64}"
+            parts: list[dict[str, Any]] = []
+            if m.content:
+                parts.append({"type": "text", "text": m.content})
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": data_uri},
+            })
+            out.append({"role": m.role, "content": parts})
+        return out
+
     def _tokens_param(self) -> str:
         # Native OpenAI GPT-5/o series use max_completion_tokens.
         # Compat servers use the legacy max_tokens.
@@ -88,7 +133,7 @@ class OpenAIProvider(LLMProvider):
         temperature: float | None = None,
         max_output_tokens: int | None = None,
     ) -> ChatResult:
-        oai_messages = [{"role": m.role, "content": m.content} for m in messages]
+        oai_messages = self._to_oai_messages(messages)
 
         kwargs: dict = {"model": self.model, "messages": oai_messages}
         if temperature is not None:
@@ -140,7 +185,7 @@ class OpenAIProvider(LLMProvider):
         temperature: float | None,
         max_output_tokens: int | None,
     ) -> ChatResult:
-        oai_messages = [{"role": m.role, "content": m.content} for m in messages]
+        oai_messages = self._to_oai_messages(messages)
 
         kwargs: dict = {
             "model": self.model,
@@ -228,7 +273,7 @@ class OpenAIProvider(LLMProvider):
                 0, ChatMessage(role="system", content=schema_addendum),
             )
 
-        oai_messages = [{"role": m.role, "content": m.content} for m in augmented]
+        oai_messages = self._to_oai_messages(augmented)
 
         base_kwargs: dict = {
             "model": self.model,

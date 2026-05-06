@@ -108,6 +108,44 @@ the OTP cycle finishes within timeout.
 
 ---
 
+## Per-purpose model selection in Settings
+
+Right now `app_settings` has a single `(provider, model)` tuple — the same
+model handles BRD→FRD synthesis, FRD→TC synthesis, AI assist (text), and
+AI assist (vision). That's wasteful: BRD→FRD doesn't need vision; vision
+escalation doesn't need a reasoning model; FRD→TC benefits from a larger
+context window than what's optimal for the recovery loop.
+
+### What to build
+
+- Extend `app_settings` (or a new `agent_model_overrides` table) with a
+  per-purpose mapping:
+  - `brd_to_frd_model` — text-only, larger context preferred
+  - `frd_to_tc_model` — text-only, larger context preferred
+  - `ai_assist_text_model` — text-only, fast + cheap
+  - `ai_assist_vision_model` — must be vision-capable
+  - Each is optional; falls back to the global `model` when unset.
+- Settings page UI: a section per purpose with model picker + a hint
+  about what's used where. Vision-purpose picker filters to
+  vision-capable models (use the `_OPENAI_VISION_RE` /
+  `_GEMINI_VISION_RE` allow-lists).
+- Factory: `get_provider_from_db(db, purpose="ai_assist_vision")`
+  resolves the right model. Existing call sites pass the matching
+  purpose; default `purpose=None` keeps current global behavior.
+- Validate at save-time that vision-purpose models actually report
+  `supports_vision=True` and surface a clear error if not.
+
+### Why deferred
+
+- The single-model setup works today for everything we ship.
+- Adds Settings-page complexity that isn't paying off until users have
+  multiple keys configured AND want different cost/latency profiles per
+  agent kind.
+- Easy to add later once we see actual usage patterns (e.g., people
+  using gpt-5-mini for the bulk LLM work and gpt-5.4-mini for vision).
+
+---
+
 ## Other deferred items
 
 (Add new entries here as the conversation evolves.)

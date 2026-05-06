@@ -321,6 +321,123 @@ export interface ExecuteRunRequest {
   selected_step_ids?: number[] | null;
   headless?: boolean;
   speed?: "slow" | "normal" | "fast";
+  ai_assist?: boolean;
+}
+
+// ── HITL intervention ────────────────────────────────────────────
+
+export type InterventionChoice =
+  | "retry"
+  | "use_suggestion"
+  | "skip"
+  | "stop";
+
+export interface InterventionPayload {
+  step_id: number;
+  choice: InterventionChoice;
+  override_target_hint?: string | null;
+  override_action_type?: string | null;
+  apply_to_submodule?: boolean;
+}
+
+/** Shape stored on ``execution_step.details_json["ai_correction"]`` and
+ *  forwarded as the ``ai_suggestion`` field on a ``needs_intervention`` event. */
+export interface AiCorrection {
+  action: "retry" | "replace" | "give_up";
+  reasoning: string;
+  confidence: number;
+  tokens_in?: number | null;
+  tokens_out?: number | null;
+  diff: Record<string, { old: unknown; new: unknown }>;
+}
+
+// ── Reports ──────────────────────────────────────────────────────
+
+export interface ReportStepRead {
+  id: number;
+  tc_node_id: number | null;
+  ordinal: number;
+  title: string;
+  action_type: string | null;
+  target_hint: string | null;
+  status: ExecutionStepStatus;
+  duration_ms: number | null;
+  screenshot_path: string | null;
+  error_message: string | null;
+  narration: string | null;
+  ai_helped: boolean;
+  ai_used_vision: boolean;
+}
+
+export interface ReportSubmoduleRead {
+  title: string;
+  total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  pass_pct: number;
+  fail_pct: number;
+  issues: string[];
+  steps: ReportStepRead[];
+}
+
+export interface ReportModuleRead {
+  title: string;
+  total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  pass_pct: number;
+  fail_pct: number;
+  submodules: ReportSubmoduleRead[];
+}
+
+export interface ReportRunSummary {
+  id: number;
+  status: AgentStatus;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  total_steps: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  pass_pct: number;
+  fail_pct: number;
+  llm_input_tokens: number | null;
+  llm_output_tokens: number | null;
+  ai_calls: number;
+  ai_vision_calls: number;
+}
+
+export interface ReportPlanSummary {
+  id: number;
+  name: string;
+  target_url: string;
+  scope: string[];
+}
+
+export interface ReportRead {
+  run: ReportRunSummary;
+  plan: ReportPlanSummary | null;
+  modules: ReportModuleRead[];
+  excel_download_url: string;
+}
+
+/** Payload of the ``needs_intervention`` SSE event. */
+export interface InterventionRequest {
+  step_id: number;
+  ordinal: number;
+  total: number;
+  title: string;
+  action_type: string | null;
+  target_hint: string | null;
+  error_message: string | null;
+  ai_suggestion: AiCorrection | null;
+  screenshot_path: string | null;
 }
 
 // ── Execution steps (per-run results) ─────────────────────────────
@@ -750,6 +867,22 @@ export const api = {
       `/api/projects/${projectId}/agent-runs/${runId}/resume`,
       { method: "POST" },
     ),
+  provideIntervention: (
+    projectId: number,
+    runId: number,
+    payload: InterventionPayload,
+  ) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/intervention`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  getRunReport: (projectId: number, runId: number) =>
+    apiFetch<ReportRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/report`,
+    ),
+  /** Absolute URL for the xlsx download — pass to an `<a download>` tag. */
+  runReportXlsxUrl: (projectId: number, runId: number): string =>
+    `${API_BASE}/api/projects/${projectId}/agent-runs/${runId}/report.xlsx`,
   /** Absolute URL for a screenshot at the relative path the backend stores. */
   screenshotUrl: (relativePath: string): string =>
     `${API_BASE}/static/screenshots/${relativePath.replace(/^\/+/, "")}`,

@@ -9,8 +9,10 @@ import {
   CheckCircle2,
   Circle,
   Hourglass,
+  Image as ImageIcon,
   Loader2,
   MinusCircle,
+  Sparkles,
   XCircle,
 } from "lucide-react";
 
@@ -210,6 +212,8 @@ function ExecutionStepRow({
           </p>
         )}
 
+        <AiCorrectionSurface step={step} />
+
         {step.path_snapshot &&
           step.path_snapshot !== step.title_snapshot && (
             <p className="mt-1 truncate text-[10px] text-muted-foreground">
@@ -239,6 +243,96 @@ function ExecutionStepRow({
         </button>
       )}
     </div>
+  );
+}
+
+/**
+ * Inline "Why" surface — renders when a step has ``details_json.ai_correction``
+ * (set by the orchestrator after auto-retry exhausted and AI assist
+ * proposed a fix). Auto-expanded for failed/blocked rows so the user can
+ * see what the agent thought; collapsed for passed rows where the AI
+ * helped quietly.
+ */
+function AiCorrectionSurface({ step }: { step: ExecutionStepRead }) {
+  const raw = step.details_json?.ai_correction;
+  if (!raw || typeof raw !== "object") return null;
+
+  const c = raw as Record<string, unknown>;
+  const action = typeof c.action === "string" ? c.action : "";
+  const reasoning = typeof c.reasoning === "string" ? c.reasoning : "";
+  const usedVision = !!c.used_vision;
+  const tokensIn = typeof c.tokens_in === "number" ? c.tokens_in : null;
+  const tokensOut = typeof c.tokens_out === "number" ? c.tokens_out : null;
+  const diffObj =
+    c.diff && typeof c.diff === "object"
+      ? (c.diff as Record<string, { old?: unknown; new?: unknown }>)
+      : {};
+  const diffEntries = Object.entries(diffObj);
+
+  const helped = step.status === "passed";
+
+  return (
+    <details
+      className={cn(
+        "mt-1 rounded-md border px-2 py-1 text-[11px]",
+        helped
+          ? "border-green-500/30 bg-green-500/5"
+          : "border-blue-500/30 bg-blue-500/5",
+      )}
+      open={!helped}
+    >
+      <summary className="flex cursor-pointer flex-wrap items-center gap-1.5 list-none">
+        <Sparkles
+          className={cn(
+            "size-3",
+            helped
+              ? "text-green-700 dark:text-green-400"
+              : "text-blue-700 dark:text-blue-400",
+          )}
+        />
+        <span className="font-medium">{helped ? "AI helped" : "AI tried"}</span>
+        {action && (
+          <span className="rounded border px-1 py-0.5 font-mono text-[9px] text-muted-foreground">
+            {action}
+          </span>
+        )}
+        {usedVision && (
+          <span
+            className="inline-flex items-center gap-0.5 rounded border border-blue-500/30 bg-blue-500/10 px-1 py-0.5 text-[9px] font-medium text-blue-700 dark:text-blue-400"
+            title="Vision pass — model saw the page screenshot"
+          >
+            <ImageIcon className="size-2.5" />
+            vision
+          </span>
+        )}
+        {(tokensIn !== null || tokensOut !== null) && (
+          <span className="ml-auto text-[9px] text-muted-foreground">
+            ↑{tokensIn ?? 0} ↓{tokensOut ?? 0}
+          </span>
+        )}
+      </summary>
+      <div className="mt-1.5 space-y-1">
+        {reasoning && (
+          <p className="break-words text-foreground/85">{reasoning}</p>
+        )}
+        {diffEntries.length > 0 && (
+          <div className="space-y-0.5 font-mono text-[10px]">
+            {diffEntries.map(([field, change]) => (
+              <div key={field} className="break-all">
+                <span className="text-muted-foreground">{field}:</span>{" "}
+                <span className="text-red-500/70 line-through">
+                  {String((change as { old?: unknown }).old ?? "")}
+                </span>
+                {" → "}
+                <span className="text-green-700 dark:text-green-400">
+                  {String((change as { new?: unknown }).new ?? "")}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
   );
 }
 

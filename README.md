@@ -117,7 +117,7 @@ live only in memory at runtime per the local-MVP policy).
 | Agent Runs | `POST /api/projects/{pid}/agent-runs/brd-to-frd` · `POST /…/frd-to-tc` · `GET /…` (list) · `GET /…/events` (SSE project-wide) · `GET /…/{run_id}` · `GET /…/{run_id}/events` (SSE per-run) · `POST /…/{run_id}/cancel` |
 | Requirements | `GET /api/projects/{pid}/requirements` · `GET/PATCH/DELETE /…/{req_id}` · `POST /…/bulk-update` |
 | TC Nodes | `GET /api/projects/{pid}/plans/{plan_id}/tc-nodes` (tree) · `GET/PATCH/DELETE /…/{node_id}` · `POST /…/bulk-update` (approve / archive / delete / select / deselect) |
-| Execution | `POST /api/projects/{pid}/agent-runs/execute` (start) · `GET /…/{run_id}/steps` (per-step rows) · plus all `agent-runs` routes — same lifecycle and SSE topics |
+| Execution | `POST /api/projects/{pid}/agent-runs/execute` (start) · `GET /…/{run_id}/steps` (per-step rows) · `POST /…/{run_id}/pause` · `POST /…/{run_id}/resume` · `POST /…/{run_id}/intervention` (HITL) · plus all `agent-runs` routes — same lifecycle and SSE topics |
 | Static | `/static/screenshots/<run_id>/step_<step_id>.png` — per-step PNGs from execute runs |
 | Debug · Parsers | `POST /api/_debug/parse` (md / paste) · `POST /api/_debug/parse-file` (pdf / docx / md) · `POST /api/_debug/chunk` |
 | Debug · LLM | `POST /api/_debug/llm/structured` (round-trip a typed JSON LLM call) |
@@ -299,6 +299,92 @@ deferred per scope decision.
 
 ---
 
+## Phase 2 · Week 7 — Pacing, HITL, agentic recovery  ✅ shipped
+
+The executor stops feeling like a script and starts feeling like an
+agent: each action is paced for human observation, settles before
+acting on lazy-loading data, retries flakes automatically, asks an LLM
+to look at the page when retries fail, and finally pops a HITL modal
+when the AI can't recover either.
+
+**Pacing & robustness**
+
+- **Speed knob** (Slow / Normal / Fast, default Slow) on the Start Run
+  dialog → maps to a `SpeedConfig` preset that sets Playwright `slow_mo`,
+  cursor-glide steps, per-character typing delay, network-idle wait
+  budget, and auto-retry count.
+- **Network-idle gate** before every action — `domcontentloaded` +
+  `networkidle` with a budget that scales with speed. Skeleton-row
+  clicks no longer happen on lazy-loading SPAs (the heavy-data SPA case
+  the user flagged).
+- **Smooth cursor glide** — `page.mouse.move(x, y, steps=24)` before
+  every click/type/select dispatches synthesized mousemove events that
+  the on-page overlay tracks, so the blue ring visibly travels.
+- **Per-character typing** — `locator.press_sequentially(text, delay=80ms)`
+  in slow mode (instant `fill()` in fast).
+- **Auto-retry with exponential backoff** — 1+1 (fast) / 1+2 (slow/normal)
+  attempts on selector / verify failures; cancellation between attempts
+  exits cleanly. Per-attempt log persisted on `details_json["attempts"]`.
+
+**Pause / resume**
+
+- `POST /agent-runs/{id}/pause` and `/resume` endpoints + Pause / Resume / Stop
+  buttons on the active run card. Pause takes effect at the next step
+  boundary; the browser stays open so you can poke at the page. Cancel
+  while paused wakes the waiter cleanly.
+
+**Visibility v2**
+
+- Cursor visible from page load (centered, idle breathing animation)
+- Banner phase narration: `Clicking X` (blue) → `Clicked X ✓` (green) /
+  `Click failed` (red) / `Blocked` (amber)
+- Verify target highlight — green ring around whatever the verify step
+  matched, fading over 1.5s
+- Mount-bug fix: at `document_start` of a real navigation, both
+  `document.head` and `document.documentElement` can be null, so the
+  earlier style-element appendChild threw silently and aborted the
+  IIFE. Now style + cursor + banner are installed inside one deferred
+  `install()` gated on `document.body`, with a DOMContentLoaded fallback.
+  Caught the "page refresh nothing else" bug the user reported.
+
+**Agentic recovery — the AI assist + HITL block**
+
+- New module [`app/agents/page_intel.py`](backend/app/agents/page_intel.py)
+  with a custom DOM walker that builds an accessibility-tree-equivalent
+  summary (~10× smaller than rendered HTML) and a structured-JSON
+  `propose_recovery` call.
+- After auto-retries exhaust on a step, the orchestrator calls
+  `_try_ai_correction` — single shot. The LLM sees the original step,
+  the recent attempt errors, and the page summary; returns
+  `{action: retry|replace|give_up, new_target_hint?, new_action_type?,
+  reasoning, confidence}`. Empty strings = "no change to that field".
+- AI's correction is recorded on `details_json["ai_correction"]` (with
+  the field-by-field diff) regardless of whether it fixed the step.
+- AI assist no-ops gracefully when no LLM is configured — runs continue
+  as auto-retry-only.
+- **HITL intervention modal** opens when both retry + AI assist fail
+  (or when no LLM is configured, immediately after retries). 4 buttons —
+  *Retry as-is · Use override · Skip step · Stop run* — plus an inline
+  `target_hint` editor (pre-filled with AI's suggestion) and an
+  *"auto-apply for this submodule"* checkbox.
+- Indefinite wait for user input (Q1 spec). Cancel-while-blocked wakes
+  the vault waiter via `request_cancel`'s drain hook.
+- New events on the SSE stream: `step_retry`, `ai_assist_started`,
+  `ai_assist_completed`, `paused`, `resumed`, `needs_intervention`,
+  `intervention_resolved`, `intervention_auto_applied`.
+
+End-to-end: **start a run → watch the cursor visibly travel → step
+fails → 2-3 silent retries → AI looks at the page and proposes a fix →
+if that fails, modal pops with the AI's suggestion pre-filled → click
+*Use override* to apply, or edit the selector inline → run resumes**.
+
+The pieces deferred from the original week-6 pitch (credentials prefill
+from `test_plan_credentials`, OTP HITL with 180s timeout, vision-LLM
+escalation when text-only suggestion fails) remain in
+[`futurescope.md`](futurescope.md).
+
+---
+
 ## Phase 2 · Week 2.5 — Test Plans  ✅ shipped
 
 A `Project` owns many `TestPlan`s. A plan bundles execution config:
@@ -322,9 +408,9 @@ Steps shipped:
 
 ---
 
-## Coming up — Phase 2 weeks 7–8
+## Coming up — Phase 2 weeks 8+
 
-1. **Intervention state machine** — credentials prefill from `test_plan_credentials` injected into `data_needs.kind='credentials'` steps; OTP / confirm modals via in-memory vault (180s timeout, never persisted). Pitched scope captured in [`futurescope.md`](futurescope.md).
+1. **Credentials + OTP HITL** — credentials prefill from `test_plan_credentials` injected into `data_needs.kind='credentials'` steps; OTP modal via in-memory vault (180s timeout, never persisted). Vision-LLM escalation for AI assist when text-only suggestion fails. All captured in [`futurescope.md`](futurescope.md).
 2. **Accuracy + transparency** — replay timeline polish, "Why" explanations on each decision, cost meter
 3. **Reports** — in-app table + Excel download, regen-on-doc-change with diff modal
 

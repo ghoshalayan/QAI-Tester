@@ -6,7 +6,9 @@ import {
   Eye,
   EyeOff,
   Gauge,
+  Image as ImageIcon,
   Layers,
+  Sparkles,
   Timer,
   Turtle,
   Zap,
@@ -49,6 +51,24 @@ export function RunHeader({ run, plan }: Props) {
     typeof run.output_summary_json?.duration_ms === "number"
       ? (run.output_summary_json.duration_ms as number)
       : null;
+
+  const llmIn =
+    typeof run.output_summary_json?.llm_input_tokens === "number"
+      ? (run.output_summary_json.llm_input_tokens as number)
+      : null;
+  const llmOut =
+    typeof run.output_summary_json?.llm_output_tokens === "number"
+      ? (run.output_summary_json.llm_output_tokens as number)
+      : null;
+  const aiCalls =
+    typeof run.output_summary_json?.ai_calls === "number"
+      ? (run.output_summary_json.ai_calls as number)
+      : 0;
+  const aiVisionCalls =
+    typeof run.output_summary_json?.ai_vision_calls === "number"
+      ? (run.output_summary_json.ai_vision_calls as number)
+      : 0;
+  const showAiCost = aiCalls > 0 && (llmIn !== null || llmOut !== null);
 
   return (
     <div className="rounded-lg border bg-card p-4">
@@ -106,6 +126,30 @@ export function RunHeader({ run, plan }: Props) {
             {stepDurationMs !== null && wallClockMs !== null && (
               <span className="ml-1.5 text-xs text-muted-foreground">
                 ({formatMs(stepDurationMs)} stepwork)
+              </span>
+            )}
+          </Field>
+        )}
+
+        {/* AI cost — only renders when at least one AI assist call fired. */}
+        {showAiCost && (
+          <Field icon={Sparkles} label="AI cost">
+            <span className="font-medium">
+              {aiCalls} call{aiCalls === 1 ? "" : "s"}
+            </span>
+            {(llmIn !== null || llmOut !== null) && (
+              <span className="ml-1.5 text-xs text-muted-foreground">
+                · {llmIn?.toLocaleString() ?? 0} in /{" "}
+                {llmOut?.toLocaleString() ?? 0} out tokens
+              </span>
+            )}
+            {aiVisionCalls > 0 && (
+              <span
+                className="ml-1.5 inline-flex items-center gap-0.5 rounded border border-blue-500/30 bg-blue-500/5 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 dark:text-blue-400"
+                title={`${aiVisionCalls} vision call${aiVisionCalls === 1 ? "" : "s"} (text + screenshot)`}
+              >
+                <ImageIcon className="size-2.5" />
+                vision×{aiVisionCalls}
               </span>
             )}
           </Field>

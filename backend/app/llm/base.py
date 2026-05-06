@@ -17,6 +17,11 @@ Role = Literal["system", "user", "assistant"]
 class ChatMessage:
     role: Role
     content: str
+    # Optional inline image (PNG/JPEG bytes) for multimodal calls. Only the
+    # ``user`` role typically attaches images; providers that don't support
+    # vision fall back to text-only and ignore this field.
+    image: bytes | None = None
+    image_mime: str = "image/png"
 
 
 @dataclass
@@ -48,6 +53,17 @@ class LLMProvider(ABC):
 
     provider_id: str
     model: str
+
+    @property
+    def supports_vision(self) -> bool:
+        """True if the configured model accepts inline images.
+
+        Default False — providers override this with a model-name allow-list.
+        Callers (e.g. the executor's vision-escalation branch) check this
+        before attaching a screenshot via ``ChatMessage.image``; if False,
+        they skip the vision call cleanly.
+        """
+        return False
 
     @abstractmethod
     def chat(

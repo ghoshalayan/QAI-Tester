@@ -5,7 +5,12 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, RefreshCw } from "lucide-react";
+import {
+  ArrowLeft,
+  FileSpreadsheet,
+  FileText,
+  RefreshCw,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -16,10 +21,14 @@ import {
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { ExecutionTimeline } from "@/components/execution-timeline";
+import { InterventionModal } from "@/components/intervention-modal";
 import { RunHeader } from "@/components/run-header";
 import { RunProgressCard } from "@/components/run-progress-card";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useAgentRunsEvents } from "@/hooks/use-agent-runs-events";
+import {
+  useActiveInterventions,
+  useAgentRunsEvents,
+} from "@/hooks/use-agent-runs-events";
 import { cn } from "@/lib/utils";
 
 type FilterValue = ExecutionStepStatus | "all";
@@ -52,6 +61,7 @@ export default function RunDetailPage() {
   const [filter, setFilter] = useState<FilterValue>("all");
 
   useAgentRunsEvents(projectId);
+  const intervention = useActiveInterventions((s) => s.byRunId[runId]);
 
   const { data: run, isLoading: runLoading } = useQuery({
     queryKey: ["agent-run", projectId, runId],
@@ -154,24 +164,40 @@ export default function RunDetailPage() {
                 value={filter}
                 onChange={setFilter}
               />
-              {showRerunButton && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="ml-auto"
-                  onClick={() => rerunFailed.mutate()}
-                  disabled={rerunFailed.isPending}
-                >
-                  <RefreshCw
-                    className={cn(
-                      "size-4",
-                      rerunFailed.isPending && "animate-spin",
-                    )}
-                  />
-                  Re-run {failedTcNodeIds.length} failed step
-                  {failedTcNodeIds.length === 1 ? "" : "s"}
+              <div className="ml-auto flex flex-wrap gap-2">
+                {showRerunButton && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => rerunFailed.mutate()}
+                    disabled={rerunFailed.isPending}
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "size-4",
+                        rerunFailed.isPending && "animate-spin",
+                      )}
+                    />
+                    Re-run {failedTcNodeIds.length} failed step
+                    {failedTcNodeIds.length === 1 ? "" : "s"}
+                  </Button>
+                )}
+                <Button asChild size="sm" variant="outline">
+                  <Link href={`/projects/${projectId}/runs/${runId}/report`}>
+                    <FileText className="size-4" />
+                    View report
+                  </Link>
                 </Button>
-              )}
+                <Button asChild size="sm" variant="outline">
+                  <a
+                    href={api.runReportXlsxUrl(projectId, runId)}
+                    download
+                  >
+                    <FileSpreadsheet className="size-4" />
+                    Download Excel
+                  </a>
+                </Button>
+              </div>
             </div>
           )}
 
@@ -183,6 +209,18 @@ export default function RunDetailPage() {
             />
           )}
         </>
+      )}
+
+      {/* HITL modal — pops on a `needs_intervention` SSE event for this run.
+          Stays open indefinitely until the user picks a choice (Q1 spec).
+          Cleared from the Zustand store via `intervention_resolved` /
+          `intervention_auto_applied` / any terminal event. */}
+      {intervention && (
+        <InterventionModal
+          projectId={projectId}
+          runId={runId}
+          intervention={intervention}
+        />
       )}
     </div>
   );

@@ -4,7 +4,7 @@ import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 
-import { api } from "@/lib/api";
+import { api, type InterventionRequest } from "@/lib/api";
 
 /**
  * Per-run transient progress info pushed by ``phase`` / ``done`` events.
@@ -64,6 +64,34 @@ export const useAgentRunProgress = create<ProgressStore>((set) => ({
   clearAll: () => set({ byRunId: {} }),
 }));
 
+
+/**
+ * Active HITL interventions — one per run that's currently blocked
+ * waiting for the user. Set on ``needs_intervention``, cleared on
+ * ``intervention_resolved`` / ``intervention_auto_applied`` or any
+ * terminal event.
+ */
+interface InterventionStore {
+  byRunId: Record<number, InterventionRequest>;
+  set: (runId: number, req: InterventionRequest) => void;
+  clear: (runId: number) => void;
+  clearAll: () => void;
+}
+
+export const useActiveInterventions = create<InterventionStore>((set) => ({
+  byRunId: {},
+  set: (runId, req) =>
+    set((s) => ({ byRunId: { ...s.byRunId, [runId]: req } })),
+  clear: (runId) =>
+    set((s) => {
+      if (!(runId in s.byRunId)) return s;
+      const next = { ...s.byRunId };
+      delete next[runId];
+      return { byRunId: next };
+    }),
+  clearAll: () => set({ byRunId: {} }),
+}));
+
 /**
  * Subscribe to live agent-run events for the entire project.
  *
@@ -79,6 +107,8 @@ export function useAgentRunsEvents(projectId: number) {
   const qc = useQueryClient();
   const merge = useAgentRunProgress((s) => s.merge);
   const clear = useAgentRunProgress((s) => s.clear);
+  const setIntervention = useActiveInterventions((s) => s.set);
+  const clearIntervention = useActiveInterventions((s) => s.clear);
 
   useEffect(() => {
     if (Number.isNaN(projectId) || projectId <= 0) return;
@@ -123,7 +153,10 @@ export function useAgentRunsEvents(projectId: number) {
       try {
         const payload = JSON.parse(ev.data);
         const runId = payload.data?.run_id;
-        if (typeof runId === "number") clear(runId);
+        if (typeof runId === "number") {
+          clear(runId);
+          clearIntervention(runId);
+        }
       } catch {
         /* ignore */
       }
@@ -156,6 +189,43 @@ export function useAgentRunsEvents(projectId: number) {
       qc.invalidateQueries({ queryKey: ["agent-run", projectId] });
     };
 
+    // HITL intervention — the orchestrator emits ``needs_intervention``
+    // when a step has burned its retry budget AND AI assist couldn't fix
+    // it. Frontend stores the payload so the modal can pop. Resolved /
+    // auto-applied / terminal all clear it.
+    const onNeedsIntervention = (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const d = payload.data ?? {};
+        if (typeof d.run_id !== "number") return;
+        setIntervention(d.run_id, {
+          step_id: d.step_id,
+          ordinal: d.ordinal,
+          total: d.total,
+          title: d.title ?? "",
+          action_type: d.action_type ?? null,
+          target_hint: d.target_hint ?? null,
+          error_message: d.error_message ?? null,
+          ai_suggestion: d.ai_suggestion ?? null,
+          screenshot_path: d.screenshot_path ?? null,
+        });
+        qc.invalidateQueries({ queryKey: ["run-steps", projectId] });
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const onInterventionCleared = (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const runId = payload.data?.run_id;
+        if (typeof runId === "number") clearIntervention(runId);
+      } catch {
+        /* ignore */
+      }
+      qc.invalidateQueries({ queryKey: ["run-steps", projectId] });
+    };
+
     es.addEventListener("started", onStarted);
     es.addEventListener("phase", onProgress as EventListener);
     es.addEventListener("done", onProgress as EventListener);
@@ -165,6 +235,9 @@ export function useAgentRunsEvents(projectId: number) {
     es.addEventListener("step_completed", onStepEvent);
     es.addEventListener("paused", onPauseEvent);
     es.addEventListener("resumed", onPauseEvent);
+    es.addEventListener("needs_intervention", onNeedsIntervention as EventListener);
+    es.addEventListener("intervention_resolved", onInterventionCleared as EventListener);
+    es.addEventListener("intervention_auto_applied", onInterventionCleared as EventListener);
     es.addEventListener("completed", onTerminal as EventListener);
     es.addEventListener("failed", onTerminal as EventListener);
     es.addEventListener("cancelled", onTerminal as EventListener);

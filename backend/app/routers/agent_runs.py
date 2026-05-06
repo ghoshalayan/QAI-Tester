@@ -19,6 +19,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     status,
 )
 from sqlalchemy import select
@@ -39,12 +40,17 @@ from app.schemas.agent_run import (
     BrdToFrdRunRequest,
     ExecuteRunRequest,
     FrdToTcRunRequest,
+    InterventionRequest,
 )
 from app.schemas.execution_step import ExecutionStepRead
+from app.schemas.report import ReportRead
+from app.services.report_service import build_excel_workbook, build_run_report
 from app.services.agent_run_service import (
+    _has_pending_intervention,
     execute_brd_to_frd,
     execute_frd_to_tc,
     execute_run,
+    provide_intervention,
     request_cancel,
     request_pause,
     request_resume,
@@ -471,6 +477,83 @@ def resume_run(
     return run
 
 
+@router.post("/{run_id}/intervention", response_model=AgentRunRead)
+def submit_intervention(
+    project_id: int,
+    run_id: int,
+    payload: InterventionRequest,
+    db: Session = Depends(get_db),
+):
+    """Resolve an HITL block on a step that survived auto-retry + AI assist.
+
+    Validates that:
+    - run exists and belongs to the project
+    - run is not in a terminal state (a stuck run can still receive choices
+      until it's cancelled)
+    - the named ``ExecutionStep`` row belongs to this run
+    - an intervention is currently pending in the vault for ``(run_id, step_id)``
+
+    On the happy path, the orchestrator's ``wait_for_intervention`` call
+    unblocks with the user's choice payload, applies the override (if
+    ``use_suggestion``), and continues the loop. The status the run lands
+    on after this is whatever the post-resolution attempt returned —
+    ``passed`` if the override worked, ``failed`` if not, or ``cancelled``
+    if the user picked ``stop``.
+
+    Returns 409 when no waiter is pending — the step was already resolved
+    or never blocked. The frontend treats that as a benign race and
+    refetches step state.
+    """
+    run = _require_run(db, project_id, run_id)
+
+    if run.status in ("completed", "failed", "cancelled"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Run is in terminal state {run.status!r}; cannot accept intervention.",
+        )
+
+    # Confirm the step belongs to this run (cheap: we don't need the row,
+    # just an existence check via the FK).
+    from app.models.execution_step import ExecutionStep  # local — avoids cycle
+    step = db.get(ExecutionStep, payload.step_id)
+    if step is None or step.run_id != run_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Step {payload.step_id} not found on run {run_id}",
+        )
+
+    if not _has_pending_intervention(run_id, payload.step_id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No intervention is pending for this step. It was already "
+            "resolved or never reached the HITL gate.",
+        )
+
+    choice_payload = {
+        "choice": payload.choice,
+        "override_target_hint": payload.override_target_hint,
+        "override_action_type": payload.override_action_type,
+        "apply_to_submodule": payload.apply_to_submodule,
+    }
+    delivered = provide_intervention(run.id, payload.step_id, choice_payload)
+    if not delivered:
+        # Race: the waiter exited (cancel) between our check and the
+        # provide_intervention call. Same UX as not-pending.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Intervention waiter is no longer active.",
+        )
+
+    logger.info(
+        "Intervention delivered for run %s step %s: %s%s",
+        run.id,
+        payload.step_id,
+        payload.choice,
+        " (apply_to_submodule)" if payload.apply_to_submodule else "",
+    )
+    return run
+
+
 @router.get("/{run_id}/steps", response_model=list[ExecutionStepRead])
 def list_run_steps(
     project_id: int,
@@ -493,3 +576,70 @@ def list_run_steps(
         .order_by(ExecutionStep.ordinal)
     )
     return list(db.scalars(stmt))
+
+
+@router.get("/{run_id}/report", response_model=ReportRead)
+def get_run_report(
+    project_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """Aggregated run report: run summary + plan info + module/submodule
+    grouping with per-step rows.
+
+    Only ``kind='execute'`` runs have meaningful reports. Returns 400 for
+    other agent kinds so the frontend can render a clear "no report
+    available" state. Runs that are still active (queued/running) DO get
+    reports — the data is partial but useful for live observation.
+    """
+    run = _require_run(db, project_id, run_id)
+    if run.kind != "execute":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Reports are only available for execute runs (got kind={run.kind!r})",
+        )
+
+    excel_url = (
+        f"/api/projects/{project_id}/agent-runs/{run_id}/report.xlsx"
+    )
+    return build_run_report(db, run, excel_url=excel_url)
+
+
+@router.get("/{run_id}/report.xlsx")
+def get_run_report_xlsx(
+    project_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """Download the run report as an Excel workbook.
+
+    Generated on demand from the same aggregate as the JSON endpoint —
+    no caching. Two sheets: Summary (run/plan/AI cost) + Results (one
+    row per step with module/submodule/title/status/issues).
+    """
+    run = _require_run(db, project_id, run_id)
+    if run.kind != "execute":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Reports are only available for execute runs (got kind={run.kind!r})",
+        )
+
+    excel_url = (
+        f"/api/projects/{project_id}/agent-runs/{run_id}/report.xlsx"
+    )
+    report = build_run_report(db, run, excel_url=excel_url)
+    xlsx_bytes = build_excel_workbook(report)
+
+    filename = f"qai-run-{run_id}-report.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # No-cache so re-running invalidates the download
+            "Cache-Control": "no-store",
+        },
+    )

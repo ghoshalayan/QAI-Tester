@@ -55,6 +55,10 @@ def request_cancel(run_id: int) -> None:
     The runner polls this at safe checkpoints; cancellation takes effect
     *between phases* of the orchestrator (week 3 doesn't interrupt mid-LLM).
     Idempotent — calling on a non-running run is a no-op.
+
+    Wakes both the pause-waiter and any pending intervention-waiters so
+    a single cancel drains every blocking primitive at once. Otherwise
+    a step blocked on HITL would hold the run for the indefinite wait.
     """
     with _cancel_lock:
         _cancelled_runs.add(run_id)
@@ -64,6 +68,8 @@ def request_cancel(run_id: int) -> None:
         ev = _resume_events.get(run_id)
     if ev:
         ev.set()
+    # Wake every intervention waiter for this run.
+    _drop_interventions(run_id)
 
 
 def _is_cancelled(run_id: int) -> bool:
@@ -135,6 +141,99 @@ def _drop_pause(run_id: int) -> None:
     with _pause_lock:
         _paused_runs.discard(run_id)
         _resume_events.pop(run_id, None)
+
+
+# ── HITL intervention vault ──────────────────────────────────────
+#
+# When auto-retry + AI assist both fail on a step, the orchestrator marks
+# the row ``blocked`` and waits here for the user to pick: retry / use
+# AI suggestion / skip / stop. Same Event+dict shape as the OTP vault
+# captured in futurescope.md, but keyed by ``(run_id, step_id)`` since a
+# single run can have multiple stuck steps.
+#
+# Cancel-while-blocked must wake every waiter for that run; we layer that
+# into ``request_cancel`` below so a single cancel button drains pause +
+# intervention + cancel together.
+
+_intervention_events: dict[tuple[int, int], "threading.Event"] = {}
+_intervention_responses: dict[tuple[int, int], dict] = {}
+_intervention_lock = threading.Lock()
+
+
+def request_intervention(
+    run_id: int,
+    step_id: int,
+    *,
+    poll_interval_s: float = 0.5,
+) -> dict | None:
+    """Block until the user submits an intervention or the run is cancelled.
+
+    Returns the user's choice payload (a dict with ``choice`` plus any
+    overrides) on submit. Returns ``None`` if the run was cancelled
+    while we were waiting — callers should treat that as "skip this step
+    and exit the loop".
+
+    Indefinite wait per the user's spec (Q1: "wait until user takes
+    action"). The poll interval just lets us re-check the cancel flag;
+    cancellation also calls ``ev.set()`` directly so the wait wakes
+    promptly without depending on the poll period.
+    """
+    key = (run_id, step_id)
+    with _intervention_lock:
+        ev = _intervention_events.setdefault(key, threading.Event())
+
+    while True:
+        if ev.wait(poll_interval_s):
+            with _intervention_lock:
+                response = _intervention_responses.pop(key, None)
+                _intervention_events.pop(key, None)
+            if _is_cancelled(run_id):
+                return None
+            return response
+        if _is_cancelled(run_id):
+            with _intervention_lock:
+                _intervention_events.pop(key, None)
+                _intervention_responses.pop(key, None)
+            return None
+
+
+def provide_intervention(
+    run_id: int, step_id: int, choice: dict,
+) -> bool:
+    """Unblock a waiting intervention with the user's choice payload.
+
+    Returns True if a waiter was found, False if the step isn't blocked
+    (either never blocked, or already resolved). The endpoint surfaces
+    False as a 409 so the UI can refetch state.
+    """
+    key = (run_id, step_id)
+    with _intervention_lock:
+        ev = _intervention_events.get(key)
+        if ev is None:
+            return False
+        _intervention_responses[key] = dict(choice)
+        ev.set()
+    return True
+
+
+def _has_pending_intervention(run_id: int, step_id: int) -> bool:
+    """True if request_intervention is currently waiting on this step."""
+    with _intervention_lock:
+        return (run_id, step_id) in _intervention_events
+
+
+def _drop_interventions(run_id: int) -> None:
+    """Clean up any pending interventions for a run.
+
+    Called on cancel and from the runtime's ``finally`` block. Sets the
+    Event so any active waiter wakes up immediately; the waiter's own
+    cleanup pops the keys.
+    """
+    with _intervention_lock:
+        keys = [k for k in _intervention_events if k[0] == run_id]
+        events = [_intervention_events[k] for k in keys]
+    for ev in events:
+        ev.set()
 
 
 # ── SSE topic helpers ────────────────────────────────────────────
@@ -297,6 +396,7 @@ def execute_brd_to_frd(run_id: int) -> None:
     finally:
         _drop_cancel(run_id)
         _drop_pause(run_id)
+        _drop_interventions(run_id)
         db.close()
 
 
@@ -417,6 +517,7 @@ def execute_frd_to_tc(run_id: int) -> None:
     finally:
         _drop_cancel(run_id)
         _drop_pause(run_id)
+        _drop_interventions(run_id)
         db.close()
 
 
@@ -506,6 +607,22 @@ def execute_run(run_id: int) -> None:
             )
             return
 
+        ai_assist = bool(input_data.get("ai_assist", True))
+
+        # Build the LLM provider for AI assist on failure. Missing config is
+        # NOT fatal — the run continues with ai_assist disabled. This keeps
+        # the executor usable without an LLM (auto-retry only) and supports
+        # the "tester ran offline" scenario.
+        provider = None
+        if ai_assist:
+            try:
+                provider = get_provider_from_db(db)
+            except RuntimeError as e:
+                logger.info(
+                    "AI assist disabled for run %s — no LLM configured: %s",
+                    run.id, e,
+                )
+
         # ── Run the orchestrator ───────────────────────────────
         try:
             result = execute_plan(
@@ -515,10 +632,13 @@ def execute_run(run_id: int) -> None:
                 selected_step_ids=selected_step_ids,
                 headless=headless,
                 speed=speed_raw,
+                provider=provider,
+                ai_assist=ai_assist,
                 emit_event=lambda et, data: _emit_run_event(run, et, data),
                 is_cancelled=lambda: _is_cancelled(run.id),
                 is_paused=lambda: _is_paused(run.id),
                 wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
+                wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
             )
         except AgentCancelled as e:
             _mark_cancelled(db, run, str(e))
@@ -545,6 +665,11 @@ def execute_run(run_id: int) -> None:
             "skipped": result.skipped,
             "blocked": result.blocked,
             "duration_ms": result.duration_ms,
+            # AI-assist cost meter — None when no AI call happened
+            "llm_input_tokens": result.llm_input_tokens,
+            "llm_output_tokens": result.llm_output_tokens,
+            "ai_calls": result.ai_calls,
+            "ai_vision_calls": result.ai_vision_calls,
         }
         db.commit()
         _emit_run_event(run, "completed", run.output_summary_json)
@@ -559,4 +684,5 @@ def execute_run(run_id: int) -> None:
     finally:
         _drop_cancel(run_id)
         _drop_pause(run_id)
+        _drop_interventions(run_id)
         db.close()

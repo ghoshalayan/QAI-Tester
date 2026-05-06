@@ -45,12 +45,48 @@ class ExecuteRunRequest(BaseModel):
     type delay, network-idle wait timeout, and auto-retry count. Default
     ``"slow"`` because heavy-data sites need the longer settle window;
     ``"fast"`` skips the visible-typing animation and shortens timeouts.
+
+    ``ai_assist`` enables the AI-driven correction layer that kicks in
+    after auto-retries exhaust on a step. The LLM looks at the live page,
+    proposes a fix (corrected target_hint / action_type / etc.), and the
+    orchestrator runs the corrected step once. On success the row is
+    promoted to ``passed`` and the correction is logged in
+    ``details_json["ai_correction"]``. Defaults to ``True`` — gracefully
+    no-ops when no LLM is configured in app_settings.
     """
 
     plan_id: int = Field(..., gt=0)
     selected_step_ids: list[int] | None = Field(default=None, min_length=1)
     headless: bool = Field(default=False)
     speed: Literal["slow", "normal", "fast"] = Field(default="slow")
+    ai_assist: bool = Field(default=True)
+
+
+class InterventionRequest(BaseModel):
+    """Body for ``POST /agent-runs/{run_id}/intervention``.
+
+    Sent by the user when an HITL modal pops on a step that survived
+    auto-retry + AI assist. Choices:
+
+    - ``retry`` — try the original step again as-is.
+    - ``use_suggestion`` — try with the user's overrides (typically the
+      AI's suggested target_hint, optionally edited inline in the modal).
+    - ``skip`` — leave the step ``failed`` and continue to the next sibling.
+    - ``stop`` — cancel the entire run.
+
+    ``override_target_hint`` / ``override_action_type`` apply only to
+    ``use_suggestion``. Empty / null means "don't override that field".
+
+    ``apply_to_submodule`` remembers the choice and auto-applies it to
+    every subsequent failure under the same submodule, so the user
+    doesn't click 20 modals on a broken submodule.
+    """
+
+    step_id: int = Field(..., gt=0)
+    choice: Literal["retry", "use_suggestion", "skip", "stop"]
+    override_target_hint: str | None = Field(default=None, max_length=2048)
+    override_action_type: str | None = Field(default=None, max_length=64)
+    apply_to_submodule: bool = Field(default=False)
 
 
 # ── Responses ─────────────────────────────────────────────────────
