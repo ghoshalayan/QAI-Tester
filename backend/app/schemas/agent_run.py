@@ -79,6 +79,16 @@ class ExecuteRunRequest(BaseModel):
     auto_adjust: bool = Field(default=False)
     promote_fixes: bool = Field(default=False)
 
+    # Window geometry — set by the frontend from ``window.screen`` so the
+    # headed Chromium tiles to fit the user's monitor and leaves the
+    # right side free for the live presenter popup. All four are optional;
+    # missing values fall through to ``browser_session`` defaults.
+    # Headless launches ignore these.
+    window_x: int | None = Field(default=None, ge=0, le=10_000)
+    window_y: int | None = Field(default=None, ge=0, le=10_000)
+    window_width: int | None = Field(default=None, ge=400, le=10_000)
+    window_height: int | None = Field(default=None, ge=300, le=10_000)
+
 
 class InterventionRequest(BaseModel):
     """Body for ``POST /agent-runs/{run_id}/intervention``.

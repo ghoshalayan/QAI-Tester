@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { Check, ExternalLink, Pencil, X } from "lucide-react";
+import { Check, ExternalLink, Pencil, Plus, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -12,6 +12,7 @@ import {
   ApiError,
   TC_NODE_KIND_LABELS,
   TC_NODE_STATUS_LABELS,
+  type TcNodeDataNeed,
   type TcNodeStatus,
   type TcNodeTreeRead,
   type TcNodeUpdate,
@@ -41,6 +42,21 @@ const ACTION_TYPES = [
   "screenshot",
 ] as const;
 
+// Data-need kinds the executor's dispatcher recognizes (see
+// app/executor/actions.py:_check_data_block / _extract_text_payload):
+//   - "data"        : free-form value used as the type/select payload
+//   - "credentials" : runtime blocks for the HITL credential vault
+//   - "otp"         : runtime blocks for an HITL OTP modal
+const DATA_NEED_KINDS = ["data", "credentials", "otp"] as const;
+type DataNeedKind = (typeof DATA_NEED_KINDS)[number];
+
+const DATA_NEED_HINTS: Record<DataNeedKind, string> = {
+  data: "Plain value typed/selected at runtime (e.g. 'admin@example.com').",
+  credentials:
+    "Runtime blocks for the HITL credential vault — username + password supplied at execution time.",
+  otp: "Runtime blocks for an HITL OTP modal — user enters the code from email/SMS/authenticator.",
+};
+
 interface Props {
   projectId: number;
   node: TcNodeTreeRead;
@@ -54,6 +70,7 @@ interface DraftFields {
   narrative: string;
   expected: string;
   description_md: string;
+  data_needs: TcNodeDataNeed[];
 }
 
 function nodeToDraft(node: TcNodeTreeRead): DraftFields {
@@ -64,7 +81,17 @@ function nodeToDraft(node: TcNodeTreeRead): DraftFields {
     narrative: node.narrative ?? "",
     expected: node.expected ?? "",
     description_md: node.description_md ?? "",
+    // Deep-copy so editing a row doesn't mutate the cached query result.
+    data_needs: (node.data_needs_json ?? []).map((dn) => ({ ...dn })),
   };
+}
+
+function dataNeedsEqual(a: TcNodeDataNeed[], b: TcNodeDataNeed[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].kind !== b[i].kind || a[i].notes !== b[i].notes) return false;
+  }
+  return true;
 }
 
 export function TcDetailPanel({ projectId, node, onClose }: Props) {
@@ -136,6 +163,17 @@ export function TcDetailPanel({ projectId, node, onClose }: Props) {
       }
       if (draft.expected !== original.expected) {
         payload.expected = draft.expected;
+      }
+      if (!dataNeedsEqual(draft.data_needs, original.data_needs)) {
+        // Drop empty rows the user added but never filled, except for
+        // credentials/otp where notes is genuinely optional (the vault
+        // supplies the value).
+        payload.data_needs_json = draft.data_needs.filter(
+          (dn) =>
+            dn.kind === "credentials" ||
+            dn.kind === "otp" ||
+            dn.notes.trim().length > 0,
+        );
       }
     }
     if (draft.description_md !== original.description_md) {
@@ -334,6 +372,17 @@ export function TcDetailPanel({ projectId, node, onClose }: Props) {
                 </ul>
               </Section>
             )}
+
+          {editing && (
+            <Section label="Data needs">
+              <DataNeedsEditor
+                rows={draft.data_needs}
+                onChange={(rows) =>
+                  setDraft({ ...draft, data_needs: rows })
+                }
+              />
+            </Section>
+          )}
         </>
       )}
 
@@ -417,6 +466,98 @@ function Section({
         {label}
       </p>
       <div className="mt-1.5">{children}</div>
+    </div>
+  );
+}
+
+function DataNeedsEditor({
+  rows,
+  onChange,
+}: {
+  rows: TcNodeDataNeed[];
+  onChange: (rows: TcNodeDataNeed[]) => void;
+}) {
+  const updateRow = (idx: number, patch: Partial<TcNodeDataNeed>) => {
+    const next = rows.map((r, i) => (i === idx ? { ...r, ...patch } : r));
+    onChange(next);
+  };
+  const removeRow = (idx: number) => {
+    onChange(rows.filter((_, i) => i !== idx));
+  };
+  const addRow = () => {
+    onChange([...rows, { kind: "data", notes: "" }]);
+  };
+
+  return (
+    <div className="space-y-2">
+      {rows.length === 0 && (
+        <p className="text-xs italic text-muted-foreground">
+          No data needs. Add one below if this step requires runtime data,
+          credentials, or an OTP.
+        </p>
+      )}
+      {rows.map((row, idx) => {
+        const knownKind = (DATA_NEED_KINDS as readonly string[]).includes(
+          row.kind,
+        );
+        const kindForHint = (knownKind ? row.kind : "data") as DataNeedKind;
+        const optionalNotes = row.kind === "credentials" || row.kind === "otp";
+        return (
+          <div
+            key={idx}
+            className="rounded-md border bg-muted/20 p-2 space-y-1.5"
+          >
+            <div className="flex items-center gap-2">
+              <select
+                value={row.kind}
+                onChange={(e) => updateRow(idx, { kind: e.target.value })}
+                className="h-8 rounded-md border border-input bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                {DATA_NEED_KINDS.map((k) => (
+                  <option key={k} value={k}>
+                    {k}
+                  </option>
+                ))}
+                {/* Preserve unknown kinds the user previously authored
+                    rather than silently rewriting them on save. */}
+                {!knownKind && <option value={row.kind}>{row.kind}</option>}
+              </select>
+              <span className="flex-1 text-[10px] text-muted-foreground">
+                {DATA_NEED_HINTS[kindForHint]}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => removeRow(idx)}
+                aria-label="Remove this data need"
+                title="Remove"
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            </div>
+            <Input
+              value={row.notes}
+              onChange={(e) => updateRow(idx, { notes: e.target.value })}
+              placeholder={
+                optionalNotes
+                  ? "Optional notes (e.g. 'admin role')"
+                  : "Value to type / select at runtime"
+              }
+              className="text-xs"
+            />
+          </div>
+        );
+      })}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={addRow}
+        className="w-full"
+      >
+        <Plus className="size-3.5" />
+        Add data need
+      </Button>
     </div>
   );
 }

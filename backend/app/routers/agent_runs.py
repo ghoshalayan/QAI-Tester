@@ -269,6 +269,10 @@ def start_execute(
             "ai_assist": payload.ai_assist,
             "auto_adjust": payload.auto_adjust,
             "promote_fixes": payload.promote_fixes,
+            "window_x": payload.window_x,
+            "window_y": payload.window_y,
+            "window_width": payload.window_width,
+            "window_height": payload.window_height,
         },
         output_summary_json={},
     )

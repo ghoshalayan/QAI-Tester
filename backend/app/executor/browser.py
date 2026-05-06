@@ -50,6 +50,13 @@ DEFAULT_VIEWPORT_HEIGHT = 800
 DEFAULT_LOCALE = "en-US"
 DEFAULT_TIMEOUT_MS = 30_000
 
+# Tile the visible Chromium window into the left portion of the screen so
+# the live presenter popup can sit on the right. ``--window-position`` and
+# ``--window-size`` are Chromium-only Chromium flags Playwright forwards
+# verbatim. Headless launches ignore these.
+DEFAULT_WINDOW_POSITION = (0, 0)
+DEFAULT_WINDOW_SIZE = (1300, 920)
+
 
 class BrowserNotInstalledError(RuntimeError):
     """Raised when the Chromium binary isn't downloaded yet.
@@ -83,6 +90,8 @@ def browser_session(
     viewport_height: int = DEFAULT_VIEWPORT_HEIGHT,
     locale: str = DEFAULT_LOCALE,
     default_timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    window_position: tuple[int, int] | None = DEFAULT_WINDOW_POSITION,
+    window_size: tuple[int, int] | None = DEFAULT_WINDOW_SIZE,
 ) -> Iterator[Page]:
     """Yield a ready-to-drive Playwright Page; clean up on exit.
 
@@ -96,6 +105,14 @@ def browser_session(
         locale: BCP-47 locale, used for ``Accept-Language`` and JS ``navigator.language``.
         default_timeout_ms: Default timeout for selectors / actions on the
             yielded Page. Per-action overrides are still possible.
+        window_position: Top-left ``(x, y)`` for the headed Chromium window,
+            in screen pixels. Default ``(0, 0)`` so the visible run tiles
+            to the left edge, leaving the right side free for the live
+            presenter popup. ``None`` disables the flag.
+        window_size: ``(width, height)`` of the headed Chromium window in
+            screen pixels (chrome included; differs from viewport which is
+            content-only). Default leaves ~600px on a 1920-wide screen for
+            the presenter popup. ``None`` disables the flag.
 
     Raises:
         BrowserNotInstalledError: If the Chromium binary hasn't been downloaded.
@@ -112,10 +129,24 @@ def browser_session(
         except Exception as e:
             raise RuntimeError(f"Failed to start Playwright: {e}") from e
 
+        # Tile the headed window so the live presenter popup can sit on
+        # the right. Headless launches ignore these flags entirely, so it's
+        # safe to always pass them.
+        launch_args: list[str] = []
+        if window_position is not None:
+            launch_args.append(
+                f"--window-position={window_position[0]},{window_position[1]}",
+            )
+        if window_size is not None:
+            launch_args.append(
+                f"--window-size={window_size[0]},{window_size[1]}",
+            )
+
         try:
             browser = pw.chromium.launch(
                 headless=headless,
                 slow_mo=config.slow_mo_ms,
+                args=launch_args or None,
             )
         except Exception as e:
             msg = str(e).lower()

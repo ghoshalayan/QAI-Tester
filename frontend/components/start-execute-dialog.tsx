@@ -110,15 +110,47 @@ export function StartExecuteDialog({
   );
 
   const startMutation = useMutation({
-    mutationFn: () =>
-      api.startExecute(projectId, {
+    mutationFn: () => {
+      // Compute screen-aware tiling once so the browser and the live
+      // panel share the same geometry contract:
+      //   browser : (0, 0) → (availWidth - PANEL, availHeight)
+      //   panel   : (availWidth - PANEL, 0) → (PANEL, availHeight)
+      // Sent to the backend as window_x / y / width / height. Headless
+      // runs and tiny screens fall through to backend defaults safely.
+      const layout = computeWindowLayout();
+      return api.startExecute(projectId, {
         plan_id: planId!,
         headless,
         speed,
         auto_adjust: autoAdjust,
         promote_fixes: promoteFixes,
-      }),
+        window_x: layout?.browser.x,
+        window_y: layout?.browser.y,
+        window_width: layout?.browser.w,
+        window_height: layout?.browser.h,
+      });
+    },
     onSuccess: (run) => {
+      // Open the live presenter pinned to the right of the screen, sized
+      // to exactly fill the gap left by the (left-tiled) browser window.
+      try {
+        const layout = computeWindowLayout();
+        if (layout) {
+          const { panel } = layout;
+          const features = `popup=yes,width=${panel.w},height=${panel.h},left=${panel.x},top=${panel.y},resizable=yes,scrollbars=yes`;
+          const url = `/live/${projectId}/${run.id}`;
+          const popup = window.open(url, `qai-live-run-${run.id}`, features);
+          if (!popup) {
+            toast.message("Popup blocked", {
+              description:
+                "Allow popups for this site to see the live agent panel beside the browser.",
+            });
+          }
+        }
+      } catch {
+        /* if window.open throws (sandboxed), fall through silently */
+      }
+
       toast.success("Execution queued", {
         description: `Run #${run.id} — progress streams on the Runs tab.`,
       });
@@ -330,6 +362,29 @@ function ToggleRow({
       </div>
     </div>
   );
+}
+
+/**
+ * Compute side-by-side window geometry from the user's actual screen.
+ * Splits ``screen.availWidth × availHeight`` into:
+ *   - browser pane on the left (everything minus the panel)
+ *   - panel popup on the right (PANEL_WIDTH wide, full height)
+ * Returns ``null`` when there's no DOM (SSR) or the screen is too narrow
+ * to usefully tile — in which case the caller skips the popup and the
+ * backend uses its built-in defaults.
+ */
+const PANEL_WIDTH = 600;
+const MIN_BROWSER_WIDTH = 720;
+function computeWindowLayout() {
+  if (typeof window === "undefined" || !window.screen) return null;
+  const availW = window.screen.availWidth ?? window.screen.width ?? 0;
+  const availH = window.screen.availHeight ?? window.screen.height ?? 0;
+  if (availW < PANEL_WIDTH + MIN_BROWSER_WIDTH || availH < 500) return null;
+  const browserW = availW - PANEL_WIDTH;
+  return {
+    browser: { x: 0, y: 0, w: browserW, h: availH },
+    panel: { x: browserW, y: 0, w: PANEL_WIDTH, h: availH },
+  };
 }
 
 function PlanSummary({ plan }: { plan: PlanReadCompact }) {

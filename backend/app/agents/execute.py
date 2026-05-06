@@ -662,6 +662,8 @@ def execute_plan(
     ai_assist: bool = True,
     auto_adjust: bool = False,
     promote_fixes: bool = False,
+    window_position: tuple[int, int] | None = None,
+    window_size: tuple[int, int] | None = None,
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     is_paused: Callable[[], bool] | None = None,
@@ -781,7 +783,18 @@ def execute_plan(
     _auto_apply_by_submodule: dict[int, dict] = {}
 
     try:
-        with browser_session(headless=headless, speed=speed) as page:
+        # Forward the optional window geometry; ``browser_session`` falls
+        # back to its own defaults when either tuple is None.
+        bs_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "speed": speed,
+        }
+        if window_position is not None:
+            bs_kwargs["window_position"] = window_position
+        if window_size is not None:
+            bs_kwargs["window_size"] = window_size
+
+        with browser_session(**bs_kwargs) as page:
             # Install the visible cursor + narration overlay. Always-on so
             # per-step screenshots inherit the cursor position + banner text
             # without any extra plumbing on the timeline side.

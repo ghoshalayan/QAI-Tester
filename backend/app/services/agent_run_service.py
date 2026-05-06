@@ -611,6 +611,25 @@ def execute_run(run_id: int) -> None:
         auto_adjust = bool(input_data.get("auto_adjust", False))
         promote_fixes = bool(input_data.get("promote_fixes", False))
 
+        # Window geometry — frontend computes from screen.availWidth/Height
+        # so the headed Chromium fits the user's monitor with the live
+        # presenter popup on the right. None values fall through to
+        # browser_session defaults.
+        win_x = input_data.get("window_x")
+        win_y = input_data.get("window_y")
+        win_w = input_data.get("window_width")
+        win_h = input_data.get("window_height")
+        window_position = (
+            (int(win_x), int(win_y))
+            if isinstance(win_x, int) and isinstance(win_y, int)
+            else None
+        )
+        window_size = (
+            (int(win_w), int(win_h))
+            if isinstance(win_w, int) and isinstance(win_h, int)
+            else None
+        )
+
         # Build the LLM provider for AI assist on failure. Missing config is
         # NOT fatal — the run continues with ai_assist disabled. This keeps
         # the executor usable without an LLM (auto-retry only) and supports
@@ -638,6 +657,8 @@ def execute_run(run_id: int) -> None:
                 ai_assist=ai_assist,
                 auto_adjust=auto_adjust,
                 promote_fixes=promote_fixes,
+                window_position=window_position,
+                window_size=window_size,
                 emit_event=lambda et, data: _emit_run_event(run, et, data),
                 is_cancelled=lambda: _is_cancelled(run.id),
                 is_paused=lambda: _is_paused(run.id),

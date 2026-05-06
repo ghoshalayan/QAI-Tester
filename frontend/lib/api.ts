@@ -329,6 +329,14 @@ export interface ExecuteRunRequest {
   /** When true, a fix that produces a passing step (AI auto-applied or
    * HITL-confirmed) is also written back to the source tc_node. */
   promote_fixes?: boolean;
+  /** Headed Chromium window position + size, in screen pixels. The
+   * frontend computes these from ``window.screen.availWidth/Height`` so
+   * the browser tiles to the left and the live presenter popup fits on
+   * the right. Headless launches ignore them. */
+  window_x?: number;
+  window_y?: number;
+  window_width?: number;
+  window_height?: number;
 }
 
 // ── HITL intervention ────────────────────────────────────────────

@@ -66,6 +66,68 @@ export const useAgentRunProgress = create<ProgressStore>((set) => ({
 
 
 /**
+ * Recent live events captured per run for the side-by-side presenter
+ * panel. Caps at ``MAX_EVENTS`` per run so the store stays bounded
+ * across long runs. Newest event last.
+ *
+ * The presenter popup mounts after the run starts, so we replay
+ * whatever's already buffered (via the EventSource ``Last-Event-ID``
+ * mechanism on the bus) plus everything that arrives live.
+ */
+export interface LiveEvent {
+  /** Monotonic counter the panel uses for keys + ordering. */
+  seq: number;
+  /** ISO timestamp captured client-side when the event was received. */
+  at: string;
+  /** SSE event name — ``step_started``, ``ai_assist_completed``, etc. */
+  type: string;
+  /** Original ``data`` payload from the bus. */
+  data: Record<string, unknown>;
+}
+
+const MAX_EVENTS_PER_RUN = 60;
+
+interface EventLogStore {
+  byRunId: Record<number, LiveEvent[]>;
+  _nextSeq: number;
+  push: (runId: number, type: string, data: Record<string, unknown>) => void;
+  clear: (runId: number) => void;
+  clearAll: () => void;
+}
+
+export const useAgentEventLog = create<EventLogStore>((set) => ({
+  byRunId: {},
+  _nextSeq: 1,
+  push: (runId, type, data) =>
+    set((s) => {
+      const seq = s._nextSeq;
+      const existing = s.byRunId[runId] ?? [];
+      const next = [
+        ...existing,
+        { seq, at: new Date().toISOString(), type, data },
+      ];
+      // Cap the buffer; drop oldest first.
+      const trimmed =
+        next.length > MAX_EVENTS_PER_RUN
+          ? next.slice(next.length - MAX_EVENTS_PER_RUN)
+          : next;
+      return {
+        _nextSeq: seq + 1,
+        byRunId: { ...s.byRunId, [runId]: trimmed },
+      };
+    }),
+  clear: (runId) =>
+    set((s) => {
+      if (!(runId in s.byRunId)) return s;
+      const next = { ...s.byRunId };
+      delete next[runId];
+      return { byRunId: next };
+    }),
+  clearAll: () => set({ byRunId: {}, _nextSeq: 1 }),
+}));
+
+
+/**
  * Active HITL interventions — one per run that's currently blocked
  * waiting for the user. Set on ``needs_intervention``, cleared on
  * ``intervention_resolved`` / ``intervention_auto_applied`` or any
@@ -109,6 +171,7 @@ export function useAgentRunsEvents(projectId: number) {
   const clear = useAgentRunProgress((s) => s.clear);
   const setIntervention = useActiveInterventions((s) => s.set);
   const clearIntervention = useActiveInterventions((s) => s.clear);
+  const pushEvent = useAgentEventLog((s) => s.push);
 
   useEffect(() => {
     if (Number.isNaN(projectId) || projectId <= 0) return;
@@ -226,6 +289,49 @@ export function useAgentRunsEvents(projectId: number) {
       qc.invalidateQueries({ queryKey: ["run-steps", projectId] });
     };
 
+    // Mirror every SSE event into the live presenter's event-log store.
+    // Wrapped per event type so the existing listeners keep their precise
+    // invalidation semantics; this is purely additive.
+    const teeToLog = (type: string) => (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        const d = payload.data ?? {};
+        const runId = d.run_id;
+        if (typeof runId === "number") {
+          pushEvent(runId, type, d);
+        }
+      } catch {
+        /* malformed event — ignore */
+      }
+    };
+
+    const PRESENTER_EVENTS = [
+      "started",
+      "phase",
+      "step_started",
+      "step_retry",
+      "step_completed",
+      "ai_improvise_started",
+      "ai_improvise_completed",
+      "ai_assist_started",
+      "ai_assist_completed",
+      "needs_intervention",
+      "intervention_resolved",
+      "intervention_auto_applied",
+      "fix_promoted",
+      "paused",
+      "resumed",
+      "module_started",
+      "module_completed",
+      "done",
+      "completed",
+      "failed",
+      "cancelled",
+    ];
+    for (const type of PRESENTER_EVENTS) {
+      es.addEventListener(type, teeToLog(type) as EventListener);
+    }
+
     es.addEventListener("started", onStarted);
     es.addEventListener("phase", onProgress as EventListener);
     es.addEventListener("done", onProgress as EventListener);
@@ -246,5 +352,5 @@ export function useAgentRunsEvents(projectId: number) {
     return () => {
       es.close();
     };
-  }, [projectId, qc, merge, clear]);
+  }, [projectId, qc, merge, clear, setIntervention, clearIntervention, pushEvent]);
 }
