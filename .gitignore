@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Local data (DBs, indices, uploaded docs, run artifacts)
+backend/data/qai.db
+backend/data/qai.db-shm
+backend/data/qai.db-wal
+backend/data/faiss/
+backend/data/docs/
+backend/data/screenshots/
+backend/data/reports/
+
+# Env
+.env
+.env.local
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

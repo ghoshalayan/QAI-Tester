@@ -1,0 +1,149 @@
+"""Playwright browser-context factory.
+
+One context-manager — :func:`browser_session` — yields a single ready Page
+and tears down Page → Context → Browser → Playwright on exit, even on
+exception. Sync API (``playwright.sync_api``) so it composes with the
+sync orchestrator + sync DB session pattern from weeks 3-4.
+
+The executor agent (``app.agents.execute``, step 6) uses this directly. The
+runner (``app.services.agent_run_service.execute_run``, step 7) calls the
+agent and forwards its events to the SSE bus.
+
+First-run note
+--------------
+After ``uv add playwright`` you must download the Chromium binary once:
+
+    cd v2/backend
+    uv run playwright install chromium
+
+If the binary is missing, :func:`browser_session` raises
+:class:`BrowserNotInstalledError` with that exact remedy. The pre-flight
+helper :func:`chromium_installed` lets the router surface this as a 4xx
+before spawning a background task.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    sync_playwright,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Default browser config — the executor agent uses these directly. The
+# values are tuned for "looks like a real desktop user" rather than for
+# CI/headless throughput; flip ``headless`` per-run if you want speed.
+DEFAULT_VIEWPORT_WIDTH = 1280
+DEFAULT_VIEWPORT_HEIGHT = 800
+DEFAULT_LOCALE = "en-US"
+DEFAULT_TIMEOUT_MS = 30_000
+
+
+class BrowserNotInstalledError(RuntimeError):
+    """Raised when the Chromium binary isn't downloaded yet.
+
+    Fix: ``cd v2/backend && uv run playwright install chromium``.
+    """
+
+
+def chromium_installed() -> bool:
+    """Cheap probe — does the Chromium binary exist on disk?
+
+    Used by the runner / router for pre-flight validation, so a missing
+    binary surfaces as a clear 4xx instead of crashing a background task.
+    """
+    try:
+        with sync_playwright() as pw:
+            exe = pw.chromium.executable_path
+            return bool(exe) and Path(exe).exists()
+    except Exception:
+        # If sync_playwright itself blows up (e.g. import error), treat as
+        # not installed — the helpful remedy is the same.
+        return False
+
+
+@contextmanager
+def browser_session(
+    *,
+    headless: bool = False,
+    viewport_width: int = DEFAULT_VIEWPORT_WIDTH,
+    viewport_height: int = DEFAULT_VIEWPORT_HEIGHT,
+    locale: str = DEFAULT_LOCALE,
+    default_timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> Iterator[Page]:
+    """Yield a ready-to-drive Playwright Page; clean up on exit.
+
+    Args:
+        headless: Run without a visible window. Default False — week 5 ships
+            with the window visible so the user can see what's happening
+            (HITL in week 6 needs this anyway).
+        viewport_width / viewport_height: Browser viewport in CSS pixels.
+        locale: BCP-47 locale, used for ``Accept-Language`` and JS ``navigator.language``.
+        default_timeout_ms: Default timeout for selectors / actions on the
+            yielded Page. Per-action overrides are still possible.
+
+    Raises:
+        BrowserNotInstalledError: If the Chromium binary hasn't been downloaded.
+        RuntimeError: For any other Playwright launch failure (e.g. permission
+            issues, port conflicts).
+    """
+    pw: Playwright | None = None
+    browser: Browser | None = None
+    context: BrowserContext | None = None
+    try:
+        try:
+            pw = sync_playwright().start()
+        except Exception as e:
+            raise RuntimeError(f"Failed to start Playwright: {e}") from e
+
+        try:
+            browser = pw.chromium.launch(headless=headless)
+        except Exception as e:
+            msg = str(e).lower()
+            if (
+                "executable doesn't exist" in msg
+                or "executable_path" in msg
+                or "browsers are not installed" in msg
+            ):
+                raise BrowserNotInstalledError(
+                    "Chromium binary not installed. From v2/backend run:\n"
+                    "    uv run playwright install chromium",
+                ) from e
+            raise
+
+        context = browser.new_context(
+            viewport={"width": viewport_width, "height": viewport_height},
+            locale=locale,
+        )
+        context.set_default_timeout(default_timeout_ms)
+
+        page = context.new_page()
+        yield page
+    finally:
+        # Reverse-order cleanup; swallow errors during teardown so we don't
+        # mask the original exception on the way out.
+        if context is not None:
+            try:
+                context.close()
+            except Exception as e:
+                logger.warning("Error closing browser context: %s", e)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception as e:
+                logger.warning("Error closing browser: %s", e)
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception as e:
+                logger.warning("Error stopping Playwright: %s", e)

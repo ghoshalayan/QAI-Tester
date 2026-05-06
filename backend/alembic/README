@@ -1,0 +1,6 @@
+Generic single-database configuration for QAI Tester v2.
+
+Usage from `v2/backend/`:
+    uv run alembic revision --autogenerate -m "your message"
+    uv run alembic upgrade head
+    uv run alembic downgrade -1
