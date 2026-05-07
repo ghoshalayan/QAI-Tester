@@ -133,12 +133,20 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         # pattern). Piggybacks on the existing tool call so it costs
         # ~30 output tokens, not a separate LLM round-trip.
         "page_memory_note": {"type": "string"},
+        # Sub-goal tracking — the agent declares which decomposed
+        # sub-goal it's working on this turn, and (when applicable)
+        # which sub-goal this turn's action just completed. Both are
+        # short stable ids (e.g. "sg1") matching ``Goal.sub_goals[].id``.
+        # Empty string when not applicable.
+        "current_sub_goal_id": {"type": "string"},
+        "sub_goal_completed_id": {"type": "string"},
     },
     "required": [
         "tool", "target_hint", "value", "url", "expected",
         "duration_ms", "scroll_direction", "scroll_amount",
         "question", "reasoning", "confidence",
         "page_memory_note",
+        "current_sub_goal_id", "sub_goal_completed_id",
     ],
     "additionalProperties": False,
 }
@@ -224,6 +232,27 @@ PAGE MEMORY:
 - Set to "" (empty string) ONLY when you've already memorized this
   exact URL on a previous turn AND nothing visibly changed.
 
+SUB-GOALS:
+- The goal is decomposed into ordered SUB-GOALS (you'll see them in
+  the GOAL block). Work through them sequentially.
+- ``current_sub_goal_id``: the id of the sub-goal you're advancing
+  THIS turn (e.g. "sg2"). Always set this when sub-goals exist —
+  it's how the UI shows what you're doing. Empty string only when
+  there are NO sub-goals defined.
+- ``sub_goal_completed_id``: ONLY set this on a turn whose action
+  verifiably advanced past the named sub-goal. Examples:
+    * You just clicked "Add to cart" and the next observation
+      shows the cart count went up → set this to the sub-goal id
+      for "click add to cart".
+    * Your verify() succeeded against the criterion that proves a
+      sub-goal → set the corresponding sub-goal id.
+  Do NOT mark a sub-goal complete just because you took an action
+  toward it — only when the OUTCOME confirms it.
+- Don't call ``mark_goal_complete`` until ALL sub-goals are done.
+  If you skip a sub-goal because the page architecture differs
+  from the test case's assumption, that's fine — pick the next
+  one and proceed.
+
 Output JSON only.
 """
 
@@ -257,12 +286,245 @@ class TurnRecord:
     error_message: str | None = None
     page_url: str = ""
     extracted_text: str = ""
+    # A4.1b: when a target_hint missed and the orchestrator ran the
+    # vision-search helper, the side-actions taken (scroll / navigate
+    # / dismiss / drill) and their LLM cost get folded in here so the
+    # report timeline shows the recovery path.
+    search_log: dict[str, Any] | None = None
 
 
 HaltReason = Literal[
     "complete", "agent_failed", "ask_human", "stall", "oscillation",
     "max_turns", "max_wallclock", "budget", "cancelled",
 ]
+
+
+# A4.3: actionable categorization of why a row didn't pass cleanly.
+# Lifted into ``details_json["divergence"]`` and surfaced as a chip on
+# the report row + a category-specific recommendation in the panel.
+DivergenceCategory = Literal[
+    "passed_clean",          # row passed, no fixes needed
+    "passed_with_help",      # row passed but only after fuzzy / vision
+    "test_case_outdated",    # near-misses found high-similar elements
+    "feature_missing",       # no near-misses, target genuinely absent
+    "infra_issue",           # page errors, network timeout, browser crash
+    "agent_drift",           # agent stalled / wandered; goal recoverable
+    "agent_gave_up",         # agent voluntarily marked failed
+    "user_cancelled",
+]
+
+
+def _build_frozen_path(
+    *,
+    run_id: int,
+    goal: Goal,
+    turn_log: list[TurnRecord],
+    agent_model: str | None,
+) -> dict[str, Any] | None:
+    """Phase E.1: serialize the agent's working tool sequence so future
+    runs can replay it deterministically.
+
+    Discards meta turns (mark_goal_complete / mark_goal_failed /
+    ask_human) and any turn whose status wasn't ``ok``. Captures the
+    SUCCESSFUL selector that resolved (post-fuzzy / post-vision-search)
+    when available, so replay uses the strongest target the system
+    found, not the original test-case wording that may have been off.
+
+    Returns the frozen-path dict, or ``None`` if there's nothing
+    worth freezing (e.g., agent reached mark_goal_complete in 1 turn
+    without any action — replay would be trivial).
+    """
+    steps: list[dict[str, Any]] = []
+    for t in turn_log:
+        if t.status != "ok":
+            continue
+        if t.tool not in (
+            "navigate", "click", "type", "select", "verify", "wait",
+            "scroll", "extract_text", "dismiss_modal",
+        ):
+            continue
+        # Strip empty / zero args before persisting — keeps the frozen
+        # JSON compact and makes the replay step contract obvious.
+        slim_args = {
+            k: v for k, v in (t.args or {}).items()
+            if v not in ("", 0, None, False)
+        }
+        # If the agent's resolver substituted a selector (fuzzy or
+        # vision-search), the substitution sits in the narration.
+        # Capture it as ``successful_selector`` so replay can use the
+        # *winning* form rather than the original test-case wording.
+        successful_selector: str | None = None
+        if "fuzzy matched" in (t.narration or "").lower():
+            # Format: "...fuzzy matched 'Add to Cart' (score 0.9)"
+            import re as _re  # noqa: PLC0415
+            m = _re.search(
+                r"fuzzy matched ['\"]([^'\"]+)['\"]",
+                t.narration or "",
+            )
+            if m:
+                successful_selector = m.group(1)
+        steps.append({
+            "turn": t.turn,
+            "tool": t.tool,
+            "args": slim_args,
+            "successful_selector": successful_selector,
+            "page_url_after": t.page_url,
+        })
+    if not steps:
+        return None
+    return {
+        "version": 1,
+        "frozen_at_run_id": run_id,
+        "frozen_at": _utcnow().isoformat(),
+        "agent_model": agent_model,
+        "goal_description": goal.description,
+        "success_criteria": list(goal.success_criteria),
+        "steps": steps,
+    }
+
+
+def _categorize_divergence(
+    *,
+    final_status: str,
+    halt_reason: str,
+    turn_log: list[TurnRecord],
+) -> dict[str, Any]:
+    """Classify why a submodule ended the way it did.
+
+    Decision tree (first match wins):
+    - status passed + no fuzzy/vision rescues  → ``passed_clean``
+    - status passed +    fuzzy/vision rescues  → ``passed_with_help``
+    - cancelled                                → ``user_cancelled``
+    - halt=agent_failed                        → ``agent_gave_up``
+    - any turn had a real-page-error           → ``infra_issue``
+    - search log shows near-misses 0.30-0.60   → ``test_case_outdated``
+    - search log shows 0 near-misses           → ``feature_missing``
+    - default                                  → ``agent_drift``
+
+    Returns a dict with the category, a short one-line summary, and
+    counts of the interventions that did/didn't work — so the report's
+    recommendation panel can be specific (e.g. "5 fuzzy substitutions
+    rescued this test — consider updating the test case wording").
+    """
+    fuzzy_rescues = 0
+    vision_rescues = 0
+    near_miss_max = 0.0
+    near_miss_observed = False
+    infra_signals = 0
+
+    for t in turn_log:
+        # Fuzzy-rescue signal: action narration explicitly mentions
+        # "fuzzy matched" (added by selectors.py / actions.py).
+        if "fuzzy matched" in (t.narration or "").lower():
+            fuzzy_rescues += 1
+        # Vision-search rescue signal: search_log halted=completed.
+        sl = t.search_log
+        if isinstance(sl, dict):
+            kind = sl.get("kind") or "search"
+            if kind == "search" and sl.get("halted") == "completed":
+                vision_rescues += 1
+            # Look at near-miss scores for divergence categorization.
+            for action in sl.get("actions") or []:
+                if not isinstance(action, dict):
+                    continue
+            # Any pre-search miss saw near-misses > 0?
+            # We track via the helper's own near_misses list — but
+            # we don't carry it forward; fall back to the agent_log
+            # narration heuristic via "near-miss" mention.
+        # Infra signal heuristic — error_message contains classic
+        # network / browser-side errors, NOT mere selector misses.
+        err = (t.error_message or "").lower()
+        if any(s in err for s in (
+            "net::err", "timeout", "navigation", "target_closed",
+            "browser has been closed", "context was destroyed",
+        )):
+            infra_signals += 1
+        # Capture if the narration / error mentions near-miss
+        # candidates from selectors.py's enriched failure message,
+        # and pull out the highest score quoted in it. Format example:
+        # "Closest candidates on page: button:'Buy now' (0.42), ..."
+        err_lower = (t.error_message or "").lower()
+        if "closest candidates" in err_lower:
+            near_miss_observed = True
+            import re as _re  # noqa: PLC0415
+            for m in _re.finditer(
+                r"\((\d\.\d+)\)", t.error_message or "",
+            ):
+                try:
+                    near_miss_max = max(near_miss_max, float(m.group(1)))
+                except ValueError:
+                    pass
+
+    summary = ""
+    if final_status == "passed":
+        if fuzzy_rescues == 0 and vision_rescues == 0:
+            category: DivergenceCategory = "passed_clean"
+            summary = "Clean pass — no recovery interventions needed."
+        else:
+            category = "passed_with_help"
+            parts: list[str] = []
+            if fuzzy_rescues:
+                parts.append(
+                    f"{fuzzy_rescues} fuzzy match"
+                    f"{'es' if fuzzy_rescues != 1 else ''}",
+                )
+            if vision_rescues:
+                parts.append(
+                    f"{vision_rescues} vision-guided search"
+                    f"{'es' if vision_rescues != 1 else ''}",
+                )
+            summary = (
+                f"Passed only after {' + '.join(parts)} — review "
+                "test-case wording to remove the friction."
+            )
+    elif halt_reason == "cancelled":
+        category = "user_cancelled"
+        summary = "User cancelled the run."
+    elif halt_reason == "agent_failed":
+        category = "agent_gave_up"
+        summary = (
+            "Agent voluntarily marked the goal failed. The page may "
+            "genuinely lack the feature, or the test case's "
+            "preconditions weren't met."
+        )
+    elif infra_signals >= 2:
+        category = "infra_issue"
+        summary = (
+            f"{infra_signals} infrastructure-style errors during the "
+            "run (timeouts / navigation / closed contexts). Re-run "
+            "before suspecting the test or the app."
+        )
+    elif near_miss_observed and near_miss_max >= 0.30:
+        category = "test_case_outdated"
+        summary = (
+            "Page contains elements similar to the test-case targets "
+            "but not similar enough to substitute automatically. "
+            "Likely the test case's wording is stale — update the "
+            "target_hints to match what the page actually shows."
+        )
+    elif near_miss_observed:
+        category = "feature_missing"
+        summary = (
+            "Target elements weren't found AND nothing on the page "
+            "is similar. The feature this test case exercises may "
+            "not exist on the target app, or the test case is in "
+            "the wrong scope."
+        )
+    else:
+        category = "agent_drift"
+        summary = (
+            "Agent ran out of turns / stalled / oscillated without "
+            "a clear page-side reason. Try re-running, or split "
+            "the test case into smaller sub-goals."
+        )
+
+    return {
+        "category": category,
+        "summary": summary,
+        "fuzzy_rescues": fuzzy_rescues,
+        "vision_rescues": vision_rescues,
+        "infra_signals": infra_signals,
+    }
 
 
 @dataclass
@@ -521,6 +783,15 @@ def _one_line_args(args: dict[str, Any]) -> str:
     return json.dumps(keep, ensure_ascii=False)[:120]
 
 
+_SUB_GOAL_ICON = {
+    "pending": "☐",
+    "in_progress": "▶",
+    "done": "✓",
+    "failed": "✗",
+    "skipped": "⊘",
+}
+
+
 def _format_goal_for_prompt(goal: Goal, *, turn_idx: int = 1) -> str:
     """Render the goal block.
 
@@ -531,9 +802,9 @@ def _format_goal_for_prompt(goal: Goal, *, turn_idx: int = 1) -> str:
     - T4+: no hints at all (the goal description + criteria are the
       contract; hints have served their purpose).
 
-    This saves ~200-400 input tokens per turn after T3 with no
-    measurable loss in quality — usually a small bump in flexibility
-    because the agent stops second-guessing stale hints.
+    Sub-goals are always shown (they're how the agent stays oriented
+    on multi-step flows). Each line gets a status icon so the agent
+    can see at a glance which one to advance next.
     """
     crit_lines = "\n".join(
         f"  - {c}" for c in goal.success_criteria
@@ -561,11 +832,26 @@ def _format_goal_for_prompt(goal: Goal, *, turn_idx: int = 1) -> str:
     else:
         hints_block = ""  # T4+: drop hints entirely
 
+    sub_goal_block = ""
+    if goal.sub_goals:
+        sg_lines = [
+            f"  {_SUB_GOAL_ICON.get(sg.status, '?')} [{sg.id}] "
+            f"{sg.description}"
+            for sg in goal.sub_goals
+        ]
+        sub_goal_block = (
+            "SUB-GOALS (work through these in order; set "
+            "``current_sub_goal_id`` each turn):\n"
+            + "\n".join(sg_lines)
+        )
+
     blocks = [
         f"GOAL: {goal.description}",
         f"PATH: {goal.path}",
         f"SUCCESS CRITERIA:\n{crit_lines}",
     ]
+    if sub_goal_block:
+        blocks.append(sub_goal_block)
     if hints_block:
         blocks.append(hints_block)
     return "\n\n".join(blocks)
@@ -703,6 +989,212 @@ def _do_dismiss_modal(page) -> tuple[str, str, str | None]:
         return "failed", "no modal close affordance found", f"{type(e).__name__}: {e}"
 
 
+def _vision_search_for_target(
+    page,
+    provider: LLMProvider,
+    *,
+    target_hint: str,
+    max_attempts: int = 3,
+    emit_event: Callable[[str, dict], None] | None = None,
+    submodule_run_id: int | None = None,
+    submodule_step_id: int | None = None,
+) -> dict[str, Any]:
+    """Vision-guided target search (Phase A4.1b).
+
+    Loops up to ``max_attempts`` times: each iteration the LLM looks
+    at a fresh screenshot + the target_hint and the resolver's
+    near-miss list, and proposes ONE side-action — scroll, click a
+    drill-in card, navigate, or dismiss a modal — that should bring
+    the target into the page. Dispatches the action, then the caller
+    retries the original tool against the now-different page state.
+
+    Returns a summary dict the caller can fold into ``details_json``:
+        {
+          "attempted": int,
+          "actions": [{action, reasoning, confidence, ...}],
+          "input_tokens": int,
+          "output_tokens": int,
+          "halted": "give_up" | "max_attempts" | "completed",
+        }
+
+    Token cost is bounded: max_attempts × (vision-LLM call + side
+    action). Default 3 = ~3 vision calls per truly-stuck target.
+    Cheap vs the cost of an entirely failed test case.
+    """
+    # Lazy-import to avoid circular dep with page_intel.
+    from app.agents.page_intel import (  # noqa: PLC0415
+        propose_search_action, SearchSuggestion,
+    )
+    from app.executor.selectors import (  # noqa: PLC0415
+        _capture_ax_tree, _similarity, FUZZY_NEAR_MISS_THRESHOLD,
+    )
+
+    actions_log: list[dict[str, Any]] = []
+    total_in = 0
+    total_out = 0
+    halt_reason = "max_attempts"
+
+    if not getattr(provider, "supports_vision", False):
+        # No vision capability → can't run search. Caller falls
+        # through to the normal failure path.
+        return {
+            "attempted": 0,
+            "actions": [],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "halted": "no_vision",
+        }
+
+    for attempt in range(1, max_attempts + 1):
+        # Build near-miss list from the CURRENT AX tree — fresh each
+        # iteration since the page may have changed via the previous
+        # search step (scroll / dismiss / etc.).
+        items = _capture_ax_tree(page)
+        scored = []
+        for item in items:
+            name = item.get("name") or ""
+            if not name:
+                continue
+            score = _similarity(target_hint, name)
+            if score >= FUZZY_NEAR_MISS_THRESHOLD:
+                scored.append((score, item))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        near_misses = [
+            {
+                "role": item.get("role"),
+                "name": item.get("name"),
+                "score": round(score, 2),
+            }
+            for score, item in scored[:5]
+        ]
+
+        _emit(emit_event, "agent_searching", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "target_hint": target_hint,
+            "near_misses": near_misses,
+        })
+
+        try:
+            suggestion: SearchSuggestion = propose_search_action(
+                provider, page,
+                target_hint=target_hint,
+                near_misses=near_misses,
+            )
+        except Exception as e:
+            logger.warning("vision search call failed: %s", e)
+            actions_log.append({
+                "attempt": attempt,
+                "action": "llm_error",
+                "error": f"{type(e).__name__}: {str(e)[:200]}",
+            })
+            halt_reason = "llm_error"
+            break
+
+        if isinstance(suggestion.input_tokens, int):
+            total_in += suggestion.input_tokens
+        if isinstance(suggestion.output_tokens, int):
+            total_out += suggestion.output_tokens
+
+        action_log: dict[str, Any] = {
+            "attempt": attempt,
+            "action": suggestion.action,
+            "reasoning": suggestion.reasoning[:300],
+            "confidence": suggestion.confidence,
+        }
+
+        # Dispatch the suggested side-action.
+        if suggestion.action == "give_up":
+            actions_log.append(action_log)
+            halt_reason = "give_up"
+            break
+
+        if suggestion.action == "scroll":
+            direction = (suggestion.scroll_direction or "down").lower()
+            amount = suggestion.scroll_amount_px or 800
+            try:
+                if direction == "down":
+                    page.mouse.wheel(0, amount)
+                elif direction == "up":
+                    page.mouse.wheel(0, -amount)
+                elif direction == "right":
+                    page.mouse.wheel(amount, 0)
+                elif direction == "left":
+                    page.mouse.wheel(-amount, 0)
+                action_log["dispatched"] = (
+                    f"scrolled {direction} {amount}px"
+                )
+            except Exception as e:
+                action_log["dispatched_error"] = (
+                    f"{type(e).__name__}: {e}"
+                )
+
+        elif suggestion.action == "click_to_drill":
+            click_hint = suggestion.click_target_hint
+            try:
+                target = resolve(page, click_hint, timeout_ms=2_000)
+                target.locator.click()
+                action_log["dispatched"] = f"clicked {click_hint!r}"
+            except Exception as e:
+                action_log["dispatched_error"] = (
+                    f"click failed: {type(e).__name__}: {e}"
+                )
+
+        elif suggestion.action == "navigate":
+            url = suggestion.navigate_url
+            try:
+                page.goto(
+                    url, wait_until="domcontentloaded", timeout=15_000,
+                )
+                action_log["dispatched"] = f"navigated to {url}"
+            except Exception as e:
+                action_log["dispatched_error"] = (
+                    f"navigate failed: {type(e).__name__}: {e}"
+                )
+
+        elif suggestion.action == "dismiss_modal":
+            status, narration, error = _do_dismiss_modal(page)
+            action_log["dispatched"] = f"dismiss_modal: {status}"
+            if error:
+                action_log["dispatched_error"] = error
+
+        actions_log.append(action_log)
+
+        # Probe the original target — did the side-action bring it
+        # in? If yes, we're done; the caller will re-resolve cleanly.
+        try:
+            resolve(page, target_hint, timeout_ms=1_500)
+            halt_reason = "completed"
+            _emit(emit_event, "agent_search_completed", {
+                "run_id": submodule_run_id,
+                "step_id": submodule_step_id,
+                "attempts_used": attempt,
+                "halt": "completed",
+            })
+            break
+        except Exception:
+            # Still missing — continue searching.
+            continue
+    else:
+        halt_reason = "max_attempts"
+        _emit(emit_event, "agent_search_completed", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "attempts_used": max_attempts,
+            "halt": "max_attempts",
+        })
+
+    return {
+        "attempted": len(actions_log),
+        "actions": actions_log,
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "halted": halt_reason,
+    }
+
+
 def _execute_tool_call(
     page,
     tool: str,
@@ -790,6 +1282,11 @@ def run_agent_for_goal(
     stall_threshold: int = 3,
     signature_repeat_threshold: int = 3,
     signature_window: int = 8,
+    # A4.1c: every N turns, run a vision LLM "is the agent on track?"
+    # check. Cheap (~1 vision call per N turns) and catches the
+    # wandering pattern that other guards miss only after many wasted
+    # turns. Set to 0 to disable.
+    on_track_interval: int = 5,
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     submodule_run_id: int | None = None,
@@ -917,6 +1414,77 @@ def run_agent_for_goal(
             if diff_text else ""
         )
 
+        # A4.1c: mid-flow vision check. Every ``on_track_interval``
+        # turns, ask a vision LLM whether the agent is still making
+        # progress against the goal. Catches the "wandering / wrong
+        # page / repeating broken click" patterns that the
+        # deterministic guards (stall, oscillation) only detect AFTER
+        # they've already cost several turns. Skipped when:
+        #  - provider can't see images
+        #  - it's still the first few turns (nothing to assess yet)
+        #  - all sub-goals are already done (no point checking)
+        on_track_block = ""
+        unverified_sub_goals = (
+            bool(goal.sub_goals)
+            and any(
+                sg.status not in ("done", "skipped")
+                for sg in goal.sub_goals
+            )
+        )
+        should_check_on_track = (
+            provider_supports_vision
+            and on_track_interval > 0
+            and turn_idx >= on_track_interval
+            and turn_idx % on_track_interval == 0
+            and unverified_sub_goals
+        )
+        if should_check_on_track:
+            try:
+                from app.agents.page_intel import (  # noqa: PLC0415
+                    check_on_track,
+                )
+                sg_summary = "\n".join(
+                    f"  {_SUB_GOAL_ICON.get(sg.status, '?')} "
+                    f"[{sg.id}] {sg.description}"
+                    for sg in goal.sub_goals
+                )
+                recent_summary = _format_history_for_prompt(turn_log)
+                on_track = check_on_track(
+                    provider, page,
+                    goal_description=goal.description,
+                    sub_goal_summary=sg_summary,
+                    recent_turns_summary=recent_summary,
+                )
+            except Exception as e:
+                logger.debug("on-track check skipped: %s", e)
+                on_track = None
+
+            if on_track is not None:
+                if isinstance(on_track.input_tokens, int):
+                    total_input += on_track.input_tokens
+                if isinstance(on_track.output_tokens, int):
+                    total_output += on_track.output_tokens
+                llm_calls += 1
+                vision_calls += 1
+                _emit(emit_event, "agent_on_track_check", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "on_track": on_track.on_track,
+                    "suggestion": on_track.suggestion[:200],
+                    "reasoning": on_track.reasoning[:200],
+                    "confidence": on_track.confidence,
+                })
+                # Only inject a warning when the LLM thinks the agent
+                # is wandering. Confirming "on track" each time would
+                # just add noise to the prompt.
+                if not on_track.on_track and on_track.suggestion:
+                    on_track_block = (
+                        f"\n⚠ MID-FLOW CHECK (vision): you appear off-"
+                        f"track. {on_track.reasoning[:200]} "
+                        f"Suggestion: {on_track.suggestion[:200]}\n"
+                    )
+
         # Page memory — show prior site-map notes the agent has
         # captured. The current URL gets a "YOU ARE HERE" marker so
         # the agent can act from memory directly when it has visited
@@ -966,6 +1534,7 @@ def run_agent_for_goal(
             f"itself requires going elsewhere.\n"
             f"{vision_note}"
             f"{diff_block}"
+            f"{on_track_block}"
             f"{memory_block}\n"
             f"{_format_goal_for_prompt(goal, turn_idx=turn_idx)}\n\n"
             f"HISTORY (last few turns):\n{_format_history_for_prompt(turn_log)}\n\n"
@@ -1033,10 +1602,39 @@ def run_agent_for_goal(
                 note=memory_note,
                 turn=turn_idx,
             )
+        # Sub-goal tracking: the agent declares which sub-goal it's
+        # working on this turn, and which (if any) just completed.
+        # Apply the status changes onto goal.sub_goals so the next
+        # turn's prompt renders the up-to-date checklist.
+        current_sg_id = str(parsed.get("current_sub_goal_id", "")).strip()
+        completed_sg_id = str(parsed.get("sub_goal_completed_id", "")).strip()
+        if goal.sub_goals:
+            for sg in goal.sub_goals:
+                if sg.id == current_sg_id and sg.status == "pending":
+                    sg.status = "in_progress"
+            if completed_sg_id:
+                for sg in goal.sub_goals:
+                    if sg.id == completed_sg_id and sg.status != "done":
+                        sg.status = "done"
+                        sg.completed_at_turn = turn_idx
+                        _emit(emit_event, "sub_goal_progress", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "sub_goal_id": sg.id,
+                            "description": sg.description,
+                            "status": "done",
+                            "turn": turn_idx,
+                            "remaining": sum(
+                                1 for s in goal.sub_goals
+                                if s.status not in ("done", "skipped")
+                            ),
+                            "total": len(goal.sub_goals),
+                        })
         args = {
             k: v for k, v in parsed.items()
             if k not in (
                 "tool", "reasoning", "confidence", "page_memory_note",
+                "current_sub_goal_id", "sub_goal_completed_id",
             )
         }
 
@@ -1062,39 +1660,157 @@ def run_agent_for_goal(
 
         # ── Meta tool branch: terminating decisions ───────────────
         if tool == "mark_goal_complete":
-            # Soft-guard: did the agent actually verify anything?
-            # Without a successful verify/extract_text in the log,
-            # "complete" is just optimism. We don't reject — the LLM
-            # can be right anyway — but we mark the row as
-            # ``inconclusive`` so the user sees it deserves review.
+            # Soft-guard #1: did the agent actually verify anything?
             verified = any(
                 t.tool in ("verify", "extract_text") and t.status == "ok"
                 for t in turn_log
             )
-            if not verified:
+            # Soft-guard #2: when sub-goals exist, were enough of
+            # them closed out? Allow the last sub-goal to be implicit
+            # (some agents call mark_goal_complete with the final
+            # sub-goal still "in_progress" because the verify itself
+            # closed it). So the bar is "≥ 80% done OR ≥ all-but-1".
+            sub_goal_completion_ok = True
+            if goal.sub_goals:
+                done = sum(
+                    1 for sg in goal.sub_goals if sg.status == "done"
+                )
+                total = len(goal.sub_goals)
+                pct = done / total if total else 1.0
+                sub_goal_completion_ok = (
+                    pct >= 0.80 or done >= total - 1
+                )
+
+            # A4.1a: vision-grounded verdict. Only run when the
+            # deterministic guards already say "OK" — otherwise we'd
+            # double-fail and waste the vision call on something we'd
+            # downgrade to inconclusive anyway.
+            verification_record: dict[str, Any] | None = None
+
+            if not verified or not sub_goal_completion_ok:
                 halt_reason = "complete"
                 final_status = "inconclusive"
+                reasons = []
+                if not verified:
+                    reasons.append("no successful verify/extract_text")
+                if not sub_goal_completion_ok:
+                    done = sum(
+                        1 for sg in goal.sub_goals if sg.status == "done"
+                    )
+                    total = len(goal.sub_goals)
+                    reasons.append(
+                        f"only {done}/{total} sub-goals closed"
+                    )
                 final_narration = (
-                    "Agent marked complete WITHOUT any successful "
-                    "verify/extract_text — flagged inconclusive for "
-                    f"review. Reasoning: {reasoning[:300]}"
+                    "Agent marked complete but flagged inconclusive: "
+                    f"{', '.join(reasons)}. Reasoning: {reasoning[:200]}"
                 )
                 logger.info(
-                    "agent claimed complete on submodule %s without "
-                    "verification — downgrading to inconclusive",
-                    goal.submodule_id,
+                    "agent claim-complete soft-guard tripped on "
+                    "submodule %s: %s",
+                    goal.submodule_id, ", ".join(reasons),
                 )
             else:
+                # Both deterministic guards passed. Now run the
+                # screenshot ground-truth check via vision LLM.
                 halt_reason = "complete"
                 final_status = "passed"
                 final_narration = (
                     reasoning or "Agent marked goal complete"
                 )[:500]
-            turn_log.append(TurnRecord(
+
+                if provider_supports_vision:
+                    _emit(emit_event, "agent_verifying", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "goal_description": goal.description[:200],
+                    })
+                    try:
+                        from app.agents.page_intel import (  # noqa: PLC0415
+                            verify_goal_via_screenshot,
+                        )
+                        verdict = verify_goal_via_screenshot(
+                            provider, page,
+                            goal_description=goal.description,
+                            success_criteria=list(goal.success_criteria),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "goal verification call failed on "
+                            "submodule %s: %s", goal.submodule_id, e,
+                        )
+                        verdict = None
+
+                    if verdict is not None:
+                        # Token + call accounting
+                        if isinstance(verdict.input_tokens, int):
+                            total_input += verdict.input_tokens
+                        if isinstance(verdict.output_tokens, int):
+                            total_output += verdict.output_tokens
+                        llm_calls += 1
+                        vision_calls += 1
+
+                        verification_record = {
+                            "verdict": verdict.verdict,
+                            "reasoning": verdict.reasoning[:500],
+                            "confidence": verdict.confidence,
+                            "criteria_met": list(verdict.criteria_met),
+                            "criteria_missed": list(verdict.criteria_missed),
+                            "input_tokens": verdict.input_tokens,
+                            "output_tokens": verdict.output_tokens,
+                        }
+
+                        _emit(emit_event, "agent_verified", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "verdict": verdict.verdict,
+                            "reasoning": verdict.reasoning[:300],
+                            "confidence": verdict.confidence,
+                        })
+
+                        if verdict.verdict == "fail":
+                            # Hard contradiction with the screenshot —
+                            # downgrade. The agent's claim is wrong.
+                            final_status = "inconclusive"
+                            final_narration = (
+                                "Vision check FAILED — page does not "
+                                "show the goal achieved. "
+                                f"{verdict.reasoning[:200]}"
+                            )
+                        elif verdict.verdict == "partial":
+                            # Some criteria met, others not. Agent
+                            # was over-optimistic; mark inconclusive
+                            # so the user reviews.
+                            final_status = "inconclusive"
+                            final_narration = (
+                                f"Vision check PARTIAL — "
+                                f"{len(verdict.criteria_met)}/"
+                                f"{len(goal.success_criteria) or 1} "
+                                f"criteria met. {verdict.reasoning[:160]}"
+                            )
+                        else:
+                            # verdict == "pass": agent's claim confirmed.
+                            # Augment the narration so the user knows
+                            # the verification ran and agreed.
+                            final_narration = (
+                                f"Goal confirmed by vision check. "
+                                f"{verdict.reasoning[:200]}"
+                            )
+
+            stop_record = TurnRecord(
                 turn=turn_idx, tool=tool, args=args, reasoning=reasoning,
                 confidence=confidence, status="stop",
                 narration=final_narration, page_url=observation.get("url", ""),
-            ))
+            )
+            if verification_record is not None:
+                # Reuse the search_log slot pattern: persist the
+                # verification block on the stop record so the
+                # report's per-turn surface can render it.
+                stop_record.search_log = {
+                    "kind": "goal_verification",
+                    **verification_record,
+                }
+            turn_log.append(stop_record)
             break
 
         if tool == "mark_goal_failed":
@@ -1149,6 +1865,87 @@ def run_agent_for_goal(
             speed_config=speed_config,
         )
 
+        # ── A4.1b: vision-guided target search on a missed selector ─
+        # When a target-bound action just failed because the selector
+        # missed, ask the vision LLM for a concrete next step (scroll /
+        # navigate / dismiss-modal / click-to-drill), dispatch it, and
+        # retry the original action ONCE. Caps at 3 search attempts so
+        # a confused LLM can't loop. Skipped when:
+        # - tool isn't target-bound (navigate / wait-by-duration / etc.)
+        # - provider can't see images
+        # - all sub-goals are already done (no point searching for a
+        #   target the agent's chasing past completion)
+        target_bound = tool in ("click", "type", "select", "verify", "wait")
+        miss_due_to_selector = (
+            outcome["status"] == "failed"
+            and isinstance(outcome.get("error_message"), str)
+            and (
+                "target not visible" in (outcome.get("narration") or "").lower()
+                or "no visible element" in (outcome.get("error_message") or "").lower()
+            )
+        )
+        sub_goals_done = (
+            bool(goal.sub_goals)
+            and all(
+                sg.status in ("done", "skipped") for sg in goal.sub_goals
+            )
+        )
+        if (
+            target_bound
+            and miss_due_to_selector
+            and not sub_goals_done
+            and provider_supports_vision
+            and args.get("target_hint")
+        ):
+            search_result = _vision_search_for_target(
+                page,
+                provider,
+                target_hint=str(args.get("target_hint", "")),
+                max_attempts=3,
+                emit_event=emit_event,
+                submodule_run_id=submodule_run_id,
+                submodule_step_id=submodule_step_id,
+            )
+            # Roll vision search tokens into the run-level cost meter.
+            if isinstance(search_result.get("input_tokens"), int):
+                total_input += search_result["input_tokens"]
+            if isinstance(search_result.get("output_tokens"), int):
+                total_output += search_result["output_tokens"]
+            # Each attempt was its own LLM call; count vision calls
+            # for the run summary (used by the live panel).
+            attempts_made = int(search_result.get("attempted") or 0)
+            vision_calls += attempts_made
+            llm_calls += attempts_made
+
+            # When the search succeeded (the original target_hint
+            # resolves now), retry the original action ONCE.
+            if search_result.get("halted") == "completed":
+                retry_outcome = _execute_tool_call(
+                    page, tool, args,
+                    plan_target_url=plan_target_url,
+                    speed_config=speed_config,
+                )
+                # Annotate the retry with the search trail so the
+                # timeline/report show the recovery path.
+                retry_outcome["search_log"] = search_result
+                retry_outcome["narration"] = (
+                    f"{retry_outcome.get('narration') or tool} "
+                    f"(after vision-guided search: "
+                    f"{attempts_made} attempt"
+                    f"{'' if attempts_made == 1 else 's'})"
+                )
+                outcome = retry_outcome
+            else:
+                # Search couldn't bring the target in view. Keep the
+                # original failed outcome but enrich with the search
+                # trail so the user sees what was tried.
+                outcome["search_log"] = search_result
+                outcome["narration"] = (
+                    f"{outcome.get('narration') or tool}"
+                    f" — vision search halted: "
+                    f"{search_result.get('halted')}"
+                )
+
         # Update banner phase to reflect outcome
         phase = (
             "did" if outcome["status"] == "ok"
@@ -1175,6 +1972,7 @@ def run_agent_for_goal(
             error_message=outcome.get("error_message"),
             page_url=observation.get("url", ""),
             extracted_text=outcome.get("extracted_text", ""),
+            search_log=outcome.get("search_log"),
         )
         turn_log.append(rec)
 
@@ -1567,6 +2365,16 @@ def run_qa_agent_for_plan(
                 screenshot = _take_screenshot(page, run_id, row.id)
                 hide_narration(page)
 
+                # A4.3: classify why this row landed where it did so
+                # the report can recommend test_case_outdated /
+                # feature_missing / infra_issue / agent_drift instead
+                # of a generic inconclusive.
+                divergence = _categorize_divergence(
+                    final_status=result.status,
+                    halt_reason=result.halt_reason,
+                    turn_log=result.turn_log,
+                )
+
                 row.status = result.status
                 row.completed_at = _utcnow()
                 row.duration_ms = int((time.monotonic() - t_loop) * 1000)
@@ -1577,6 +2385,7 @@ def run_qa_agent_for_plan(
                     "mode": "agentic",
                     "goal": goal.to_dict(),
                     "halt_reason": result.halt_reason,
+                    "divergence": divergence,
                     "agent_log": [
                         {
                             "turn": t.turn,
@@ -1589,6 +2398,7 @@ def run_qa_agent_for_plan(
                             "error_message": t.error_message,
                             "page_url": t.page_url,
                             "extracted_text": t.extracted_text,
+                            "search_log": t.search_log,
                         }
                         for t in result.turn_log
                     ],
@@ -1598,6 +2408,61 @@ def run_qa_agent_for_plan(
                 }
                 counts[result.status] = counts.get(result.status, 0) + 1
                 db.commit()
+
+                # ── Phase E.1: freeze the working path ────────────
+                # If this submodule passed the deterministic guards,
+                # the soft-guards, AND vision verification (when
+                # present) said "pass", serialize the agent's tool
+                # sequence onto the submodule TcNode. Replay-mode
+                # runs walk this list deterministically. Skip when
+                # vision said partial/fail or when verification
+                # didn't run — we don't want to canonicalize a path
+                # we're not sure actually worked.
+                vision_verdict = None
+                for t in result.turn_log:
+                    sl = t.search_log
+                    if (
+                        isinstance(sl, dict)
+                        and sl.get("kind") == "goal_verification"
+                    ):
+                        vision_verdict = sl.get("verdict")
+                        break
+                # Freeze when either (a) vision said pass, OR
+                # (b) vision didn't run (no provider vision support)
+                # but everything else passed. Don't freeze on
+                # partial/fail.
+                should_freeze = (
+                    result.status == "passed"
+                    and vision_verdict in (None, "pass")
+                )
+                if should_freeze:
+                    frozen = _build_frozen_path(
+                        run_id=run_id,
+                        goal=goal,
+                        turn_log=result.turn_log,
+                        agent_model=getattr(provider, "model", None),
+                    )
+                    if frozen and submodule.id is not None:
+                        # Reload the submodule node freshly — the
+                        # one in scope is still valid since Tc nodes
+                        # don't get deleted mid-run, but explicit is
+                        # safer.
+                        sm_row = db.get(TcNode, submodule.id)
+                        if sm_row is not None:
+                            sm_row.frozen_path = frozen
+                            db.commit()
+                            _emit(emit_event, "frozen_path_captured", {
+                                "step_id": row.id,
+                                "tc_node_id": submodule.id,
+                                "step_count": len(frozen["steps"]),
+                                "agent_model": frozen.get("agent_model"),
+                            })
+                            logger.info(
+                                "froze path for submodule %s "
+                                "(%d steps) from run %s",
+                                submodule.id, len(frozen["steps"]),
+                                run_id,
+                            )
 
                 _emit(emit_event, "step_completed", {
                     "step_id": row.id,
@@ -1609,6 +2474,10 @@ def run_qa_agent_for_plan(
                     "duration_ms": row.duration_ms,
                     "screenshot_path": row.screenshot_path,
                     "halt_reason": result.halt_reason,
+                    "divergence_category": divergence["category"],
+                    "fuzzy_rescues": divergence["fuzzy_rescues"],
+                    "vision_rescues": divergence["vision_rescues"],
+                    "frozen": should_freeze,
                 })
     except BrowserNotInstalledError:
         raise

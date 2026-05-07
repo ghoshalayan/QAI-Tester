@@ -131,6 +131,34 @@ def _glide_cursor(page: Page, target: ResolvedTarget, config: SpeedConfig) -> No
         logger.debug("cursor glide suppressed: %s: %s", type(e).__name__, e)
 
 
+def _fuzzy_suffix(target: ResolvedTarget) -> str:
+    """Render the fuzzy-substitution annotation for narration / details.
+
+    Empty when the literal waterfall hit a target directly. Surfaces
+    the substitution prominently when the resolver had to fuzzy-match
+    so the user sees ``clicked 'Add Cart' → matched 'Add to Cart'
+    (score 0.91)`` and can spot stale test-case wording.
+    """
+    fm = target.fuzzy_match
+    if not fm:
+        return ""
+    score = fm.get("score")
+    matched = fm.get("matched_name") or "?"
+    return f" — fuzzy matched {matched!r} (score {score})"
+
+
+def _details_with_fuzzy(target: ResolvedTarget, **extra: Any) -> dict:
+    """Build the action's details dict with the fuzzy match surfaced."""
+    out: dict[str, Any] = {
+        "strategy": target.strategy,
+        "attempts": list(target.attempts),
+    }
+    if target.fuzzy_match:
+        out["fuzzy_match"] = target.fuzzy_match
+    out.update(extra)
+    return out
+
+
 def _check_data_block(ctx: ActionContext) -> ActionResult | None:
     """If the step needs HITL data, short-circuit to ``blocked``."""
     for need in ctx.data_needs or ():
@@ -286,8 +314,11 @@ def _do_click(page: Page, ctx: ActionContext) -> ActionResult:
         )
     return ActionResult(
         status="passed",
-        narration=f"clicked {ctx.target_hint!r} (via {target.strategy})",
-        details={"strategy": target.strategy, "attempts": target.attempts},
+        narration=(
+            f"clicked {ctx.target_hint!r} (via {target.strategy})"
+            f"{_fuzzy_suffix(target)}"
+        ),
+        details=_details_with_fuzzy(target),
     )
 
 
@@ -330,12 +361,15 @@ def _do_type(page: Page, ctx: ActionContext) -> ActionResult:
         )
     return ActionResult(
         status="passed",
-        narration=f"typed into {ctx.target_hint!r} (via {target.strategy})",
-        details={
-            "strategy": target.strategy,
-            "text_length": len(text),  # never log the text itself
-            "type_delay_ms": delay_ms,
-        },
+        narration=(
+            f"typed into {ctx.target_hint!r} (via {target.strategy})"
+            f"{_fuzzy_suffix(target)}"
+        ),
+        details=_details_with_fuzzy(
+            target,
+            text_length=len(text),  # never log the text itself
+            type_delay_ms=delay_ms,
+        ),
     )
 
 
@@ -373,8 +407,11 @@ def _do_select(page: Page, ctx: ActionContext) -> ActionResult:
             )
     return ActionResult(
         status="passed",
-        narration=f"selected {text!r} in {ctx.target_hint!r}",
-        details={"strategy": target.strategy, "option": text},
+        narration=(
+            f"selected {text!r} in {ctx.target_hint!r}"
+            f"{_fuzzy_suffix(target)}"
+        ),
+        details=_details_with_fuzzy(target, option=text),
     )
 
 
@@ -406,8 +443,13 @@ def _do_verify(page: Page, ctx: ActionContext) -> ActionResult:
         # 1.5s is long enough that the per-step screenshot taken right
         # after this catches the ring at full opacity.
         highlight_target(page, target.locator, duration_ms=1500)
-        parts.append(f"{ctx.target_hint!r} visible (via {target.strategy})")
+        parts.append(
+            f"{ctx.target_hint!r} visible (via {target.strategy})"
+            f"{_fuzzy_suffix(target)}"
+        )
         details["strategy"] = target.strategy
+        if target.fuzzy_match:
+            details["fuzzy_match"] = target.fuzzy_match
 
     if has_expected:
         expected = (ctx.expected or "").strip()
@@ -451,8 +493,11 @@ def _do_wait(page: Page, ctx: ActionContext) -> ActionResult:
             )
         return ActionResult(
             status="passed",
-            narration=f"waited for {ctx.target_hint!r} (via {target.strategy})",
-            details={"strategy": target.strategy},
+            narration=(
+                f"waited for {ctx.target_hint!r} (via {target.strategy})"
+                f"{_fuzzy_suffix(target)}"
+            ),
+            details=_details_with_fuzzy(target),
         )
 
     duration_ms = _parse_duration_ms(ctx.narrative)

@@ -320,6 +320,20 @@ export function useAgentRunsEvents(projectId: number) {
       "agent_goal_ready",
       "agent_thought",
       "agent_acted",
+      // Phase A1: sub-goal decomposition + progress
+      "sub_goal_progress",
+      // Phase A4.1b: vision-guided target search
+      "agent_searching",
+      "agent_search_completed",
+      // Phase A4.1a / A4.1c: vision verification + mid-flow check
+      "agent_verifying",
+      "agent_verified",
+      "agent_on_track_check",
+      // Phase E: path freezing + replay + self-healing
+      "frozen_path_captured",
+      "frozen_step_completed",
+      "frozen_step_self_healing",
+      "frozen_step_self_heal_completed",
       // HITL + control
       "needs_intervention",
       "intervention_resolved",

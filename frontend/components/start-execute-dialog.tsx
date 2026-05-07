@@ -82,7 +82,9 @@ export function StartExecuteDialog({
   const [speed, setSpeed] = useState<Speed>("slow");
   const [autoAdjust, setAutoAdjust] = useState(false);
   const [promoteFixes, setPromoteFixes] = useState(false);
-  const [mode, setMode] = useState<"scripted" | "agentic">("scripted");
+  const [mode, setMode] = useState<"scripted" | "agentic" | "replay">(
+    "scripted",
+  );
 
   useEffect(() => {
     if (open) {
@@ -444,13 +446,13 @@ function ModePicker({
   value,
   onChange,
 }: {
-  value: "scripted" | "agentic";
-  onChange: (next: "scripted" | "agentic") => void;
+  value: "scripted" | "agentic" | "replay";
+  onChange: (next: "scripted" | "agentic" | "replay") => void;
 }) {
   return (
     <div className="space-y-2">
       <label className="text-sm font-medium">Run mode</label>
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-3 gap-2">
         <button
           type="button"
           onClick={() => onChange("scripted")}
@@ -467,7 +469,7 @@ function ModePicker({
             Scripted
           </span>
           <span className="text-[11px] text-muted-foreground">
-            Rigid step-walker. AI only patches on failure. Fastest, cheapest.
+            Rigid walker. AI patches only on failure. Cheapest.
           </span>
         </button>
         <button
@@ -486,8 +488,28 @@ function ModePicker({
             Agentic
           </span>
           <span className="text-[11px] text-muted-foreground">
-            Goal-oriented QA agent. Reasons each turn, adapts to changes.
-            Needs an LLM. ~10× more tokens.
+            Goal-oriented loop. Discovers paths. Captures frozen
+            paths on success. ~10× tokens.
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange("replay")}
+          aria-pressed={value === "replay"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "replay"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Play className="size-4" />
+            Replay
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            Deterministic walk of frozen paths. Self-heals on
+            broken selectors. ~5% of agentic cost.
           </span>
         </button>
       </div>
@@ -496,6 +518,17 @@ function ModePicker({
           Agentic mode runs at the test-case (submodule) level. Each
           submodule with selected steps becomes one goal the agent will
           verify. Loop guards halt at 30 turns / 5 min / 80k tokens.
+          On a clean pass, the working tool sequence is frozen onto
+          the test case so future runs can use Replay mode.
+        </p>
+      )}
+      {value === "replay" && (
+        <p className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1 text-[10px] text-emerald-700 dark:text-emerald-300">
+          Replay walks the frozen path captured the last time agentic
+          mode passed cleanly on each test case. Zero LLM cost on the
+          happy path; vision LLM only fires for self-healing if a
+          frozen step's selector breaks. Submodules without a frozen
+          path fall through to agentic.
         </p>
       )}
     </div>

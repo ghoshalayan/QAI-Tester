@@ -86,7 +86,12 @@ class ExecuteRunRequest(BaseModel):
     #   per submodule (= test case). The agent observes the page,
     #   picks tools, and self-verifies against derived success
     #   criteria. Requires an LLM provider configured in App Settings.
-    mode: Literal["scripted", "agentic"] = Field(default="scripted")
+    # - "replay":   deterministic walk of each submodule's frozen
+    #   path (captured the last time agentic mode passed cleanly on
+    #   it). Zero LLM calls on the happy path; vision-LLM only fires
+    #   for self-healing when a frozen step misses. Submodules
+    #   without a frozen path fall through to agentic.
+    mode: Literal["scripted", "agentic", "replay"] = Field(default="scripted")
 
     # Window geometry — set by the frontend from ``window.screen`` so the
     # headed Chromium tiles to fit the user's monitor and leaves the

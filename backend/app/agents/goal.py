@@ -43,6 +43,22 @@ class StepHint:
 
 
 @dataclass
+class SubGoal:
+    """One ordered sub-step the agent works through to achieve the goal.
+
+    Decomposed at submodule start by the goal extractor. The agent
+    picks ``id`` each turn (telling us which sub-goal it's progressing)
+    and reports completion when the action verifiably advances past
+    one. Status flips drive the live presenter's checkbox UI.
+    """
+
+    id: str          # short stable id, e.g. "sg1", "sg2"
+    description: str
+    status: str = "pending"  # pending | in_progress | done | failed | skipped
+    completed_at_turn: int | None = None
+
+
+@dataclass
 class Goal:
     """The QA agent's mission for a single test case (submodule)."""
 
@@ -51,6 +67,7 @@ class Goal:
     path: str  # e.g. "Sign In > Successful sign-in with valid creds"
     description: str
     success_criteria: list[str] = field(default_factory=list)
+    sub_goals: list[SubGoal] = field(default_factory=list)
     hints: list[StepHint] = field(default_factory=list)
     # Telemetry for the cost meter
     input_tokens: int | None = None
@@ -63,6 +80,15 @@ class Goal:
             "path": self.path,
             "description": self.description,
             "success_criteria": list(self.success_criteria),
+            "sub_goals": [
+                {
+                    "id": sg.id,
+                    "description": sg.description,
+                    "status": sg.status,
+                    "completed_at_turn": sg.completed_at_turn,
+                }
+                for sg in self.sub_goals
+            ],
             "hints": [
                 {
                     "ordinal": h.ordinal,
@@ -85,8 +111,18 @@ GOAL_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
         },
+        # Ordered sub-goals: 2-5 items the agent will work through
+        # sequentially. Each is a verb-first sentence describing one
+        # discrete page-level outcome. The schema requires the field
+        # for OpenAI strict-mode compatibility; an empty array is
+        # fine for trivial goals (the agent will still work, just
+        # without the sub-goal UI breakdown).
+        "sub_goals": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
-    "required": ["description", "success_criteria"],
+    "required": ["description", "success_criteria", "sub_goals"],
     "additionalProperties": False,
 }
 
@@ -97,7 +133,7 @@ You'll see a submodule (one test case) and the literal steps inside it.
 Your job: rewrite this as a goal-oriented mission a human tester could
 execute even if some of the steps are slightly wrong or out of date.
 
-Output two things:
+Output THREE things:
 
 1. description: ONE sentence, present tense, written from the user's
    perspective. Example: "User searches for a product and adds it to
@@ -113,6 +149,26 @@ Output two things:
 
    AVOID: criteria that just restate the action ("clicked the button").
    PREFER: criteria that describe the OUTCOME ("the page now shows X").
+
+3. sub_goals: 2-5 ORDERED page-level outcomes the agent will work
+   through sequentially. Each is a verb-first sentence describing ONE
+   discrete advance toward the goal — the kind of milestone you'd put
+   on a checklist while testing manually.
+
+   Good example for "User adds a product to cart":
+   - "Find a product on the catalog or search"
+   - "Open the product detail page"
+   - "Click the Add to Cart button"
+   - "Verify the cart shows the product"
+
+   Bad examples (avoid):
+   - "Click submit" (too low-level — that's an action, not a sub-goal)
+   - "Test the cart" (too vague — what specifically?)
+   - "Search for a product, click it, add to cart" (combine multiple
+     sub-goals into one — split them)
+
+   For trivial goals that don't decompose meaningfully (e.g., "verify
+   the homepage loads"), return an empty array [].
 
 Output JSON only. No commentary.
 """
@@ -223,12 +279,26 @@ def extract_goal(
         str(c).strip() for c in raw_criteria if isinstance(c, str) and c.strip()
     ]
 
+    raw_sub_goals = parsed.get("sub_goals") or []
+    sub_goals: list[SubGoal] = []
+    for i, sg_text in enumerate(raw_sub_goals):
+        if not isinstance(sg_text, str) or not sg_text.strip():
+            continue
+        sub_goals.append(
+            SubGoal(
+                id=f"sg{i + 1}",
+                description=sg_text.strip(),
+                status="pending",
+            ),
+        )
+
     return Goal(
         submodule_id=submodule.id,
         submodule_title=submodule.title or "",
         path=submodule_path or submodule.path_cached or submodule.title or "",
         description=description,
         success_criteria=success_criteria,
+        sub_goals=sub_goals,
         hints=hints,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,

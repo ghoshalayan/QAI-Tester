@@ -416,6 +416,47 @@ function StepRow({ step }: { step: ReportStepRead }) {
                 {step.ai_used_vision && " · vision"}
               </span>
             )}
+            {/* A4 visibility — show concrete interventions that ran */}
+            {step.fuzzy_rescues > 0 && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-blue-500/30 bg-blue-500/10 px-1 py-0.5 text-[9px] font-medium text-blue-700 dark:text-blue-400"
+                title={`Fuzzy selector matched ${step.fuzzy_rescues} time(s) — test-case wording was slightly off`}
+              >
+                fuzzy ×{step.fuzzy_rescues}
+              </span>
+            )}
+            {step.vision_rescues > 0 && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-purple-500/30 bg-purple-500/10 px-1 py-0.5 text-[9px] font-medium text-purple-700 dark:text-purple-400"
+                title={`Vision-guided target search recovered ${step.vision_rescues} time(s)`}
+              >
+                vision ×{step.vision_rescues}
+              </span>
+            )}
+            {step.goal_verification?.verdict === "fail" && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-red-500/30 bg-red-500/10 px-1 py-0.5 text-[9px] font-medium text-red-700 dark:text-red-400"
+                title="Vision check disagreed with the agent's claim"
+              >
+                vision ✗
+              </span>
+            )}
+            {step.goal_verification?.verdict === "partial" && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-orange-500/30 bg-orange-500/10 px-1 py-0.5 text-[9px] font-medium text-orange-700 dark:text-orange-400"
+                title="Vision check confirmed only some criteria"
+              >
+                vision ~
+              </span>
+            )}
+            {step.goal_verification?.verdict === "pass" && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-1 py-0.5 text-[9px] font-medium text-emerald-700 dark:text-emerald-400"
+                title="Vision check confirmed all goal criteria"
+              >
+                vision ✓
+              </span>
+            )}
           </div>
           {step.narration && (
             <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
@@ -491,6 +532,74 @@ function ReportAgentDetail({ step }: { step: ReportStepRead }) {
               )}
             </div>
           </div>
+        )}
+
+        {step.divergence_summary && (
+          <div
+            className={cn(
+              "rounded border p-1.5 text-[11px]",
+              step.divergence_category === "passed_clean"
+                ? "border-emerald-500/30 bg-emerald-500/5"
+                : step.divergence_category === "passed_with_help"
+                  ? "border-blue-500/30 bg-blue-500/5"
+                  : step.divergence_category === "test_case_outdated"
+                    ? "border-amber-500/40 bg-amber-500/5"
+                    : step.divergence_category === "feature_missing"
+                      ? "border-red-500/30 bg-red-500/5"
+                      : step.divergence_category === "infra_issue"
+                        ? "border-yellow-500/30 bg-yellow-500/5"
+                        : "border-muted-foreground/30 bg-muted/30",
+            )}
+          >
+            <div className="mb-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-[9px] uppercase tracking-wide text-muted-foreground">
+                {step.divergence_category?.replace(/_/g, " ")}
+              </span>
+            </div>
+            <p className="break-words text-muted-foreground">
+              {step.divergence_summary}
+            </p>
+          </div>
+        )}
+
+        {step.goal_verification && (
+          <div
+            className={cn(
+              "rounded border p-1.5 text-[11px]",
+              step.goal_verification.verdict === "pass"
+                ? "border-emerald-500/30 bg-emerald-500/5"
+                : step.goal_verification.verdict === "partial"
+                  ? "border-orange-500/30 bg-orange-500/5"
+                  : "border-red-500/30 bg-red-500/5",
+            )}
+          >
+            <div className="mb-0.5 flex items-baseline gap-1.5">
+              <span className="font-mono text-[9px] uppercase tracking-wide text-muted-foreground">
+                vision verification · {step.goal_verification.verdict}
+              </span>
+              {typeof step.goal_verification.confidence === "number" && (
+                <span className="text-[9px] text-muted-foreground">
+                  ({Math.round(step.goal_verification.confidence * 100)}%)
+                </span>
+              )}
+            </div>
+            {step.goal_verification.reasoning && (
+              <p className="break-words text-muted-foreground">
+                {step.goal_verification.reasoning}
+              </p>
+            )}
+            {step.goal_verification.criteria_missed.length > 0 && (
+              <ul className="mt-1 ml-3 list-disc space-y-0.5 text-[10px] text-red-700/80 dark:text-red-400/80">
+                {step.goal_verification.criteria_missed.map((c, i) => (
+                  <li key={i}>missed: {c}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {step.sub_goals.length > 0 && (
+          <SubGoalChecklist subGoals={step.sub_goals} />
         )}
 
         {step.agent_log.length === 0 ? (
@@ -573,6 +682,83 @@ function ReportAgentTurnRow({
     </li>
   );
 }
+
+// ── Sub-goal checklist ────────────────────────────────────────────
+
+
+const SUB_GOAL_STATUS_GLYPH: Record<string, string> = {
+  pending: "☐",
+  in_progress: "▶",
+  done: "✓",
+  failed: "✗",
+  skipped: "⊘",
+};
+
+const SUB_GOAL_STATUS_TINT: Record<string, string> = {
+  pending: "text-muted-foreground",
+  in_progress: "text-blue-600 dark:text-blue-400",
+  done: "text-emerald-600 dark:text-emerald-400",
+  failed: "text-red-600 dark:text-red-400",
+  skipped: "text-amber-600 dark:text-amber-400",
+};
+
+function SubGoalChecklist({
+  subGoals,
+}: {
+  subGoals: ReportStepRead["sub_goals"];
+}) {
+  const done = subGoals.filter((sg) => sg.status === "done").length;
+  const total = subGoals.length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  return (
+    <div className="rounded border bg-card p-1.5">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          Sub-goals
+        </span>
+        <span className="text-[10px] text-muted-foreground">
+          {done}/{total} done · {pct}%
+        </span>
+      </div>
+      <ol className="space-y-0.5">
+        {subGoals.map((sg) => (
+          <li
+            key={sg.id}
+            className="flex items-baseline gap-1.5 text-[11px]"
+          >
+            <span
+              className={cn(
+                "shrink-0 font-mono",
+                SUB_GOAL_STATUS_TINT[sg.status] ?? "text-muted-foreground",
+              )}
+            >
+              {SUB_GOAL_STATUS_GLYPH[sg.status] ?? "?"}
+            </span>
+            <span className="font-mono text-[9px] text-muted-foreground">
+              [{sg.id}]
+            </span>
+            <span
+              className={cn(
+                "min-w-0 flex-1 break-words",
+                sg.status === "done" &&
+                  "text-muted-foreground line-through decoration-emerald-500/60",
+              )}
+            >
+              {sg.description}
+            </span>
+            {sg.completed_at_turn !== null && (
+              <span className="shrink-0 text-[9px] text-muted-foreground">
+                T{sg.completed_at_turn}
+              </span>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 
 // ── Pill ──────────────────────────────────────────────────────────
 

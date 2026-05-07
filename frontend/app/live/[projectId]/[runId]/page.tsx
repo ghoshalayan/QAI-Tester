@@ -519,6 +519,215 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+  if (type === "frozen_path_captured") {
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-emerald-500" />}
+        label="frozen path captured"
+        title={
+          typeof data.step_count === "number"
+            ? `${data.step_count} step(s) saved for replay`
+            : "saved for replay"
+        }
+        sublabel={
+          typeof data.agent_model === "string"
+            ? `from ${data.agent_model}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "frozen_step_completed") {
+    const status = data.status as string | undefined;
+    const Icon =
+      status === "ok"
+        ? CheckCircle2
+        : status === "blocked"
+          ? AlertTriangle
+          : XCircle;
+    const colorClass =
+      status === "ok"
+        ? "text-emerald-500"
+        : status === "blocked"
+          ? "text-amber-500"
+          : "text-red-500";
+    const healed = !!data.self_healed;
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={
+          typeof data.frozen_step_index === "number" &&
+          typeof data.total === "number"
+            ? `replay ${data.frozen_step_index}/${data.total}`
+            : "replay step"
+        }
+        title={
+          typeof data.tool === "string"
+            ? `${data.tool}${healed ? " · self-healed" : ""}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "frozen_step_self_healing") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-purple-500" />}
+        label="self-healing"
+        title={data.target_hint as string | undefined}
+        sublabel={
+          typeof data.frozen_step_index === "number"
+            ? `frozen step ${data.frozen_step_index}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "frozen_step_self_heal_completed") {
+    const ok = !!data.healed;
+    return (
+      <Row
+        icon={
+          ok ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : (
+            <XCircle className="size-3.5 text-red-500" />
+          )
+        }
+        label={ok ? "self-heal ✓" : "self-heal ✗"}
+        title={
+          typeof data.frozen_step_index === "number"
+            ? `frozen step ${data.frozen_step_index}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_verifying") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-purple-500" />}
+        label="vision verifying goal"
+        title={data.goal_description as string | undefined}
+      />
+    );
+  }
+  if (type === "agent_verified") {
+    const verdict = data.verdict as string | undefined;
+    const Icon =
+      verdict === "pass"
+        ? CheckCircle2
+        : verdict === "partial"
+          ? AlertTriangle
+          : XCircle;
+    const colorClass =
+      verdict === "pass"
+        ? "text-emerald-500"
+        : verdict === "partial"
+          ? "text-amber-500"
+          : "text-red-500";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={`vision verdict: ${verdict}`}
+        title={data.reasoning as string | undefined}
+        sublabel={
+          typeof data.confidence === "number"
+            ? `confidence ${Math.round(data.confidence * 100)}%`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_on_track_check") {
+    const onTrack = !!data.on_track;
+    return (
+      <Row
+        icon={
+          onTrack ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : (
+            <AlertTriangle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={
+          onTrack
+            ? `on-track check ✓ (T${data.turn ?? "?"})`
+            : `off-track warning (T${data.turn ?? "?"})`
+        }
+        title={
+          (onTrack
+            ? (data.reasoning as string | undefined)
+            : (data.suggestion as string | undefined)) ?? undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_searching") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-purple-500" />}
+        label={
+          typeof data.attempt === "number" && typeof data.max_attempts === "number"
+            ? `vision search ${data.attempt}/${data.max_attempts}`
+            : "vision search"
+        }
+        title={
+          typeof data.target_hint === "string"
+            ? `looking for ${data.target_hint}`
+            : undefined
+        }
+        sublabel={
+          Array.isArray(data.near_misses) && data.near_misses.length > 0
+            ? `${data.near_misses.length} near-miss(es) considered`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "agent_search_completed") {
+    const halt = data.halt as string | undefined;
+    const ok = halt === "completed";
+    return (
+      <Row
+        icon={
+          ok ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : (
+            <XCircle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={ok ? "vision search ✓" : `vision search · ${halt}`}
+        title={
+          typeof data.attempts_used === "number"
+            ? `after ${data.attempts_used} attempt(s)`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "sub_goal_progress") {
+    const remaining =
+      typeof data.remaining === "number" ? data.remaining : 0;
+    const total = typeof data.total === "number" ? data.total : 0;
+    const done = total - remaining;
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={
+          total > 0
+            ? `sub-goal ✓ (${done}/${total})`
+            : "sub-goal ✓"
+        }
+        title={data.description as string | undefined}
+        sublabel={
+          typeof data.turn === "number"
+            ? `closed at T${data.turn}`
+            : undefined
+        }
+      />
+    );
+  }
   if (type === "agent_thought") {
     return (
       <Row

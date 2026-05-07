@@ -94,6 +94,15 @@ class TcNode(Base):
     expected: Mapped[str | None] = mapped_column(Text, nullable=True)
     data_needs_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # ── Phase E: frozen replay path (submodule-level) ─────────────
+    # When an agentic run passes vision verification on this
+    # submodule, we serialize the agent's working tool sequence here
+    # (with successful selectors after fuzzy / vision substitution).
+    # Replay-mode runs walk this list deterministically — no LLM
+    # calls. NULL for nodes that have never been successfully
+    # agent-run; replay falls back to agentic for them.
+    frozen_path: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # ── Selection + status ────────────────────────────────────────
     selectable_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True,

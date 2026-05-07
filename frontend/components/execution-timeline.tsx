@@ -355,7 +355,16 @@ function AgentTurnsSurface({ step }: { step: ExecutionStepRead }) {
   if ((details as Record<string, unknown>).mode !== "agentic") return null;
 
   const goal = (details as Record<string, unknown>).goal as
-    | { description?: string; success_criteria?: string[] }
+    | {
+        description?: string;
+        success_criteria?: string[];
+        sub_goals?: Array<{
+          id: string;
+          description: string;
+          status: string;
+          completed_at_turn: number | null;
+        }>;
+      }
     | undefined;
   const haltReason = (details as Record<string, unknown>).halt_reason as
     | string
@@ -364,6 +373,7 @@ function AgentTurnsSurface({ step }: { step: ExecutionStepRead }) {
   const turns: Array<Record<string, unknown>> = Array.isArray(turnLog)
     ? (turnLog as Array<Record<string, unknown>>)
     : [];
+  const subGoals = Array.isArray(goal?.sub_goals) ? goal.sub_goals : [];
 
   const passed = step.status === "passed";
 
@@ -417,6 +427,8 @@ function AgentTurnsSurface({ step }: { step: ExecutionStepRead }) {
           </div>
         )}
 
+        {subGoals.length > 0 && <SubGoalChecklist subGoals={subGoals} />}
+
         {turns.length === 0 ? (
           <p className="italic text-muted-foreground">
             No turns ran (the agent halted before its first action).
@@ -430,6 +442,79 @@ function AgentTurnsSurface({ step }: { step: ExecutionStepRead }) {
         )}
       </div>
     </details>
+  );
+}
+
+const _SUB_GOAL_GLYPH: Record<string, string> = {
+  pending: "☐",
+  in_progress: "▶",
+  done: "✓",
+  failed: "✗",
+  skipped: "⊘",
+};
+const _SUB_GOAL_TINT: Record<string, string> = {
+  pending: "text-muted-foreground",
+  in_progress: "text-blue-600 dark:text-blue-400",
+  done: "text-emerald-600 dark:text-emerald-400",
+  failed: "text-red-600 dark:text-red-400",
+  skipped: "text-amber-600 dark:text-amber-400",
+};
+
+function SubGoalChecklist({
+  subGoals,
+}: {
+  subGoals: Array<{
+    id: string;
+    description: string;
+    status: string;
+    completed_at_turn: number | null;
+  }>;
+}) {
+  const done = subGoals.filter((sg) => sg.status === "done").length;
+  const total = subGoals.length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return (
+    <div className="rounded border bg-card p-1.5 text-[11px]">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          Sub-goals
+        </span>
+        <span className="text-[10px] text-muted-foreground">
+          {done}/{total} done · {pct}%
+        </span>
+      </div>
+      <ol className="space-y-0.5">
+        {subGoals.map((sg) => (
+          <li key={sg.id} className="flex items-baseline gap-1.5">
+            <span
+              className={cn(
+                "shrink-0 font-mono",
+                _SUB_GOAL_TINT[sg.status] ?? "text-muted-foreground",
+              )}
+            >
+              {_SUB_GOAL_GLYPH[sg.status] ?? "?"}
+            </span>
+            <span className="font-mono text-[9px] text-muted-foreground">
+              [{sg.id}]
+            </span>
+            <span
+              className={cn(
+                "min-w-0 flex-1 break-words",
+                sg.status === "done" &&
+                  "text-muted-foreground line-through decoration-emerald-500/60",
+              )}
+            >
+              {sg.description}
+            </span>
+            {sg.completed_at_turn !== null && (
+              <span className="shrink-0 text-[9px] text-muted-foreground">
+                T{sg.completed_at_turn}
+              </span>
+            )}
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 

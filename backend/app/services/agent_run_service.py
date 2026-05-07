@@ -611,7 +611,7 @@ def execute_run(run_id: int) -> None:
         auto_adjust = bool(input_data.get("auto_adjust", False))
         promote_fixes = bool(input_data.get("promote_fixes", False))
         mode = input_data.get("mode", "scripted")
-        if mode not in ("scripted", "agentic"):
+        if mode not in ("scripted", "agentic", "replay"):
             mode = "scripted"
 
         # Window geometry — frontend computes from screen.availWidth/Height
@@ -670,6 +670,33 @@ def execute_run(run_id: int) -> None:
                     headless=headless,
                     speed=speed_raw,
                     provider=provider,
+                    auto_adjust=auto_adjust,
+                    promote_fixes=promote_fixes,
+                    window_position=window_position,
+                    window_size=window_size,
+                    emit_event=lambda et, data: _emit_run_event(run, et, data),
+                    is_cancelled=lambda: _is_cancelled(run.id),
+                    is_paused=lambda: _is_paused(run.id),
+                    wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
+                    wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
+                )
+            elif mode == "replay":
+                # Phase E: deterministic walk of frozen paths.
+                # Submodules without a frozen path fall through to
+                # agentic mode (handled inside the runner) — so
+                # ``provider`` may be required for partial coverage
+                # but isn't strictly required for fully-frozen plans.
+                from app.agents.replay import run_replay_for_plan
+
+                result = run_replay_for_plan(
+                    db=db,
+                    run_id=run.id,
+                    plan_id=plan_id,
+                    selected_step_ids=selected_step_ids,
+                    headless=headless,
+                    speed=speed_raw,
+                    provider=provider,
+                    self_heal_enabled=ai_assist,
                     auto_adjust=auto_adjust,
                     promote_fixes=promote_fixes,
                     window_position=window_position,

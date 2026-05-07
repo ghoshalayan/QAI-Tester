@@ -70,7 +70,14 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
     halt_reason = None
     goal_description = None
     success_criteria: list[str] = []
+    sub_goals: list[dict] = []
     agent_log: list[dict] = []
+    divergence_category: str | None = None
+    divergence_summary: str | None = None
+    fuzzy_rescues = 0
+    vision_rescues = 0
+    goal_verification: dict | None = None
+
     if isinstance(details, dict) and details.get("mode") == "agentic":
         mode = "agentic"
         halt_reason = details.get("halt_reason")
@@ -80,11 +87,38 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
             sc = goal.get("success_criteria") or []
             if isinstance(sc, list):
                 success_criteria = [str(c) for c in sc if isinstance(c, str)]
+            sg = goal.get("sub_goals") or []
+            if isinstance(sg, list):
+                # Raw dicts; Pydantic coerces via ReportSubGoal(**dict).
+                sub_goals = [s for s in sg if isinstance(s, dict)]
         log = details.get("agent_log") or []
         if isinstance(log, list):
             # Preserve the raw dicts; Pydantic coerces them on the
             # ReportStepRead boundary via ReportAgentTurn(**dict).
             agent_log = [t for t in log if isinstance(t, dict)]
+
+        # A4.3: divergence classification + intervention counts.
+        div = details.get("divergence")
+        if isinstance(div, dict):
+            divergence_category = div.get("category")
+            divergence_summary = div.get("summary")
+            fuzzy_rescues = int(div.get("fuzzy_rescues") or 0)
+            vision_rescues = int(div.get("vision_rescues") or 0)
+
+        # A4.1a: pull the screenshot-based goal verification (if any)
+        # off the stop turn's search_log slot. Last turn that has a
+        # ``kind == 'goal_verification'`` block wins.
+        for t in reversed(agent_log):
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and sl.get("kind") == "goal_verification":
+                goal_verification = {
+                    "verdict": sl.get("verdict"),
+                    "reasoning": sl.get("reasoning"),
+                    "confidence": sl.get("confidence"),
+                    "criteria_met": list(sl.get("criteria_met") or []),
+                    "criteria_missed": list(sl.get("criteria_missed") or []),
+                }
+                break
 
     return ReportStepRead(
         id=step.id,
@@ -104,7 +138,13 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         halt_reason=halt_reason,
         goal_description=goal_description,
         success_criteria=success_criteria,
+        sub_goals=sub_goals,  # type: ignore[arg-type]
         agent_log=agent_log,  # type: ignore[arg-type]
+        divergence_category=divergence_category,
+        divergence_summary=divergence_summary,
+        fuzzy_rescues=fuzzy_rescues,
+        vision_rescues=vision_rescues,
+        goal_verification=goal_verification,
     )
 
 

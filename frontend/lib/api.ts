@@ -336,8 +336,11 @@ export interface ExecuteRunRequest {
   promote_fixes?: boolean;
   /** Run mode:
    * - "scripted" (default): rigid step-walker with AI patches.
-   * - "agentic":   goal-oriented QA agent loop per submodule. */
-  mode?: "scripted" | "agentic";
+   * - "agentic":   goal-oriented QA agent loop per submodule.
+   * - "replay":    deterministic walk of each submodule's frozen
+   *   path (captured on a previous successful agentic run).
+   *   Submodules without a frozen path fall through to agentic. */
+  mode?: "scripted" | "agentic" | "replay";
   /** Headed Chromium window position + size, in screen pixels. The
    * frontend computes these from ``window.screen.availWidth/Height`` so
    * the browser tiles to the left and the live presenter popup fits on
@@ -390,6 +393,20 @@ export interface ReportAgentTurn {
   extracted_text: string;
 }
 
+export type ReportSubGoalStatus =
+  | "pending"
+  | "in_progress"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export interface ReportSubGoal {
+  id: string;
+  description: string;
+  status: ReportSubGoalStatus;
+  completed_at_turn: number | null;
+}
+
 export interface ReportStepRead {
   id: number;
   tc_node_id: number | null;
@@ -409,7 +426,27 @@ export interface ReportStepRead {
   halt_reason: string | null;
   goal_description: string | null;
   success_criteria: string[];
+  /** Ordered sub-goals the agent worked through (Phase A1). */
+  sub_goals: ReportSubGoal[];
   agent_log: ReportAgentTurn[];
+  /** A4.3: divergence classification for actionable recommendations.
+   * passed_clean / passed_with_help / test_case_outdated /
+   * feature_missing / infra_issue / agent_drift / agent_gave_up /
+   * user_cancelled. null for scripted runs. */
+  divergence_category: string | null;
+  divergence_summary: string | null;
+  /** A4.2 fuzzy substitutions that rescued this row's actions. */
+  fuzzy_rescues: number;
+  /** A4.1b vision-guided target searches that successfully recovered. */
+  vision_rescues: number;
+  /** A4.1a vision-grounded verdict on the agent's "I'm done" claim. */
+  goal_verification: {
+    verdict: "pass" | "partial" | "fail" | null;
+    reasoning: string | null;
+    confidence: number | null;
+    criteria_met: string[];
+    criteria_missed: string[];
+  } | null;
 }
 
 export interface ReportSubmoduleRead {

@@ -39,6 +39,23 @@ class ReportAgentTurn(BaseModel):
     error_message: str | None = None
     page_url: str = ""
     extracted_text: str = ""
+
+
+class ReportSubGoal(BaseModel):
+    """One ordered sub-goal the agent worked through (Phase A1).
+
+    Lifted from ``details_json["goal"]["sub_goals"]`` so the report
+    can render the sub-goal checklist with each item's final status —
+    pending / in_progress / done / failed / skipped — and the turn at
+    which the agent closed it.
+    """
+
+    id: str
+    description: str
+    status: str = "pending"
+    completed_at_turn: int | None = None
+
+
 AgentStatus = Literal[
     "queued", "running", "paused", "completed", "failed", "cancelled",
 ]
@@ -73,7 +90,25 @@ class ReportStepRead(BaseModel):
     halt_reason: str | None = None
     goal_description: str | None = None
     success_criteria: list[str] = Field(default_factory=list)
+    sub_goals: list[ReportSubGoal] = Field(default_factory=list)
     agent_log: list[ReportAgentTurn] = Field(default_factory=list)
+    # ── A4 visibility fields ──────────────────────────────────────
+    # Divergence classification (A4.3). One of: passed_clean,
+    # passed_with_help, test_case_outdated, feature_missing,
+    # infra_issue, agent_drift, agent_gave_up, user_cancelled.
+    # ``None`` for scripted runs.
+    divergence_category: str | None = None
+    divergence_summary: str | None = None
+    # Counts of automatic interventions that ran on this row, so the
+    # report can render "rescued by N fuzzy match(es) / N vision
+    # search(es)" badges. Tells the user the value of the agentic
+    # stack, not just its cost.
+    fuzzy_rescues: int = 0
+    vision_rescues: int = 0
+    # A4.1a goal verification result (verdict + reasoning) when the
+    # agent claimed completion. ``None`` if the agent didn't reach
+    # mark_goal_complete.
+    goal_verification: dict | None = None
 
 
 class ReportSubmoduleRead(BaseModel):
