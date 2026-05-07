@@ -616,15 +616,29 @@ function EventRow({ event }: { event: LiveEvent }) {
         label={type}
         title={
           typeof data.passed === "number"
-            ? [
-                `${data.passed} passed`,
-                `${data.failed ?? 0} failed`,
-                ...(typeof data.inconclusive === "number" &&
-                data.inconclusive > 0
-                  ? [`${data.inconclusive} inconclusive`]
-                  : []),
-                `${data.blocked ?? 0} blocked`,
-              ].join(" · ")
+            ? (() => {
+                const total =
+                  typeof data.total_steps === "number"
+                    ? data.total_steps
+                    : (data.passed as number) +
+                      ((data.failed as number) ?? 0) +
+                      ((data.inconclusive as number) ?? 0) +
+                      ((data.blocked as number) ?? 0) +
+                      ((data.skipped as number) ?? 0);
+                const pct =
+                  total > 0
+                    ? Math.round(((data.passed as number) / total) * 100)
+                    : 0;
+                return [
+                  `${data.passed}/${total} passed (${pct}%)`,
+                  `${data.failed ?? 0} failed`,
+                  ...(typeof data.inconclusive === "number" &&
+                  data.inconclusive > 0
+                    ? [`${data.inconclusive} inconclusive`]
+                    : []),
+                  `${data.blocked ?? 0} blocked`,
+                ].join(" · ");
+              })()
             : (data.message as string | undefined)
         }
       />

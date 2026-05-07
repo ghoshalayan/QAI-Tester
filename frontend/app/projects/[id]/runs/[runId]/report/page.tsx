@@ -239,11 +239,20 @@ function ModuleSection({ module: mod }: { module: ReportModuleRead }) {
         <span className="text-xs text-muted-foreground">
           {mod.passed}/{mod.total} passed
           {mod.failed > 0 && ` · ${mod.failed} failed`}
+          {mod.inconclusive > 0 && ` · ${mod.inconclusive} inconclusive`}
           {mod.blocked > 0 && ` · ${mod.blocked} blocked`}
           {mod.skipped > 0 && ` · ${mod.skipped} skipped`}
         </span>
         <PctBadge pct={mod.pass_pct} kind="pass" />
         {mod.fail_pct > 0 && <PctBadge pct={mod.fail_pct} kind="fail" />}
+        {/* Partial badge — surfaces when results are mixed within the
+            module, so the user can spot "this feature is fragile, half
+            its tests fail" at a glance. */}
+        {mod.pass_pct > 0 && mod.fail_pct > 0 && (
+          <span className="inline-flex items-center rounded-md border border-orange-500/30 bg-orange-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-orange-700 dark:text-orange-400">
+            Partial
+          </span>
+        )}
       </div>
       <table className="w-full text-sm">
         <thead className="bg-muted/30 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -294,13 +303,38 @@ function SubmoduleRow({ submodule: sub }: { submodule: ReportSubmoduleRead }) {
           {sub.total}
         </td>
         <td className="px-2 py-2 text-center">
-          <PctBadge pct={sub.pass_pct} kind="pass" />
+          <div className="inline-flex flex-col items-center gap-0.5">
+            <PctBadge pct={sub.pass_pct} kind="pass" />
+            <span className="text-[9px] text-muted-foreground">
+              {sub.passed}/{sub.total}
+            </span>
+          </div>
         </td>
         <td className="px-2 py-2 text-center">
           {sub.fail_pct > 0 ? (
-            <PctBadge pct={sub.fail_pct} kind="fail" />
+            <div className="inline-flex flex-col items-center gap-0.5">
+              <PctBadge pct={sub.fail_pct} kind="fail" />
+              <span className="text-[9px] text-muted-foreground">
+                {sub.failed}/{sub.total}
+              </span>
+            </div>
+          ) : sub.inconclusive > 0 ? (
+            <span className="inline-flex items-center rounded-md border border-orange-500/30 bg-orange-500/10 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-orange-700 dark:text-orange-400">
+              {sub.inconclusive}× unclear
+            </span>
           ) : (
             <span className="text-xs text-muted-foreground">—</span>
+          )}
+          {/* Partial test case — some sub-steps passed, some failed.
+              This is the most useful visual signal for the user:
+              "this test case is half-working" deserves attention
+              that "all-pass" or "all-fail" don't. */}
+          {sub.pass_pct > 0 && sub.fail_pct > 0 && (
+            <div className="mt-0.5">
+              <span className="inline-flex items-center rounded-md border border-orange-500/30 bg-orange-500/10 px-1 py-0.5 font-mono text-[9px] font-semibold text-orange-700 dark:text-orange-400">
+                Partial
+              </span>
+            </div>
           )}
         </td>
         <td className="px-4 py-2 text-xs">

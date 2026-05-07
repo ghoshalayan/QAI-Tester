@@ -395,6 +395,24 @@ export function RunProgressCard({
                 ? "✓"
                 : "•"}{" "}
               <strong>{exPassed ?? 0}</strong>/{exTotalSteps ?? 0} passed
+              {/* Pass percentage as a prominent badge — even on a clean
+                  100% run, surface the number so the user can compare
+                  runs at a glance. */}
+              {(exTotalSteps ?? 0) > 0 && (
+                <span
+                  className={cn(
+                    "ml-1.5 inline-flex items-center rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-semibold",
+                    passPctTint(
+                      ((exPassed ?? 0) / (exTotalSteps ?? 1)) * 100,
+                    ),
+                  )}
+                >
+                  {Math.round(
+                    ((exPassed ?? 0) / (exTotalSteps ?? 1)) * 100,
+                  )}
+                  %
+                </span>
+              )}
               {(exFailed ?? 0) > 0 && (
                 <>
                   {" · "}
@@ -473,4 +491,17 @@ export function RunProgressCard({
         )}
     </Card>
   );
+}
+
+/**
+ * Tint pass-percentage like the report's PctBadge — keeps the color
+ * grammar consistent: green for great, yellow for "watch this", red for
+ * "you have a problem".
+ */
+function passPctTint(pct: number): string {
+  if (pct >= 90)
+    return "bg-green-500/15 text-green-700 dark:text-green-400 border-green-500/30";
+  if (pct >= 70)
+    return "bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/30";
+  return "bg-red-500/15 text-red-700 dark:text-red-400 border-red-500/30";
 }

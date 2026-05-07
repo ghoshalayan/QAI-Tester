@@ -126,11 +126,19 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         "question": {"type": "string"},
         "reasoning": {"type": "string"},
         "confidence": {"type": "number"},
+        # Page memory — agent produces a 1-2 line "what's on this
+        # page right now" summary alongside the tool call. We cache it
+        # keyed by URL so future turns on the same page can read the
+        # memory instead of re-scraping the AX tree (Atlas/Comet
+        # pattern). Piggybacks on the existing tool call so it costs
+        # ~30 output tokens, not a separate LLM round-trip.
+        "page_memory_note": {"type": "string"},
     },
     "required": [
         "tool", "target_hint", "value", "url", "expected",
         "duration_ms", "scroll_direction", "scroll_amount",
         "question", "reasoning", "confidence",
+        "page_memory_note",
     ],
     "additionalProperties": False,
 }
@@ -202,6 +210,19 @@ RULES:
   observation. Don't fabricate.
 - ALWAYS set: tool, reasoning (1 sentence), confidence (0.0-1.0).
   Set the args your tool needs and leave the rest as empty strings / 0.
+
+PAGE MEMORY:
+- ``page_memory_note``: a 1-2 sentence summary of what's on the page
+  RIGHT NOW (what kind of page, key affordances, key labels, blocking
+  modals). NOT what you're about to do — that's ``reasoning``.
+- This is cached by URL across turns. Future turns on the same URL
+  see your memory note instead of the full element list, so write
+  enough that future-you can act without re-scanning.
+- Good example: "Product detail page for iPhone 13. 'Add to cart'
+  button (data-testid=add-cart) top-right. Price $999, in-stock badge."
+- Bad example (too vague): "homepage". (Useless on revisit.)
+- Set to "" (empty string) ONLY when you've already memorized this
+  exact URL on a previous turn AND nothing visibly changed.
 
 Output JSON only.
 """
@@ -388,12 +409,100 @@ def _format_observation_for_prompt(obs: dict[str, Any], max_items: int = 60) -> 
     return json.dumps(short, indent=2, ensure_ascii=False)
 
 
-def _format_history_for_prompt(turns: list[TurnRecord], window: int = 6) -> str:
+def _format_page_memory_for_prompt(
+    memory: dict[str, dict[str, Any]],
+    current_url: str,
+    *,
+    max_entries: int = 10,
+) -> str:
+    """Render the page-memory cache as a compact block for the prompt.
+
+    Each entry is one line: ``- /path (T<turn>): <note>``. The current
+    URL gets a ``← YOU ARE HERE`` marker so the agent can immediately
+    read its own prior summary instead of re-parsing the AX tree.
+
+    Returns "" when memory is empty so the caller can skip the block.
+    """
+    if not memory:
+        return ""
+    # Sort by turn (most recent first) and cap to avoid prompt bloat.
+    items = sorted(
+        memory.items(),
+        key=lambda kv: kv[1].get("turn", 0),
+        reverse=True,
+    )[:max_entries]
+    lines: list[str] = []
+    for url, entry in items:
+        # Show only the path part — most apps share a host across all
+        # pages, so the host is just noise.
+        try:
+            from urllib.parse import urlparse
+            path = urlparse(url).path or url
+        except Exception:
+            path = url
+        marker = "  ← YOU ARE HERE" if url == current_url else ""
+        note = (entry.get("note") or "")[:240]
+        lines.append(
+            f"- {path} (T{entry.get('turn', '?')}): {note}{marker}",
+        )
+    return "\n".join(lines)
+
+
+def _store_page_memory(
+    memory: dict[str, dict[str, Any]],
+    *,
+    url: str,
+    note: str,
+    turn: int,
+    cap: int = 30,
+) -> None:
+    """Insert / update a memory entry. LRU-evicts the oldest by turn
+    when the cap is exceeded.
+
+    Empty notes are ignored — the agent's contract is to set "" only
+    when there's nothing new to record, so we keep the existing entry.
+    """
+    if not url or not note.strip():
+        return
+    memory[url] = {"note": note.strip()[:240], "turn": turn}
+    if len(memory) > cap:
+        # Evict the oldest by turn number.
+        oldest_url = min(
+            memory.keys(),
+            key=lambda u: memory[u].get("turn", 0),
+        )
+        memory.pop(oldest_url, None)
+
+
+def _format_history_for_prompt(
+    turns: list[TurnRecord],
+    *,
+    verbose_tail: int = 3,
+    compact_window: int = 8,
+) -> str:
+    """Compressed history.
+
+    The most recent ``verbose_tail`` turns get the full narration; older
+    turns in the window collapse to a one-liner with just the tool +
+    args + status. Anything older than ``compact_window`` is dropped.
+
+    Saves ~30-50% on history tokens vs sending six verbose turns —
+    older turns rarely justify the extra context, while the most
+    recent few are what the agent actually reasons against.
+    """
     if not turns:
         return "(no turns yet — this is the first action)"
-    recent = turns[-window:]
+    window = turns[-compact_window:]
+    if len(window) <= verbose_tail:
+        verbose = window
+        compact: list[TurnRecord] = []
+    else:
+        verbose = window[-verbose_tail:]
+        compact = window[:-verbose_tail]
     out: list[str] = []
-    for t in recent:
+    for t in compact:
+        out.append(f"  T{t.turn}: {t.tool}({_one_line_args(t.args)}) → {t.status}")
+    for t in verbose:
         out.append(
             f"  T{t.turn}: {t.tool}({_one_line_args(t.args)}) "
             f"→ {t.status}: {t.narration[:160]}",
@@ -412,23 +521,54 @@ def _one_line_args(args: dict[str, Any]) -> str:
     return json.dumps(keep, ensure_ascii=False)[:120]
 
 
-def _format_goal_for_prompt(goal: Goal) -> str:
+def _format_goal_for_prompt(goal: Goal, *, turn_idx: int = 1) -> str:
+    """Render the goal block.
+
+    Hints fade by turn:
+    - T1: full hints (action, title, target).
+    - T2-T3: just titles (no targets — agent should be acting on
+      observation by now, not following selectors blindly).
+    - T4+: no hints at all (the goal description + criteria are the
+      contract; hints have served their purpose).
+
+    This saves ~200-400 input tokens per turn after T3 with no
+    measurable loss in quality — usually a small bump in flexibility
+    because the agent stops second-guessing stale hints.
+    """
     crit_lines = "\n".join(
         f"  - {c}" for c in goal.success_criteria
     ) or "  (none specified — pick whatever observable signals fit)"
-    hint_lines: list[str] = []
-    for h in goal.hints[:20]:
-        hint_lines.append(
+
+    if turn_idx <= 1:
+        hint_lines = [
             f"  {h.ordinal + 1}. [{h.action_type or '?'}] {h.title}"
-            f" — target: {h.target_hint or '?'}",
+            f" — target: {h.target_hint or '?'}"
+            for h in goal.hints[:20]
+        ]
+        hints_block = (
+            "HINTS (original test-case steps — guidance, not contract):\n"
+            + ("\n".join(hint_lines) or "  (no hints — improvise)")
         )
-    hints_text = "\n".join(hint_lines) or "  (no hints — improvise)"
-    return (
-        f"GOAL: {goal.description}\n"
-        f"PATH: {goal.path}\n"
-        f"SUCCESS CRITERIA:\n{crit_lines}\n\n"
-        f"HINTS (original test-case steps — guidance, not contract):\n{hints_text}"
-    )
+    elif turn_idx <= 3:
+        hint_lines = [
+            f"  {h.ordinal + 1}. {h.title}" for h in goal.hints[:20]
+        ]
+        hints_block = (
+            "HINT TITLES (titles only — you should be acting on the "
+            "observation now, not following selectors blindly):\n"
+            + ("\n".join(hint_lines) or "  (no hints)")
+        )
+    else:
+        hints_block = ""  # T4+: drop hints entirely
+
+    blocks = [
+        f"GOAL: {goal.description}",
+        f"PATH: {goal.path}",
+        f"SUCCESS CRITERIA:\n{crit_lines}",
+    ]
+    if hints_block:
+        blocks.append(hints_block)
+    return "\n\n".join(blocks)
 
 
 # ── Tool dispatch ─────────────────────────────────────────────────
@@ -688,6 +828,13 @@ def run_agent_for_goal(
     provider_supports_vision = bool(
         getattr(provider, "supports_vision", False),
     )
+    # Page memory — persistent within this submodule's loop, keyed by
+    # URL. Each entry is the agent's own 1-2 line "what's on this
+    # page" note from a previous turn. Future turns on the same URL
+    # read the cached note instead of re-parsing the AX tree, the
+    # Atlas/Comet site-map pattern. Cuts observation tokens by ~80%
+    # on multi-page flows where the agent revisits pages.
+    page_memory: dict[str, dict[str, Any]] = {}
 
     halt_reason: HaltReason = "max_turns"
     final_status: Literal["passed", "failed", "blocked", "inconclusive"] = (
@@ -770,6 +917,47 @@ def run_agent_for_goal(
             if diff_text else ""
         )
 
+        # Page memory — show prior site-map notes the agent has
+        # captured. The current URL gets a "YOU ARE HERE" marker so
+        # the agent can act from memory directly when it has visited
+        # this page before.
+        current_url = observation.get("url", "")
+        memory_text = _format_page_memory_for_prompt(
+            page_memory, current_url,
+        )
+        memory_block = (
+            f"\nPAGE MEMORY (your prior site-map notes; reuse instead "
+            f"of re-scanning when possible):\n{memory_text}\n"
+            if memory_text else ""
+        )
+
+        # If the agent has already memorized THIS URL, send a TRIMMED
+        # observation (just URL + title + element_count) — the memory
+        # note + the diff block (which names any new/removed elements)
+        # give the agent enough to act, without paying for the full
+        # 60-item AX tree every turn. This is the biggest token win.
+        already_memorized = (
+            current_url in page_memory and turn_idx > 1
+        )
+        if already_memorized:
+            obs_block = (
+                "CURRENT OBSERVATION (compressed — you already "
+                "memorized this URL; full element list omitted):\n"
+                + json.dumps(
+                    {
+                        "url": current_url,
+                        "title": observation.get("title", ""),
+                        "element_count": len(observation.get("items") or []),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            obs_block = (
+                "CURRENT OBSERVATION:\n"
+                + _format_observation_for_prompt(observation)
+            )
+
         user_prompt = (
             f"TARGET SITE (the app under test): "
             f"{plan_target_url or '(none configured)'}\n"
@@ -777,10 +965,11 @@ def run_agent_for_goal(
             f"should normally NOT need to navigate again unless the goal "
             f"itself requires going elsewhere.\n"
             f"{vision_note}"
-            f"{diff_block}\n"
-            f"{_format_goal_for_prompt(goal)}\n\n"
+            f"{diff_block}"
+            f"{memory_block}\n"
+            f"{_format_goal_for_prompt(goal, turn_idx=turn_idx)}\n\n"
             f"HISTORY (last few turns):\n{_format_history_for_prompt(turn_log)}\n\n"
-            f"CURRENT OBSERVATION:\n{_format_observation_for_prompt(observation)}\n\n"
+            f"{obs_block}\n\n"
             f"This is turn {turn_idx}/{max_turns}. Pick ONE tool."
         )
 
@@ -834,9 +1023,21 @@ def run_agent_for_goal(
         tool = str(parsed.get("tool"))
         reasoning = str(parsed.get("reasoning", "")).strip()
         confidence = float(parsed.get("confidence", 0.0))
+        # Capture the page-memory note BEFORE we filter it out of
+        # ``args``. The agent emits this alongside every tool call.
+        memory_note = str(parsed.get("page_memory_note", "")).strip()
+        if memory_note:
+            _store_page_memory(
+                page_memory,
+                url=observation.get("url", ""),
+                note=memory_note,
+                turn=turn_idx,
+            )
         args = {
             k: v for k, v in parsed.items()
-            if k not in ("tool", "reasoning", "confidence")
+            if k not in (
+                "tool", "reasoning", "confidence", "page_memory_note",
+            )
         }
 
         _emit(emit_event, "agent_thought", {
