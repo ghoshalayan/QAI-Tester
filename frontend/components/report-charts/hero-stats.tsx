@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  AlertTriangle,
   CheckCircle2,
   Sparkles,
   Timer,
@@ -71,6 +72,19 @@ export function HeroStats({ run }: Props) {
             : `${((run.failed / Math.max(run.total_steps, 1)) * 100).toFixed(0)}% failure`
         }
       />
+
+      {/* Inconclusive — only surfaces when > 0. Distinct from failed:
+          orange tint, separate icon. These usually mean the test case
+          itself was unclear, not that the app broke. */}
+      {run.inconclusive > 0 && (
+        <Stat
+          icon={AlertTriangle}
+          label="Inconclusive"
+          value={run.inconclusive.toString()}
+          valueClass="text-orange-600 dark:text-orange-400"
+          sub="Goal halted before verification — review the test wording"
+        />
+      )}
 
       {/* Duration */}
       {run.duration_ms !== null && (
@@ -152,6 +166,7 @@ function subStepBreakdown(run: ReportRunSummary): string {
   const parts: string[] = [];
   if (run.passed > 0) parts.push(`${run.passed} ok`);
   if (run.failed > 0) parts.push(`${run.failed} fail`);
+  if (run.inconclusive > 0) parts.push(`${run.inconclusive} unclear`);
   if (run.blocked > 0) parts.push(`${run.blocked} blocked`);
   if (run.skipped > 0) parts.push(`${run.skipped} skip`);
   return parts.join(" · ") || "—";

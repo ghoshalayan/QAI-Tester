@@ -616,7 +616,15 @@ function EventRow({ event }: { event: LiveEvent }) {
         label={type}
         title={
           typeof data.passed === "number"
-            ? `${data.passed} passed · ${data.failed ?? 0} failed · ${data.blocked ?? 0} blocked`
+            ? [
+                `${data.passed} passed`,
+                `${data.failed ?? 0} failed`,
+                ...(typeof data.inconclusive === "number" &&
+                data.inconclusive > 0
+                  ? [`${data.inconclusive} inconclusive`]
+                  : []),
+                `${data.blocked ?? 0} blocked`,
+              ].join(" · ")
             : (data.message as string | undefined)
         }
       />

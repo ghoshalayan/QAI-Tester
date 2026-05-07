@@ -166,6 +166,10 @@ export function RunProgressCard({
     typeof run.output_summary_json?.failed === "number"
       ? (run.output_summary_json.failed as number)
       : null;
+  const exInconclusive =
+    typeof run.output_summary_json?.inconclusive === "number"
+      ? (run.output_summary_json.inconclusive as number)
+      : null;
   const exBlocked =
     typeof run.output_summary_json?.blocked === "number"
       ? (run.output_summary_json.blocked as number)
@@ -376,17 +380,31 @@ export function RunProgressCard({
             "mt-3 rounded-md p-3 text-xs",
             isExecute && (exFailed ?? 0) > 0
               ? "bg-red-500/5 text-red-700 dark:text-red-400"
-              : "bg-green-500/5 text-green-700 dark:text-green-400",
+              // Inconclusive (but no real failures) → orange/amber tint;
+              // these are usually test-case wording problems, not bugs.
+              : isExecute && (exInconclusive ?? 0) > 0
+                ? "bg-orange-500/5 text-orange-700 dark:text-orange-400"
+                : "bg-green-500/5 text-green-700 dark:text-green-400",
           )}
         >
           {isExecute ? (
             <>
-              {(exFailed ?? 0) === 0 && (exBlocked ?? 0) === 0 ? "✓" : "•"}{" "}
+              {(exFailed ?? 0) === 0 &&
+              (exBlocked ?? 0) === 0 &&
+              (exInconclusive ?? 0) === 0
+                ? "✓"
+                : "•"}{" "}
               <strong>{exPassed ?? 0}</strong>/{exTotalSteps ?? 0} passed
               {(exFailed ?? 0) > 0 && (
                 <>
                   {" · "}
                   <strong>{exFailed}</strong> failed
+                </>
+              )}
+              {(exInconclusive ?? 0) > 0 && (
+                <>
+                  {" · "}
+                  <strong>{exInconclusive}</strong> inconclusive
                 </>
               )}
               {(exBlocked ?? 0) > 0 && (

@@ -722,6 +722,10 @@ def execute_run(run_id: int) -> None:
             "total_steps": result.total_steps,
             "passed": result.passed,
             "failed": result.failed,
+            # Inconclusive is its own bucket — the run-progress card and
+            # report charts render it distinctly (orange) so users can
+            # tell "test case was unclear" from "the app failed".
+            "inconclusive": result.inconclusive,
             "skipped": result.skipped,
             "blocked": result.blocked,
             "duration_ms": result.duration_ms,

@@ -177,8 +177,12 @@ ACTION TOOLS (mutate the page):
 
 META TOOLS (terminate the loop):
 - mark_goal_complete(reasoning): the goal is verifiably achieved.
-  Only call this when AT LEAST ONE success criterion was checked
-  via verify() or extract_text() and clearly held.
+  HARD RULE — you MAY ONLY call this if your HISTORY contains at
+  least one successful verify() or extract_text() call that confirms
+  one of the SUCCESS CRITERIA. If you haven't verified anything yet,
+  call verify() FIRST, then mark_goal_complete on the next turn.
+  Don't claim a goal complete just because the page "looks right" —
+  verify the criteria explicitly.
 - mark_goal_failed(reasoning): the goal CANNOT be achieved here
   (page broken, feature missing, login expired). Different from
   the test being wrong — this is the APP failing.
@@ -188,6 +192,10 @@ RULES:
 - target_hint: a Playwright-resolvable hint. CSS selector, "text 'Sign In'",
   or "role=button[name='Sign In']". Prefer stable hints (data-testid,
   text, role) over fragile ones (nth-child).
+- If WHAT CHANGED SINCE LAST TURN says "PAGE UNCHANGED", your previous
+  action had NO visible effect. Do NOT repeat it. Try a fundamentally
+  different approach: dismiss_modal first, scroll, change selector,
+  use the screenshot if attached.
 - Don't repeat the same failing action 3 times — try a different approach.
 - If you've tried for many turns with no progress, mark_goal_failed.
 - Be concrete: copy product names, button labels VERBATIM from the
@@ -312,6 +320,62 @@ def _hash_observation(obs: dict[str, Any]) -> str:
     ]
     blob = obs.get("url", "") + "\n" + "\n".join(fingerprint)
     return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _diff_observations(
+    prev: dict[str, Any] | None, curr: dict[str, Any],
+) -> str:
+    """Build a 1-3 line diff that tells the agent what just changed.
+
+    Without this, the agent can't tell whether its last action made
+    progress — leading to the "click button → page didn't change → click
+    same button again" stall pattern. The diff highlights:
+
+    - URL changes (strongest signal of progress)
+    - Number of new / removed interactive elements
+    - Up to 3 example new elements (so the agent has something
+      concrete to act on next turn)
+
+    Returns empty string for the first turn (no prior observation).
+    """
+    if prev is None:
+        return ""
+
+    prev_url = prev.get("url", "")
+    curr_url = curr.get("url", "")
+
+    prev_keys = {
+        f"{i.get('role','')}::{(i.get('name','') or '')[:60]}"
+        for i in (prev.get("items") or [])
+    }
+    curr_items = curr.get("items") or []
+    curr_keys = {
+        f"{i.get('role','')}::{(i.get('name','') or '')[:60]}"
+        for i in curr_items
+    }
+    added_keys = curr_keys - prev_keys
+    removed_keys = prev_keys - curr_keys
+
+    parts: list[str] = []
+    if prev_url != curr_url:
+        parts.append(f"URL changed: {prev_url} → {curr_url}")
+    elif not added_keys and not removed_keys:
+        # The single most-useful diagnostic: page is unchanged. The
+        # agent should NOT repeat its last action.
+        parts.append(
+            "PAGE UNCHANGED since your last action — your last action "
+            "had no visible effect. Pick a DIFFERENT approach.",
+        )
+    else:
+        if added_keys:
+            sample = sorted(added_keys)[:3]
+            parts.append(
+                f"+{len(added_keys)} new element(s); examples: {sample}",
+            )
+        if removed_keys:
+            parts.append(f"-{len(removed_keys)} element(s) removed")
+
+    return "\n".join(parts)
 
 
 def _format_observation_for_prompt(obs: dict[str, Any], max_items: int = 60) -> str:
@@ -610,6 +674,11 @@ def run_agent_for_goal(
     total_output = 0
     llm_calls = 0
     vision_calls = 0
+    # Track previous observation so we can give the agent an explicit
+    # "what changed" diff each turn — by far the biggest cause of the
+    # "agent stalls clicking the same button" pattern is the agent not
+    # noticing the previous click did nothing.
+    prev_observation: dict[str, Any] | None = None
     # Vision-on-demand: when an action tool fails, we capture the page
     # screenshot and attach it to the NEXT turn's user message. This
     # gives the agent visual context (exact button labels, blocking
@@ -693,13 +762,22 @@ def run_agent_for_goal(
                 "the screenshot.\n"
             )
 
+        # Page-state diff — explicit "what changed" feedback so the
+        # agent doesn't repeat its last action when it had no effect.
+        diff_text = _diff_observations(prev_observation, observation)
+        diff_block = (
+            f"\nWHAT CHANGED SINCE LAST TURN:\n{diff_text}\n"
+            if diff_text else ""
+        )
+
         user_prompt = (
             f"TARGET SITE (the app under test): "
             f"{plan_target_url or '(none configured)'}\n"
             f"The browser was already navigated here at run-start; you "
             f"should normally NOT need to navigate again unless the goal "
             f"itself requires going elsewhere.\n"
-            f"{vision_note}\n"
+            f"{vision_note}"
+            f"{diff_block}\n"
             f"{_format_goal_for_prompt(goal)}\n\n"
             f"HISTORY (last few turns):\n{_format_history_for_prompt(turn_log)}\n\n"
             f"CURRENT OBSERVATION:\n{_format_observation_for_prompt(observation)}\n\n"
@@ -783,11 +861,34 @@ def run_agent_for_goal(
 
         # ── Meta tool branch: terminating decisions ───────────────
         if tool == "mark_goal_complete":
-            halt_reason = "complete"
-            final_status = "passed"
-            final_narration = (
-                reasoning or "Agent marked goal complete"
-            )[:500]
+            # Soft-guard: did the agent actually verify anything?
+            # Without a successful verify/extract_text in the log,
+            # "complete" is just optimism. We don't reject — the LLM
+            # can be right anyway — but we mark the row as
+            # ``inconclusive`` so the user sees it deserves review.
+            verified = any(
+                t.tool in ("verify", "extract_text") and t.status == "ok"
+                for t in turn_log
+            )
+            if not verified:
+                halt_reason = "complete"
+                final_status = "inconclusive"
+                final_narration = (
+                    "Agent marked complete WITHOUT any successful "
+                    "verify/extract_text — flagged inconclusive for "
+                    f"review. Reasoning: {reasoning[:300]}"
+                )
+                logger.info(
+                    "agent claimed complete on submodule %s without "
+                    "verification — downgrading to inconclusive",
+                    goal.submodule_id,
+                )
+            else:
+                halt_reason = "complete"
+                final_status = "passed"
+                final_narration = (
+                    reasoning or "Agent marked goal complete"
+                )[:500]
             turn_log.append(TurnRecord(
                 turn=turn_idx, tool=tool, args=args, reasoning=reasoning,
                 confidence=confidence, status="stop",
@@ -899,6 +1000,11 @@ def run_agent_for_goal(
             "error": rec.error_message,
             "vision_pending": pending_screenshot is not None,
         })
+
+        # Snapshot for next turn's diff. Only update at end of a
+        # successful loop iteration so the diff compares against the
+        # last "settled" page state, not a transient mid-action one.
+        prev_observation = observation
 
     else:
         # for-else: loop ran to max_turns without a break
@@ -1348,10 +1454,13 @@ def run_qa_agent_for_plan(
         plan_id=plan_id,
         total_steps=len(rows),
         passed=counts["passed"],
-        # Roll inconclusive into ``failed`` for the legacy summary so the
-        # cost meter / report card don't break; the per-row status is
-        # what the report drills into anyway.
-        failed=counts["failed"] + counts.get("inconclusive", 0),
+        failed=counts["failed"],
+        # Inconclusive is its own bucket — NOT failed. A halted-before-
+        # verification goal usually points at a test-case wording issue
+        # or a missing precondition, not an app bug. Surfacing it
+        # separately is what lets the report recommend "review the test"
+        # vs "file a bug".
+        inconclusive=counts.get("inconclusive", 0),
         skipped=counts["skipped"],
         blocked=counts["blocked"],
         duration_ms=duration_ms,

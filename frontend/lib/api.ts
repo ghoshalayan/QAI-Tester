@@ -414,6 +414,9 @@ export interface ReportSubmoduleRead {
   failed: number;
   blocked: number;
   skipped: number;
+  /** Agentic goals that halted before being verified — distinct
+   * from failed. */
+  inconclusive: number;
   pass_pct: number;
   fail_pct: number;
   issues: string[];
@@ -427,6 +430,7 @@ export interface ReportModuleRead {
   failed: number;
   blocked: number;
   skipped: number;
+  inconclusive: number;
   pass_pct: number;
   fail_pct: number;
   submodules: ReportSubmoduleRead[];
@@ -443,6 +447,7 @@ export interface ReportRunSummary {
   failed: number;
   blocked: number;
   skipped: number;
+  inconclusive: number;
   pass_pct: number;
   fail_pct: number;
   llm_input_tokens: number | null;

@@ -80,6 +80,12 @@ class ExecutionResult:
     skipped: int
     blocked: int
     duration_ms: int
+    # Set by the agentic runner (Phase C) when a goal halted before
+    # being verified — distinct from ``failed`` (the test ran and the
+    # assertion fired). Always 0 for scripted runs. Surfaces as its own
+    # bucket in the run summary card and reports — the user can see
+    # "test case might be wrong" vs "the app failed" at a glance.
+    inconclusive: int = 0
     # AI-assist token totals across every recovery + vision call in the
     # run. ``None`` when no AI calls were made (no LLM configured, or
     # ai_assist=False, or no step needed assist). The runner copies

@@ -271,7 +271,10 @@ function SubmoduleRow({ submodule: sub }: { submodule: ReportSubmoduleRead }) {
   // click to discover it.
   const hasAgenticRow = sub.steps.some((s) => s.mode === "agentic");
   const [expanded, setExpanded] = useState(
-    sub.failed > 0 || sub.blocked > 0 || hasAgenticRow,
+    sub.failed > 0 ||
+      sub.blocked > 0 ||
+      sub.inconclusive > 0 ||
+      hasAgenticRow,
   );
   const Caret = expanded ? ChevronDown : ChevronRight;
 

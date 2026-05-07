@@ -10,8 +10,13 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default: "bg-primary text-primary-foreground hover:bg-primary/90",
+        // Hardcoded ``text-white`` instead of ``text-destructive-foreground``.
+        // The shadcn light-theme defaults shipped with foreground == bg
+        // (both red), making the label invisible. The CSS-var fix in
+        // globals.css is also correct, but pinning the foreground here
+        // is bulletproof against future template regressions.
         destructive:
-          "bg-destructive text-destructive-foreground hover:bg-destructive/90",
+          "bg-destructive text-white hover:bg-destructive/90",
         outline:
           "border border-input bg-background hover:bg-accent hover:text-accent-foreground",
         secondary:

@@ -16,7 +16,7 @@ interface Props {
 }
 
 interface Slice {
-  key: "passed" | "failed" | "blocked" | "skipped";
+  key: "passed" | "failed" | "inconclusive" | "blocked" | "skipped";
   label: string;
   value: number;
   color: string;
@@ -25,6 +25,9 @@ interface Slice {
 const SLICE_COLORS: Record<Slice["key"], string> = {
   passed: "#22c55e",
   failed: "#ef4444",
+  // Orange — visually distinct from yellow (blocked) so users don't
+  // confuse "agent halted before verifying" with "needs HITL".
+  inconclusive: "#f97316",
   blocked: "#eab308",
   skipped: "#94a3b8",
 };
@@ -32,6 +35,7 @@ const SLICE_COLORS: Record<Slice["key"], string> = {
 const SLICE_LABELS: Record<Slice["key"], string> = {
   passed: "Passed",
   failed: "Failed",
+  inconclusive: "Inconclusive",
   blocked: "Blocked",
   skipped: "Skipped",
 };

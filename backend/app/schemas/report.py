@@ -85,6 +85,10 @@ class ReportSubmoduleRead(BaseModel):
     failed: int
     blocked: int
     skipped: int
+    # Agentic goals that halted before being verified — distinct from
+    # failed; usually points at a test-case wording issue, not an app
+    # bug. Default 0 for scripted runs / pre-Phase-C reports.
+    inconclusive: int = 0
     pass_pct: float = Field(..., ge=0.0, le=100.0)
     fail_pct: float = Field(..., ge=0.0, le=100.0)
     # Short distinct error excerpts (first 200 chars each, deduped).
@@ -102,6 +106,7 @@ class ReportModuleRead(BaseModel):
     failed: int
     blocked: int
     skipped: int
+    inconclusive: int = 0
     pass_pct: float = Field(..., ge=0.0, le=100.0)
     fail_pct: float = Field(..., ge=0.0, le=100.0)
     submodules: list[ReportSubmoduleRead] = Field(default_factory=list)
@@ -120,6 +125,7 @@ class ReportRunSummary(BaseModel):
     failed: int
     blocked: int
     skipped: int
+    inconclusive: int = 0
     pass_pct: float = Field(..., ge=0.0, le=100.0)
     fail_pct: float = Field(..., ge=0.0, le=100.0)
     # AI-assist cost meter

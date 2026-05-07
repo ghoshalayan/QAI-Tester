@@ -136,20 +136,19 @@ def _zero_counts() -> dict[str, int]:
         "failed": 0,
         "blocked": 0,
         "skipped": 0,
-        # Agentic-mode runs can produce ``inconclusive`` rows when a goal
-        # halts before being verified. We roll them into the report's
-        # ``failed`` bucket for the headline pass/fail charts (same as
-        # the legacy ExecutionResult does), but track them separately so
-        # the per-row status badge shows the truth.
+        # Agentic-mode runs produce ``inconclusive`` when a goal halts
+        # before being verified — distinct from ``failed`` (the test
+        # actually ran an assertion that fired). Tracked separately so
+        # the report can recommend "review the test wording" rather
+        # than "file a bug".
+        "inconclusive": 0,
     }
 
 
 def _accumulate(counts: dict[str, int], status: str) -> None:
     counts["total"] += 1
-    if status in ("passed", "failed", "blocked", "skipped"):
+    if status in ("passed", "failed", "blocked", "skipped", "inconclusive"):
         counts[status] += 1
-    elif status == "inconclusive":
-        counts["failed"] += 1
 
 
 def _pcts(counts: dict[str, int]) -> tuple[float, float]:
@@ -245,6 +244,7 @@ def build_run_report(
                     failed=payload["counts"]["failed"],
                     blocked=payload["counts"]["blocked"],
                     skipped=payload["counts"]["skipped"],
+                    inconclusive=payload["counts"].get("inconclusive", 0),
                     pass_pct=sub_pass,
                     fail_pct=sub_fail,
                     issues=list(payload["issues"]),
@@ -260,6 +260,7 @@ def build_run_report(
                 failed=mod_counts["failed"],
                 blocked=mod_counts["blocked"],
                 skipped=mod_counts["skipped"],
+                inconclusive=mod_counts.get("inconclusive", 0),
                 pass_pct=mod_pass,
                 fail_pct=mod_fail,
                 submodules=submodules,
@@ -280,6 +281,7 @@ def build_run_report(
         failed=run_counts["failed"],
         blocked=run_counts["blocked"],
         skipped=run_counts["skipped"],
+        inconclusive=run_counts.get("inconclusive", 0),
         pass_pct=run_pass,
         fail_pct=run_fail,
         llm_input_tokens=output.get("llm_input_tokens")
@@ -344,6 +346,7 @@ def build_excel_workbook(report: ReportRead) -> bytes:
         ("Total steps", report.run.total_steps),
         ("Passed", report.run.passed),
         ("Failed", report.run.failed),
+        ("Inconclusive", report.run.inconclusive),
         ("Blocked", report.run.blocked),
         ("Skipped", report.run.skipped),
         ("Pass %", report.run.pass_pct),

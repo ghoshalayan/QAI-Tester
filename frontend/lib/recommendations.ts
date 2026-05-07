@@ -174,9 +174,37 @@ export function buildRecommendations(report: ReportRead): Recommendation[] {
     });
   }
 
+  // ── Inconclusive surface — different recommendation than failed ──
+  // Halted-before-verification usually means the test case wording
+  // was unclear or the agent got stuck on a UI it couldn't read.
+  // Telling the user to "fix the bug" would be wrong; they should
+  // tighten the test case's success criteria first.
+  if (r.inconclusive > 0) {
+    out.push({
+      id: "inconclusive-cases",
+      severity: "warn",
+      title: `${r.inconclusive} test case${
+        r.inconclusive === 1 ? "" : "s"
+      } inconclusive`,
+      body:
+        `The agent halted before verifying ${
+          r.inconclusive === 1 ? "this goal" : "these goals"
+        }. ` +
+        "This is usually a TEST-CASE problem (vague success criteria, " +
+        "missing precondition, ambiguous step) — not necessarily an app " +
+        "bug. Open the timeline, read the agent's last few turns, and " +
+        "tighten the success criteria or hint targets accordingly.",
+    });
+  }
+
   // ── Positive recognition ───────────────────────────────────────
 
-  if (r.failed === 0 && r.blocked === 0 && r.total_steps > 0) {
+  if (
+    r.failed === 0 &&
+    r.blocked === 0 &&
+    r.inconclusive === 0 &&
+    r.total_steps > 0
+  ) {
     const adjective =
       r.total_steps >= 20 ? "comprehensive " : r.total_steps >= 10 ? "solid " : "";
     out.push({
