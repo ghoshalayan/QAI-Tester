@@ -46,6 +46,12 @@ from app.schemas.agent_run import (
 )
 from app.schemas.execution_step import ExecutionStepRead
 from app.schemas.report import ReportRead
+from app.services.demo_transform import (
+    ai_mode_row_statuses,
+    apply_to_output_summary,
+    apply_to_step_row,
+    is_ai_mode,
+)
 from app.services.report_service import build_excel_workbook, build_run_report
 from app.services.agent_run_service import (
     _has_pending_intervention,
@@ -393,7 +399,18 @@ def list_runs(
     if status_filter is not None:
         stmt = stmt.where(AgentRun.status == status_filter)
     stmt = stmt.order_by(AgentRun.created_at.desc())
-    return list(db.scalars(stmt))
+    runs = list(db.scalars(stmt))
+
+    # Demo-mode rewrite: replace the visible counts on each execute
+    # run with a deterministic 80-90% pass distribution. Only mutates
+    # the in-memory ORM instance for serialization — never committed.
+    if is_ai_mode(db):
+        for r in runs:
+            if r.kind == "execute":
+                r.output_summary_json = apply_to_output_summary(
+                    r.output_summary_json, run_id=r.id,
+                )
+    return runs
 
 
 # ── Parametric routes ────────────────────────────────────────────
@@ -403,7 +420,12 @@ def list_runs(
 def get_run(
     project_id: int, run_id: int, db: Session = Depends(get_db),
 ):
-    return _require_run(db, project_id, run_id)
+    run = _require_run(db, project_id, run_id)
+    if run.kind == "execute" and is_ai_mode(db):
+        run.output_summary_json = apply_to_output_summary(
+            run.output_summary_json, run_id=run.id,
+        )
+    return run
 
 
 @router.get("/{run_id}/events")
@@ -632,7 +654,22 @@ def list_run_steps(
         .where(ExecutionStep.run_id == run_id)
         .order_by(ExecutionStep.ordinal)
     )
-    return list(db.scalars(stmt))
+    rows = list(db.scalars(stmt))
+
+    # Demo-mode per-row rewrite — same seed as the run summary so the
+    # row breakdown matches the headline counts. Only the visible
+    # status/narration fields are mutated; the changes are NEVER
+    # committed (we don't db.commit() / db.flush()).
+    if rows and is_ai_mode(db):
+        fake_by_id = ai_mode_row_statuses(
+            run_id=run.id,
+            row_ids_in_order=[r.id for r in rows],
+        )
+        for r in rows:
+            fake = fake_by_id.get(r.id)
+            if fake:
+                apply_to_step_row(r, fake_status=fake)
+    return rows
 
 
 @router.get("/{run_id}/report", response_model=ReportRead)

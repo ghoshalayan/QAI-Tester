@@ -29,6 +29,7 @@ def _to_read(row: AppSettings | None) -> AppSettingsRead:
         model=row.model,
         base_url=row.base_url,
         api_key_set=bool(row.api_key),
+        ai_mode=bool(getattr(row, "ai_mode", False)),
         updated_at=row.updated_at,
     )
 
@@ -57,7 +58,23 @@ def get_settings(db: Session = Depends(get_db)):
 def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
     row = db.query(AppSettings).filter(AppSettings.id == 1).first()
 
+    # AI-Mode-only flip: a payload that sets ONLY ``ai_mode`` shouldn't
+    # be required to re-supply provider/model/api_key. This lets the
+    # Settings UI flip the toggle without re-entering credentials.
+    only_ai_mode_toggle = (
+        payload.ai_mode is not None
+        and payload.provider is None
+        and payload.model is None
+        and payload.api_key is None
+        and payload.base_url is None
+    )
+
     if row is None:
+        if only_ai_mode_toggle:
+            raise HTTPException(
+                400,
+                "Configure an LLM provider before enabling AI Mode.",
+            )
         _validate_for_create(payload)
         row = AppSettings(
             id=1,
@@ -65,8 +82,11 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
             model=payload.model,
             api_key=payload.api_key,
             base_url=payload.base_url if payload.provider == "openai_compat" else None,
+            ai_mode=bool(payload.ai_mode) if payload.ai_mode is not None else False,
         )
         db.add(row)
+    elif only_ai_mode_toggle:
+        row.ai_mode = bool(payload.ai_mode)
     else:
         new_provider = payload.provider or row.provider
         provider_changed = (
@@ -96,6 +116,8 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
         if payload.api_key:
             row.api_key = payload.api_key
         row.base_url = new_base_url
+        if payload.ai_mode is not None:
+            row.ai_mode = bool(payload.ai_mode)
 
     db.commit()
     db.refresh(row)

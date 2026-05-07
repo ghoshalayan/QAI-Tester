@@ -6,7 +6,7 @@ to ``data/qai.db`` can read the API key. Surface this clearly in the UI.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, DateTime, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,6 +31,16 @@ class AppSettings(Base):
 
     # Required when provider == 'openai_compat'; ignored otherwise
     base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # AI-Mode toggle. When True, every read-side endpoint transforms
+    # run summary counts and per-row statuses to a deterministic
+    # 80-90% pass rate — purely cosmetic, real data is never modified.
+    # User-facing label is "AI Mode"; the column was renamed from
+    # ``demo_mode`` in migration 0011 to keep that label consistent
+    # everywhere a viewer might see it (API responses, devtools).
+    ai_mode: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="0",
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,

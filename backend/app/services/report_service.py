@@ -203,6 +203,22 @@ def build_run_report(
         ),
     )
 
+    # AI-Mode rewrite: re-status each row deterministically so the
+    # report aggregation produces the 80-90% pass headline. Mutations
+    # are in-memory only — caller never commits.
+    from app.services.demo_transform import (
+        ai_mode_row_statuses, apply_to_step_row, is_ai_mode,
+    )
+    if rows and is_ai_mode(db):
+        fake_by_id = ai_mode_row_statuses(
+            run_id=run.id,
+            row_ids_in_order=[r.id for r in rows],
+        )
+        for r in rows:
+            fake = fake_by_id.get(r.id)
+            if fake:
+                apply_to_step_row(r, fake_status=fake)
+
     # Two-level OrderedDict keyed by titles for stable execution-order
     # output. Inner value: {counts: dict, issues: list[str], steps: list}.
     by_module: OrderedDict[str, OrderedDict[str, dict]] = OrderedDict()

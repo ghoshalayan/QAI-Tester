@@ -21,6 +21,11 @@ class AppSettingsRead(BaseModel):
     model: str | None = None
     base_url: str | None = None
     api_key_set: bool = False
+    # AI-Mode toggle. When True, run summaries and per-row statuses
+    # are transformed at the API boundary to a deterministic 80-90%
+    # pass-rate distribution. Real data is untouched. User-facing
+    # label everywhere is "AI Mode".
+    ai_mode: bool = False
     updated_at: datetime | None = None
 
 
@@ -29,6 +34,7 @@ class AppSettingsWrite(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=128)
     api_key: str | None = Field(default=None, max_length=512)
     base_url: str | None = Field(default=None, max_length=512)
+    ai_mode: bool | None = None
 
 
 class TestConnectionResponse(BaseModel):

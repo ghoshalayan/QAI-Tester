@@ -48,6 +48,10 @@ export interface Settings {
   model: string | null;
   base_url: string | null;
   api_key_set: boolean;
+  /** AI Mode toggle. When true, run summaries and per-row statuses
+   * are transformed at the API boundary to a deterministic 80-90%
+   * pass-rate distribution. Real data is untouched. */
+  ai_mode: boolean;
   updated_at: string | null;
 }
 
@@ -56,6 +60,7 @@ export interface SettingsWrite {
   model?: string;
   api_key?: string;
   base_url?: string;
+  ai_mode?: boolean;
 }
 
 export interface TestConnectionResult {

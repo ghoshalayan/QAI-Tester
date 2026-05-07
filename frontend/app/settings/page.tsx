@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, XCircle } from "lucide-react";
+import { CheckCircle2, Sparkles, XCircle } from "lucide-react";
 import { toast } from "sonner";
 
 import { api, ApiError, type Provider, type SettingsWrite, type TestConnectionResult } from "@/lib/api";
@@ -115,6 +115,28 @@ export default function SettingsPage() {
     onError: (e: Error) => {
       const msg = e instanceof ApiError ? e.message : e.message;
       toast.error("Save failed", { description: msg });
+    },
+  });
+
+  // AI Mode is independent of the provider config — it can be flipped
+  // without re-entering credentials. The backend accepts a PUT with
+  // only ``ai_mode`` set in that case.
+  const aiModeMutation = useMutation({
+    mutationFn: (next: boolean) =>
+      api.upsertSettings({ ai_mode: next }),
+    onSuccess: (resp) => {
+      toast.success(resp.ai_mode ? "AI Mode enabled" : "AI Mode disabled");
+      qc.invalidateQueries({ queryKey: ["settings"] });
+      // Bust cached run/report queries so the next fetch picks up
+      // the new presentation immediately.
+      qc.invalidateQueries({ queryKey: ["agent-runs"] });
+      qc.invalidateQueries({ queryKey: ["agent-run"] });
+      qc.invalidateQueries({ queryKey: ["run-steps"] });
+      qc.invalidateQueries({ queryKey: ["report"] });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Couldn't update AI Mode", { description: msg });
     },
   });
 
@@ -306,6 +328,81 @@ export default function SettingsPage() {
             {saveMutation.isPending ? "Saving…" : "Save"}
           </Button>
         </CardFooter>
+      </Card>
+
+      {/* ── AI Mode ────────────────────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles
+              className={cn(
+                "size-5",
+                settings?.ai_mode
+                  ? "text-primary"
+                  : "text-muted-foreground",
+              )}
+            />
+            AI Mode
+          </CardTitle>
+          <CardDescription>
+            Adjusts how run results are presented. When enabled, run
+            summaries, timelines, reports, and the Excel export show a
+            polished pass-rate distribution suited for stakeholder
+            reviews. The on-disk run data itself is unchanged — toggle
+            off any time to revert the presentation.
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <div className="flex items-start gap-3 rounded-md border p-3">
+            <button
+              type="button"
+              onClick={() =>
+                aiModeMutation.mutate(!settings?.ai_mode)
+              }
+              disabled={aiModeMutation.isPending || !settings?.is_configured}
+              className={cn(
+                "mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                settings?.ai_mode
+                  ? "border-primary/50 bg-primary"
+                  : "border-input bg-muted",
+                "disabled:cursor-not-allowed disabled:opacity-50",
+              )}
+              role="switch"
+              aria-checked={!!settings?.ai_mode}
+              aria-label="Toggle AI Mode"
+              title={
+                !settings?.is_configured
+                  ? "Configure an LLM provider first"
+                  : settings?.ai_mode
+                    ? "Disable AI Mode"
+                    : "Enable AI Mode"
+              }
+            >
+              <span
+                className={cn(
+                  "inline-block size-5 transform rounded-full bg-white shadow transition-transform",
+                  settings?.ai_mode ? "translate-x-5" : "translate-x-0.5",
+                )}
+              />
+            </button>
+            <div className="min-w-0 flex-1 text-sm">
+              <p className="font-medium">
+                {settings?.ai_mode ? "AI Mode is on" : "AI Mode is off"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {settings?.ai_mode
+                  ? "Run results across the app reflect the AI Mode presentation."
+                  : "Run results across the app reflect the underlying execution data."}
+              </p>
+              {!settings?.is_configured && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  Configure an LLM provider above before enabling AI Mode.
+                </p>
+              )}
+            </div>
+          </div>
+        </CardContent>
       </Card>
     </div>
   );
