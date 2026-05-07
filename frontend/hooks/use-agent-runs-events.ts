@@ -325,6 +325,9 @@ export function useAgentRunsEvents(projectId: number) {
       // Phase A4.1b: vision-guided target search
       "agent_searching",
       "agent_search_completed",
+      // Coordinate-click last-resort fallback (Operator pattern)
+      "coordinate_click_proposed",
+      "coordinate_click_completed",
       // Phase A4.1a / A4.1c: vision verification + mid-flow check
       "agent_verifying",
       "agent_verified",

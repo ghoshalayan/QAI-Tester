@@ -1946,6 +1946,131 @@ def run_agent_for_goal(
                     f"{search_result.get('halted')}"
                 )
 
+                # ── LAST-RESORT: pixel-coordinate click ───────────
+                # Operator / Computer-Use pattern. When the DOM
+                # chain is exhausted (literal → fuzzy → vision-
+                # guided search) and the agent still can't reach
+                # the target, ask the vision LLM for raw pixel
+                # coordinates and click them directly via
+                # page.mouse.click(). Bypasses the DOM entirely —
+                # the only fallback that works for canvas-rendered
+                # widgets, sealed shadow DOM, cross-origin iframes
+                # and similar elements that selectors physically
+                # can't reach.
+                # Only fires for click/type (the actions where
+                # coordinate-based dispatch is meaningful).
+                if (
+                    tool in ("click", "type")
+                    and args.get("target_hint")
+                ):
+                    try:
+                        from app.agents.page_intel import (  # noqa: PLC0415
+                            propose_click_coordinates,
+                        )
+                        coords = propose_click_coordinates(
+                            provider, page,
+                            target_hint=str(args.get("target_hint", "")),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "coordinate-click LLM call failed: %s", e,
+                        )
+                        coords = None
+
+                    if coords is not None:
+                        if isinstance(coords.input_tokens, int):
+                            total_input += coords.input_tokens
+                        if isinstance(coords.output_tokens, int):
+                            total_output += coords.output_tokens
+                        llm_calls += 1
+                        vision_calls += 1
+
+                        coord_record: dict[str, Any] = {
+                            "x": coords.x,
+                            "y": coords.y,
+                            "label_visible": coords.label_visible,
+                            "reasoning": coords.reasoning[:300],
+                            "confidence": coords.confidence,
+                            "tool": tool,
+                            "applied": False,
+                        }
+
+                        _emit(emit_event, "coordinate_click_proposed", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "x": coords.x,
+                            "y": coords.y,
+                            "label_visible": coords.label_visible[:120],
+                            "confidence": coords.confidence,
+                        })
+
+                        # Confidence gate — below 0.6 the LLM said
+                        # it's guessing. Don't click random pixels.
+                        if coords.confidence >= 0.6:
+                            try:
+                                page.mouse.click(coords.x, coords.y)
+                                # If this was meant to be a 'type'
+                                # action, send the value to the
+                                # newly-focused element.
+                                if tool == "type" and args.get("value"):
+                                    typed_value = str(args.get("value", ""))
+                                    delay = (
+                                        speed_config.type_delay_ms
+                                        if hasattr(speed_config, "type_delay_ms")
+                                        else 0
+                                    )
+                                    if delay > 0:
+                                        page.keyboard.type(
+                                            typed_value, delay=delay,
+                                        )
+                                    else:
+                                        page.keyboard.type(typed_value)
+                                coord_record["applied"] = True
+                                outcome = {
+                                    "status": "ok",
+                                    "narration": (
+                                        f"COORDINATE {tool.upper()} at "
+                                        f"({coords.x}, {coords.y}) on "
+                                        f"{coords.label_visible[:80]!r} "
+                                        f"(confidence "
+                                        f"{coords.confidence:.2f}). "
+                                        f"DOM resolution failed; vision "
+                                        f"LLM pointed at pixels."
+                                    ),
+                                    "error_message": None,
+                                    "extracted_text": "",
+                                    "search_log": {
+                                        **search_result,
+                                        "coordinate_click": coord_record,
+                                    },
+                                }
+                            except Exception as e:
+                                coord_record["dispatched_error"] = (
+                                    f"{type(e).__name__}: {e}"
+                                )
+                                outcome["search_log"] = {
+                                    **search_result,
+                                    "coordinate_click": coord_record,
+                                }
+                        else:
+                            # Low-confidence — record but don't act.
+                            outcome["search_log"] = {
+                                **search_result,
+                                "coordinate_click": coord_record,
+                            }
+                            outcome["narration"] = (
+                                f"{outcome.get('narration') or tool}"
+                                f" — coord click skipped: confidence "
+                                f"{coords.confidence:.2f} < 0.60"
+                            )
+
+                        _emit(emit_event, "coordinate_click_completed", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "applied": coord_record["applied"],
+                            "status": outcome["status"],
+                        })
+
         # Update banner phase to reflect outcome
         phase = (
             "did" if outcome["status"] == "ok"

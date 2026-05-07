@@ -519,6 +519,57 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+  if (type === "coordinate_click_proposed") {
+    const conf =
+      typeof data.confidence === "number" ? data.confidence : 0;
+    const okConf = conf >= 0.6;
+    return (
+      <Row
+        icon={
+          okConf ? (
+            <Bot className="size-3.5 text-purple-500" />
+          ) : (
+            <AlertTriangle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={
+          okConf
+            ? `coord click proposed (${Math.round(conf * 100)}%)`
+            : `coord click low-conf (${Math.round(conf * 100)}%)`
+        }
+        title={data.label_visible as string | undefined}
+        sublabel={
+          typeof data.x === "number" && typeof data.y === "number"
+            ? `at (${data.x}, ${data.y})`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "coordinate_click_completed") {
+    const applied = !!data.applied;
+    const okStatus = data.status === "ok";
+    return (
+      <Row
+        icon={
+          applied && okStatus ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : applied ? (
+            <XCircle className="size-3.5 text-red-500" />
+          ) : (
+            <AlertTriangle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={
+          applied
+            ? okStatus
+              ? "coord click ✓"
+              : "coord click failed"
+            : "coord click skipped"
+        }
+      />
+    );
+  }
   if (type === "frozen_path_captured") {
     return (
       <Row

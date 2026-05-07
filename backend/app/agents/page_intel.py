@@ -1080,3 +1080,174 @@ def check_on_track(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
+
+
+# ── Last-resort: pixel-coordinate click (Operator / Computer-Use pattern) ──
+
+
+@dataclass
+class CoordinateClick:
+    """Vision LLM's pixel-level pointing for an unresolvable target.
+
+    When DOM-based resolution exhausts every layer (literal selectors,
+    fuzzy AX-tree match, vision-guided scroll/drill/dismiss/navigate)
+    and the agent still can't find the target, we ask the vision LLM
+    to point at PIXEL COORDINATES. The orchestrator then dispatches
+    the click via ``page.mouse.click(x, y)`` directly, bypassing the
+    DOM entirely.
+
+    This is the same pattern OpenAI Operator and Anthropic Computer
+    Use are built on. It works for the elements DOM can't reach:
+    canvas-rendered controls, custom widgets in shadow DOM that hides
+    selectors, embedded apps in cross-origin iframes, etc.
+    """
+
+    x: int
+    y: int
+    label_visible: str   # what the LLM saw at that location
+    reasoning: str
+    confidence: float
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+COORDINATE_CLICK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "x": {"type": "integer"},
+        "y": {"type": "integer"},
+        "label_visible": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["x", "y", "label_visible", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+
+COORDINATE_CLICK_SYSTEM_PROMPT = """You point at a target element with PIXEL COORDINATES so an automation agent can click it directly without using the DOM.
+
+The agent's DOM-based resolver couldn't find this target through any
+selector strategy (literal CSS, text match, role+name, fuzzy match,
+vision-guided scroll/navigate/drill). But you can SEE the element
+in the screenshot. Look at the image and return the (x, y) pixel
+coordinate where a click would land on the target.
+
+Rules:
+- The image is the actual screenshot of the visible viewport. Origin
+  is the TOP-LEFT corner; X grows rightward, Y grows downward. Pixel
+  units, integer values.
+- Pick the CENTER of the target's clickable area, not its edge.
+- ``label_visible``: quote what you see at that location verbatim
+  (e.g. "Add to cart button - black bg, white text, top-right of
+  product card"). Be specific so the orchestrator can log a useful
+  audit trail.
+- ``confidence`` 0.0-1.0:
+  * 0.9+ — you can clearly see the exact target.
+  * 0.7-0.9 — you see something that's almost certainly it.
+  * 0.5-0.7 — you see a candidate but it's ambiguous.
+  * < 0.5 — you're guessing. The orchestrator skips clicks below 0.6.
+- If you can't see the target in the visible region: x=0, y=0,
+  confidence=0.0, label_visible="(not visible)".
+- If the target is offscreen but you can see a scrollbar or "more"
+  affordance: still return confidence=0.0 — the agent already had a
+  chance to scroll. Don't try to point at something you can't see.
+
+Output JSON only.
+"""
+
+
+def propose_click_coordinates(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    target_hint: str,
+    near_misses: list[dict[str, Any]] | None = None,
+) -> CoordinateClick:
+    """Vision LLM call: point at pixel coordinates for a target the DOM
+    chain couldn't resolve.
+
+    Caller dispatches the click via ``page.mouse.click(x, y)``. This
+    is the LAST resort — only fires when fuzzy + vision-guided search
+    have both already exhausted.
+
+    Raises:
+        RuntimeError: provider lacks vision OR LLM call fails OR
+            response shape is malformed.
+    """
+    if not getattr(provider, "supports_vision", False):
+        raise RuntimeError(
+            "propose_click_coordinates requires a vision-capable provider; "
+            f"{type(provider).__name__} reports supports_vision=False",
+        )
+
+    try:
+        screenshot = page.screenshot(full_page=False)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to capture screenshot for coordinate click: "
+            f"{type(e).__name__}: {e}",
+        ) from e
+
+    near_text = ""
+    if near_misses:
+        nm_lines = "\n".join(
+            f"  - {nm.get('role') or '?'}: "
+            f"{(nm.get('name') or '')[:80]!r} (score {nm.get('score')})"
+            for nm in near_misses[:3]
+        )
+        near_text = (
+            f"\nNEAR-MISSES (DOM resolver scored these but they "
+            f"weren't the target):\n{nm_lines}\n"
+        )
+
+    user_prompt = (
+        f"TARGET (the agent's hint that the DOM resolver could not "
+        f"reach):\n  {target_hint!r}\n"
+        f"{near_text}\n"
+        f"PAGE URL: {_safe_url(page)}\n\n"
+        "Look at the screenshot. Return pixel coordinates for a "
+        "direct click on the target. If you cannot see the target, "
+        "set confidence to 0.0 and label_visible to '(not visible)'."
+    )
+
+    try:
+        result = provider.chat_structured(
+            messages=[
+                ChatMessage(
+                    role="system",
+                    content=COORDINATE_CLICK_SYSTEM_PROMPT,
+                ),
+                ChatMessage(
+                    role="user",
+                    content=user_prompt,
+                    image=screenshot,
+                ),
+            ],
+            schema=COORDINATE_CLICK_SCHEMA,
+            schema_name="coordinate_click",
+            temperature=0.1,
+            max_output_tokens=256,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for coordinate click: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"coordinate click returned unexpected shape: "
+            f"{type(parsed).__name__}",
+        )
+
+    return CoordinateClick(
+        x=int(parsed.get("x", 0) or 0),
+        y=int(parsed.get("y", 0) or 0),
+        label_visible=str(parsed.get("label_visible", "")),
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
