@@ -23,6 +23,10 @@ dependencies = [
     "python-multipart>=0.0.9",
     "playwright>=1.48.0",
     "openpyxl>=3.1.0",
+    "pillow>=10.0.0",
+    # Phase 3 — vault: Fernet encryption-at-rest + TOTP code generation
+    "cryptography>=43.0.0",
+    "pyotp>=2.9.0",
 ]
 
 [dependency-groups]

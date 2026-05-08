@@ -27,6 +27,18 @@ class AppSettings(Base):
 
     model: Mapped[str] = mapped_column(String(128), nullable=False)
 
+    # Phase 1 — provider tiering. When set, the LLM router tries this
+    # model first for cost-sensitive roles (screen classifier, popup
+    # classifier, on-track check, goal verifier, smart-pick, semantic
+    # verify) and escalates to ``model`` only on low-confidence /
+    # validation failure. NULL = no tiering — every call uses ``model``.
+    # Same provider as ``model`` (we don't support cross-provider
+    # tiers in v1; e.g. you can't run cheap=Gemini-Flash + strong=
+    # GPT-5).
+    cheap_model: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+    )
+
     api_key: Mapped[str] = mapped_column(String(512), nullable=False, default="")
 
     # Required when provider == 'openai_compat'; ignored otherwise

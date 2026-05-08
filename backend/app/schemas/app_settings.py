@@ -19,6 +19,8 @@ class AppSettingsRead(BaseModel):
     is_configured: bool = False
     provider: ProviderLiteral | None = None
     model: str | None = None
+    # Phase 1 — cheap-tier model. None / empty when tiering disabled.
+    cheap_model: str | None = None
     base_url: str | None = None
     api_key_set: bool = False
     # AI-Mode toggle. When True, run summaries and per-row statuses
@@ -32,6 +34,10 @@ class AppSettingsRead(BaseModel):
 class AppSettingsWrite(BaseModel):
     provider: ProviderLiteral | None = None
     model: str | None = Field(default=None, min_length=1, max_length=128)
+    # Phase 1 — cheap-tier model. Optional. Empty string means "clear
+    # / disable tiering". Validation: must NOT equal ``model`` (would
+    # be a no-op tier). Cross-field check lives in the router.
+    cheap_model: str | None = Field(default=None, max_length=128)
     api_key: str | None = Field(default=None, max_length=512)
     base_url: str | None = Field(default=None, max_length=512)
     ai_mode: bool | None = None

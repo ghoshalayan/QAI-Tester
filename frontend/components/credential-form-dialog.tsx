@@ -40,6 +40,8 @@ export function CredentialFormDialog({
   const [label, setLabel] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  // Phase 3 — TOTP seed (base32 OR otpauth:// URI). Empty = none.
+  const [totpSecret, setTotpSecret] = useState("");
   const [urlPattern, setUrlPattern] = useState("");
   const [usernameHint, setUsernameHint] = useState("");
   const [passwordHint, setPasswordHint] = useState("");
@@ -51,6 +53,7 @@ export function CredentialFormDialog({
     setLabel(credential?.label ?? "");
     setUsername(credential?.username ?? "");
     setPassword(""); // never pre-populate
+    setTotpSecret(""); // never pre-populate (server returns totp_set boolean only)
     setUrlPattern(credential?.url_pattern ?? "");
     setUsernameHint(credential?.username_selector_hint ?? "");
     setPasswordHint(credential?.password_selector_hint ?? "");
@@ -64,6 +67,10 @@ export function CredentialFormDialog({
           label: label.trim(),
           username: username.trim(),
           password: password || undefined, // empty → keep existing
+          // Empty string = explicit "clear TOTP"; undefined = preserve.
+          // We only send the field when the user typed something OR
+          // explicitly cleared a previously-set seed via the toggle.
+          totp_secret: totpSecret.trim() ? totpSecret.trim() : undefined,
           url_pattern: urlPattern || undefined,
           username_selector_hint: usernameHint || undefined,
           password_selector_hint: passwordHint || undefined,
@@ -74,6 +81,7 @@ export function CredentialFormDialog({
         label: label.trim(),
         username: username.trim(),
         password,
+        totp_secret: totpSecret.trim() || undefined,
         url_pattern: urlPattern || undefined,
         username_selector_hint: usernameHint || undefined,
         password_selector_hint: passwordHint || undefined,
@@ -176,6 +184,41 @@ export function CredentialFormDialog({
               <p className="text-xs text-muted-foreground">
                 ✓ Password on file — leave empty to keep, or type a new one to
                 replace.
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cred-totp">
+              TOTP secret (optional — auto-generates 2FA codes)
+            </Label>
+            <Input
+              id="cred-totp"
+              type="password"
+              value={totpSecret}
+              onChange={(e) => setTotpSecret(e.target.value)}
+              placeholder={
+                credential?.totp_set
+                  ? "•••••••••••••••• (leave empty to keep)"
+                  : "JBSWY3DPEHPK3PXP  or  otpauth://totp/..."
+              }
+              autoComplete="off"
+              maxLength={512}
+            />
+            <p className="text-xs text-muted-foreground">
+              Paste a base32 seed or full <code>otpauth://</code> URI from
+              the QR code provisioning page. When set, the agent
+              generates 2FA codes automatically and never prompts you for
+              an OTP. Leave empty when the site uses SMS / email / push
+              2FA — those will fall back to a HITL prompt during the run.
+              <br />
+              Stored encrypted at rest with the same vault key as the
+              password — same security posture.
+            </p>
+            {credential?.totp_set && (
+              <p className="text-xs text-emerald-600 dark:text-emerald-400">
+                ✓ TOTP secret on file — leave empty to keep, or paste a new
+                one to replace.
               </p>
             )}
           </div>

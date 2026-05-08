@@ -92,6 +92,18 @@ class ExecuteRunRequest(BaseModel):
     #   for self-healing when a frozen step misses. Submodules
     #   without a frozen path fall through to agentic.
     mode: Literal["scripted", "agentic", "replay"] = Field(default="scripted")
+    # Phase 6 — within ``mode='agentic'``, choose the action strategy:
+    # - ``hybrid`` (default): existing DOM-first ladder with vision
+    #   rescue. Cheaper & faster on most modern apps.
+    # - ``vision_only``: every click / type goes through VL + pixel
+    #   coordinates. DOM resolution bypassed entirely. ~3-5x more
+    #   vision tokens, but works on apps where DOM is hopeless
+    #   (heavy canvas, sealed shadow DOM, hostile rotating classes,
+    #   SAP GUI for HTML in legacy frames). Ignored when ``mode``
+    #   isn't ``agentic``.
+    agent_strategy: Literal["hybrid", "vision_only"] = Field(
+        default="hybrid",
+    )
 
     # Window geometry — set by the frontend from ``window.screen`` so the
     # headed Chromium tiles to fit the user's monitor and leaves the
@@ -115,6 +127,15 @@ class InterventionRequest(BaseModel):
       AI's suggested target_hint, optionally edited inline in the modal).
     - ``skip`` — leave the step ``failed`` and continue to the next sibling.
     - ``stop`` — cancel the entire run.
+    - ``provide_text`` — Phase 4 / auth flow. Submitting an OTP, a
+      manually-typed credential, a captcha solution, etc. ``text_value``
+      carries the value; ``text_kind`` describes what kind of input it
+      is (so the agent's auth flow knows how to use it). The agent's
+      pending wait unblocks with the typed string and resumes the loop.
+    - ``manual_solved`` — Phase 4. User clicks "I solved it in the
+      browser, continue" for captcha / passkey / device-prompt cases
+      where the value can't be typed. The agent retries the action
+      that was blocked.
 
     ``override_target_hint`` / ``override_action_type`` apply only to
     ``use_suggestion``. Empty / null means "don't override that field".
@@ -125,10 +146,23 @@ class InterventionRequest(BaseModel):
     """
 
     step_id: int = Field(..., gt=0)
-    choice: Literal["retry", "use_suggestion", "skip", "stop"]
+    choice: Literal[
+        "retry", "use_suggestion", "skip", "stop",
+        "provide_text", "manual_solved",
+    ]
     override_target_hint: str | None = Field(default=None, max_length=2048)
     override_action_type: str | None = Field(default=None, max_length=64)
     apply_to_submodule: bool = Field(default=False)
+    # Phase 4 — typed HITL input.
+    text_value: str | None = Field(default=None, max_length=512)
+    # What kind of value ``text_value`` carries — agent's auth flow
+    # branches on this. ``otp_code``, ``username``, ``password``,
+    # ``captcha_text``, ``free_text``.
+    text_kind: str | None = Field(default=None, max_length=32)
+    # Optional second value for paired prompts (username + password
+    # asked together when both are missing). Same encoding rules as
+    # text_value.
+    text_value_secondary: str | None = Field(default=None, max_length=512)
 
 
 # ── Responses ─────────────────────────────────────────────────────

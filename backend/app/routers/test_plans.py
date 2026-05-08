@@ -84,12 +84,25 @@ def _require_credential(
 
 
 def _to_credential_read(c: TestPlanCredential) -> CredentialRead:
+    # Phase 3 — decrypt the username for display ONLY (password &
+    # TOTP secret are never echoed). When decryption fails (key
+    # drift, corrupt row), surface a placeholder so the UI doesn't
+    # crash — user can re-enter to fix.
+    username_display = c.username or ""
+    if getattr(c, "encrypted", False) and c.username:
+        try:
+            from app.security.vault import decrypt_str  # noqa: PLC0415
+
+            username_display = decrypt_str(c.username)
+        except Exception:
+            username_display = "(decryption failed — re-enter)"
     return CredentialRead(
         id=c.id,
         plan_id=c.plan_id,
         label=c.label,
-        username=c.username,
+        username=username_display,
         password_set=bool(c.password),
+        totp_set=bool(getattr(c, "totp_secret", None)),
         url_pattern=c.url_pattern,
         username_selector_hint=c.username_selector_hint,
         password_selector_hint=c.password_selector_hint,
@@ -379,11 +392,24 @@ def create_credential(
     db: Session = Depends(get_db),
 ):
     plan = _require_plan(db, project_id, plan_id)
+    # Phase 3 — encrypt at write. Resolve the vault key (env var,
+    # then file, then auto-generate on first use) and Fernet-encrypt
+    # username / password / totp_secret. ``encrypted=True`` flags the
+    # row so the read path knows to decrypt.
+    from app.security.vault import encrypt_for_write  # noqa: PLC0415
+
+    enc_user, enc_pass, enc_totp = encrypt_for_write(
+        payload.username,
+        payload.password,
+        getattr(payload, "totp_secret", None),
+    )
     cred = TestPlanCredential(
         plan_id=plan.id,
         label=payload.label.strip(),
-        username=payload.username,
-        password=payload.password,
+        username=enc_user,
+        password=enc_pass,
+        totp_secret=enc_totp,
+        encrypted=True,
         url_pattern=payload.url_pattern,
         username_selector_hint=payload.username_selector_hint,
         password_selector_hint=payload.password_selector_hint,
@@ -408,13 +434,34 @@ def update_credential(
 ):
     cred = _require_credential(db, project_id, plan_id, cred_id)
 
+    # Phase 3 — partial update with re-encrypt. Each field that
+    # changes goes back through the vault. Existing fields stay
+    # in their current encryption state (legacy plaintext rows
+    # remain plaintext on a label-only update — they migrate to
+    # encrypted form only when the user re-enters credentials).
+    from app.security.vault import encrypt_str  # noqa: PLC0415
+
     if payload.label is not None:
         cred.label = payload.label.strip()
     if payload.username is not None:
-        cred.username = payload.username
+        cred.username = encrypt_str(payload.username)
+        cred.encrypted = True
     # Only replace password if a non-empty value is provided
     if payload.password is not None and payload.password.strip():
-        cred.password = payload.password
+        cred.password = encrypt_str(payload.password)
+        cred.encrypted = True
+    # TOTP secret update — empty string clears it.
+    if getattr(payload, "totp_secret", None) is not None:
+        from app.security.vault import (  # noqa: PLC0415
+            _normalize_totp_seed,
+        )
+        seed_raw = (payload.totp_secret or "").strip()
+        if seed_raw:
+            seed = _normalize_totp_seed(seed_raw)
+            cred.totp_secret = encrypt_str(seed) if seed else None
+            cred.encrypted = True
+        else:
+            cred.totp_secret = None
     if payload.url_pattern is not None:
         cred.url_pattern = payload.url_pattern or None
     if payload.username_selector_hint is not None:

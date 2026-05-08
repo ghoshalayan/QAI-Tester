@@ -337,6 +337,25 @@ export function useAgentRunsEvents(projectId: number) {
       "frozen_step_completed",
       "frozen_step_self_healing",
       "frozen_step_self_heal_completed",
+      // Phase 1: provider tiering — fired when the cheap tier hands
+      // off to strong on a low-confidence / invalid result.
+      "llm_escalated",
+      // Phase 14: smart candidate selection — DOM ↔ browser-use
+      // bridge picks the right element among many matches (skips
+      // sponsored ads, items missing prices, etc.).
+      "smart_pick_started",
+      "smart_pick_completed",
+      // Phase 9: semantic verify escalation
+      "semantic_verify_started",
+      "semantic_verify_completed",
+      // Phase 11: agent disputes a test step that's provably wrong
+      "test_case_disputed",
+      // Phase 10: popup/overlay classifier (required vs dismissable
+      // vs ad)
+      "popup_classified",
+      // Phase 4: typed HITL prompts (auth flow)
+      "hitl_prompt_opened",
+      "hitl_prompt_answered",
       // HITL + control
       "needs_intervention",
       "intervention_resolved",

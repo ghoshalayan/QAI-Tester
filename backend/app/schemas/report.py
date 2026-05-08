@@ -109,6 +109,23 @@ class ReportStepRead(BaseModel):
     # agent claimed completion. ``None`` if the agent didn't reach
     # mark_goal_complete.
     goal_verification: dict | None = None
+    # Phase 11 — test-case dispute. When the agent flagged the test
+    # step as provably wrong via ``flag_test_case_issue``, this dict
+    # carries ``{issue_kind, evidence, suggested_fix, turn}``.
+    # Submodule status is ``blocked`` in that case (not failed —
+    # failure means the APP is broken; this means the TEST is).
+    test_case_dispute: dict | None = None
+    # Phase 14 — smart candidate selection record. When the agent's
+    # target_hint matched 3+ visible elements and the vision LLM
+    # picked the right one (skipping sponsored ads, etc.), this dict
+    # carries ``{strategy, chosen_label, rejected_labels,
+    # rejection_reasons, confidence, reasoning}``.
+    smart_pick: dict | None = None
+    # Phase 9 — semantic verify escalation result. When a literal
+    # ``verify`` failed and the vision LLM escalation ruled, this
+    # dict carries ``{verdict, reasoning, confidence,
+    # visible_evidence}``.
+    semantic_verify: dict | None = None
 
 
 class ReportSubmoduleRead(BaseModel):

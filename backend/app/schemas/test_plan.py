@@ -17,6 +17,11 @@ class CredentialCreate(BaseModel):
     label: str = Field(..., min_length=1, max_length=64)
     username: str = Field(..., min_length=1, max_length=512)
     password: str = Field(..., min_length=1, max_length=512)
+    # Phase 3 — TOTP secret. Accepts a base32 seed OR an
+    # ``otpauth://...`` URI (the vault normalizes either form).
+    # Empty / missing means "no TOTP for this credential — OTP
+    # screens will fall back to HITL prompt".
+    totp_secret: str | None = Field(default=None, max_length=512)
     url_pattern: str | None = Field(default=None, max_length=2048)
     username_selector_hint: str | None = Field(default=None, max_length=512)
     password_selector_hint: str | None = Field(default=None, max_length=512)
@@ -33,6 +38,10 @@ class CredentialUpdate(BaseModel):
     label: str | None = Field(default=None, min_length=1, max_length=64)
     username: str | None = Field(default=None, min_length=1, max_length=512)
     password: str | None = Field(default=None, max_length=512)
+    # Phase 3 — TOTP secret. Empty string explicitly clears any
+    # stored seed (so the auth flow falls back to HITL). ``None``
+    # leaves the existing value untouched.
+    totp_secret: str | None = Field(default=None, max_length=512)
     url_pattern: str | None = Field(default=None, max_length=2048)
     username_selector_hint: str | None = Field(default=None, max_length=512)
     password_selector_hint: str | None = Field(default=None, max_length=512)
@@ -40,14 +49,19 @@ class CredentialUpdate(BaseModel):
 
 
 class CredentialRead(BaseModel):
-    """Read view — never echoes the password. The UI shows ``••••``
-    while ``password_set: true``."""
+    """Read view — never echoes the password OR the TOTP seed. The UI
+    shows ``••••`` while ``password_set: true`` (and likewise for
+    ``totp_set``)."""
 
     id: int
     plan_id: int
     label: str
     username: str
     password_set: bool
+    # Phase 3 — TOTP indicator. UI renders an "OTP via TOTP enabled"
+    # chip when true; agent will auto-generate codes from the
+    # encrypted seed without prompting HITL.
+    totp_set: bool = False
     url_pattern: str | None = None
     username_selector_hint: str | None = None
     password_selector_hint: str | None = None

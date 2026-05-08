@@ -75,6 +75,34 @@ def _check_cancel(
         raise AgentCancelled(f"Cancelled at: {where}")
 
 
+def _persist_self_heal_patches(
+    db: Session,
+    submodule: TcNode,
+    frozen: dict[str, Any],
+    steps: list[dict[str, Any]],
+    self_healed_steps: list[int],
+    submodule_run_id: int | None,
+) -> None:
+    """Write the in-memory ``steps`` (with self-heal patches applied)
+    back to ``tc_nodes.frozen_path`` so the next replay starts from the
+    healed prefix. No-op when nothing was healed.
+
+    Called from BOTH the success path AND the early-return failure
+    path — otherwise patches accumulated for steps 1..idx-1 are lost
+    when step idx fails, and the next run pays the self-heal cost
+    over again."""
+    if not self_healed_steps:
+        return
+    patched_frozen = dict(frozen)
+    patched_frozen["steps"] = steps
+    patched_frozen["self_healed_at_run_id"] = submodule_run_id
+    patched_frozen["self_healed_at"] = _utcnow().isoformat()
+    sm_row = db.get(TcNode, submodule.id)
+    if sm_row is not None:
+        sm_row.frozen_path = patched_frozen
+        db.commit()
+
+
 # ── Step dispatch ─────────────────────────────────────────────────
 
 
@@ -178,6 +206,62 @@ def _dispatch_frozen_step(
             "working_selector": None,
         }
 
+    if tool == "press_key":
+        # Phase 0.10 — keyboard primitive replay. Same key, same focus
+        # ordering as the agentic capture; the steps preceding this
+        # in the frozen path are responsible for putting focus on the
+        # right field (a click or a type), so we just dispatch the
+        # key here.
+        key = (args.get("key") or "").strip()
+        if not key:
+            return {
+                "status": "failed",
+                "narration": "press_key: missing 'key' arg in frozen step",
+                "error_message": "frozen press_key without key",
+                "working_selector": None,
+            }
+        try:
+            page.keyboard.press(key)
+        except Exception as e:
+            return {
+                "status": "failed",
+                "narration": f"press_key {key!r} dispatch failed",
+                "error_message": f"{type(e).__name__}: {e}",
+                "working_selector": None,
+            }
+        return {
+            "status": "ok",
+            "narration": f"replayed press_key {key!r}",
+            "error_message": None,
+            "working_selector": None,
+        }
+
+    if tool == "go_back":
+        try:
+            response = page.go_back(
+                wait_until="domcontentloaded", timeout=10_000,
+            )
+        except Exception as e:
+            return {
+                "status": "failed",
+                "narration": "go_back failed",
+                "error_message": f"{type(e).__name__}: {e}",
+                "working_selector": None,
+            }
+        if response is None:
+            return {
+                "status": "failed",
+                "narration": "go_back: history empty on replay",
+                "error_message": "no previous page in history",
+                "working_selector": None,
+            }
+        return {
+            "status": "ok",
+            "narration": f"replayed go_back to {page.url}",
+            "error_message": None,
+            "working_selector": None,
+        }
+
     if tool == "dismiss_modal":
         # Use the same heuristic candidates as qa_agent.
         candidates = [
@@ -235,6 +319,7 @@ def _dispatch_frozen_step(
                 "narration": f"extract_text: {target_hint!r} not visible",
                 "error_message": str(e),
                 "working_selector": target_hint,
+                "details": {"failure_kind": "selector_not_found"},
             }
         try:
             text = resolved.locator.inner_text(timeout=5000)
@@ -264,13 +349,35 @@ def _dispatch_frozen_step(
             "working_selector": target_hint,
         }
 
+    # Phase 0.10 — replay the type-and-submit pairing. When the
+    # frozen step recorded ``submit: true`` AND the type itself
+    # passed, fire Enter on the focused field so the form submits.
+    # Same logic as the agentic loop's _execute_tool_call so a
+    # frozen "type query and search" still replays as one step.
+    submit_after = bool(args.get("submit")) and tool == "type"
+    submit_warning: str | None = None
+    if submit_after and result.status == "passed":
+        try:
+            page.keyboard.press("Enter")
+        except Exception as e:
+            submit_warning = f"Enter dispatch failed: {type(e).__name__}: {e}"
+
+    base_narration = f"replayed {tool}: {result.narration}"
+    if submit_after and result.status == "passed":
+        base_narration = (
+            f"{base_narration}; pressed Enter to submit"
+            if submit_warning is None
+            else f"{base_narration}; submit-Enter softly failed ({submit_warning})"
+        )
+
     return {
         "status": "ok" if result.status == "passed" else (
             "blocked" if result.status == "blocked" else "failed"
         ),
-        "narration": f"replayed {tool}: {result.narration}",
+        "narration": base_narration,
         "error_message": result.error_message,
         "working_selector": target_hint,
+        "details": result.details,
     }
 
 
@@ -353,6 +460,7 @@ def _replay_submodule(
         # selector misses; not for other failure modes
         # (timeouts, dispatcher errors, etc.).
         healed = False
+        outcome_details = outcome.get("details") or {}
         if (
             outcome["status"] == "failed"
             and self_heal_enabled
@@ -360,7 +468,8 @@ def _replay_submodule(
             and provider is not None
             and step.get("tool") in ("click", "type", "select", "verify", "wait")
             and (
-                "not visible" in (outcome.get("narration") or "").lower()
+                outcome_details.get("failure_kind") == "selector_not_found"
+                or "not visible" in (outcome.get("narration") or "").lower()
                 or "no visible element" in (outcome.get("error_message") or "").lower()
             )
         ):
@@ -515,6 +624,13 @@ def _replay_submodule(
         # Replay halts on the first hard failure — a stable plan
         # shouldn't have one. Self-heal got its chance above.
         if outcome["status"] == "failed":
+            # Persist patches accumulated for steps 1..idx-1 even on
+            # failure so the next run's healed prefix doesn't pay the
+            # self-heal cost again. Only the failing step is lost.
+            _persist_self_heal_patches(
+                db, submodule, frozen, steps,
+                self_healed_steps, submodule_run_id,
+            )
             return {
                 "status": "failed",
                 "halt_reason": "frozen_step_failed",
@@ -533,15 +649,10 @@ def _replay_submodule(
 
     # All steps passed — persist any self-heal patches back to the
     # submodule so future runs use the patched selectors.
-    if self_healed_steps:
-        patched_frozen = dict(frozen)
-        patched_frozen["steps"] = steps
-        patched_frozen["self_healed_at_run_id"] = submodule_run_id
-        patched_frozen["self_healed_at"] = _utcnow().isoformat()
-        sm_row = db.get(TcNode, submodule.id)
-        if sm_row is not None:
-            sm_row.frozen_path = patched_frozen
-            db.commit()
+    _persist_self_heal_patches(
+        db, submodule, frozen, steps,
+        self_healed_steps, submodule_run_id,
+    )
 
     return {
         "status": "passed",

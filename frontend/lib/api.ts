@@ -46,6 +46,11 @@ export interface Settings {
   is_configured: boolean;
   provider: Provider | null;
   model: string | null;
+  /** Phase 1 — cheap-tier model. When set, vision helpers (search,
+   * on-track, goal-verify, smart-pick, semantic-verify) try this
+   * model first and escalate to ``model`` on low confidence.
+   * null/empty = no tiering. */
+  cheap_model: string | null;
   base_url: string | null;
   api_key_set: boolean;
   /** AI Mode toggle. When true, run summaries and per-row statuses
@@ -58,6 +63,8 @@ export interface Settings {
 export interface SettingsWrite {
   provider?: Provider;
   model?: string;
+  /** Phase 1 — cheap-tier model. Empty string clears tiering. */
+  cheap_model?: string;
   api_key?: string;
   base_url?: string;
   ai_mode?: boolean;
@@ -186,6 +193,9 @@ export interface CredentialRead {
   label: string;
   username: string;
   password_set: boolean;
+  /** Phase 3 — TOTP indicator. True when a TOTP seed is stored;
+   * agent will auto-generate codes without HITL. */
+  totp_set: boolean;
   url_pattern: string | null;
   username_selector_hint: string | null;
   password_selector_hint: string | null;
@@ -198,6 +208,8 @@ export interface CredentialCreate {
   label: string;
   username: string;
   password: string;
+  /** Phase 3 — base32 seed OR ``otpauth://`` URI. Vault normalizes. */
+  totp_secret?: string;
   url_pattern?: string;
   username_selector_hint?: string;
   password_selector_hint?: string;
@@ -209,6 +221,8 @@ export interface CredentialUpdate {
   username?: string;
   /** Empty string or omitted → keep existing password. */
   password?: string;
+  /** Empty string clears existing TOTP seed; null/undefined preserves. */
+  totp_secret?: string;
   url_pattern?: string;
   username_selector_hint?: string;
   password_selector_hint?: string;
@@ -341,6 +355,16 @@ export interface ExecuteRunRequest {
    *   path (captured on a previous successful agentic run).
    *   Submodules without a frozen path fall through to agentic. */
   mode?: "scripted" | "agentic" | "replay";
+  /** Phase 6 — within agentic mode, choose the action strategy.
+   * - ``hybrid`` (default): DOM-first ladder with vision rescue.
+   *   Faster + cheaper on most modern apps.
+   * - ``vision_only``: every click / type goes through VL + pixel
+   *   coordinates. Bypasses DOM resolution entirely. ~3-5x more
+   *   vision tokens but works on apps DOM resolution can't reach
+   *   (heavy canvas, sealed shadow DOM, hostile rotating classes,
+   *   SAP GUI for HTML in legacy frames).
+   * Ignored when mode isn't "agentic". */
+  agent_strategy?: "hybrid" | "vision_only";
   /** Headed Chromium window position + size, in screen pixels. The
    * frontend computes these from ``window.screen.availWidth/Height`` so
    * the browser tiles to the left and the live presenter popup fits on
@@ -357,7 +381,9 @@ export type InterventionChoice =
   | "retry"
   | "use_suggestion"
   | "skip"
-  | "stop";
+  | "stop"
+  | "provide_text"   // Phase 4 — typed HITL input
+  | "manual_solved"; // Phase 4 — captcha/passkey resume
 
 export interface InterventionPayload {
   step_id: number;
@@ -365,6 +391,22 @@ export interface InterventionPayload {
   override_target_hint?: string | null;
   override_action_type?: string | null;
   apply_to_submodule?: boolean;
+  /** Phase 4 — typed value (OTP code, captcha solve, manual cred). */
+  text_value?: string | null;
+  /** Kind tag — ``otp_code`` / ``username`` / ``password`` /
+   * ``captcha_text`` / ``free_text``. Auth flow branches on this. */
+  text_kind?: string | null;
+  /** Phase 4 — paired second value (e.g. password when text_value
+   * is the username). */
+  text_value_secondary?: string | null;
+}
+
+/** Phase 4 — open typed prompt fetched via GET /intervention/open. */
+export interface OpenPrompt {
+  open: boolean;
+  kind?: "request_text" | "request_credentials" | "await_manual_solve";
+  question?: string;
+  fields?: { name: string; label: string; type?: string }[];
 }
 
 /** Shape stored on ``execution_step.details_json["ai_correction"]`` and
@@ -446,6 +488,38 @@ export interface ReportStepRead {
     confidence: number | null;
     criteria_met: string[];
     criteria_missed: string[];
+  } | null;
+  /** Phase 11 — agent flagged the test step as provably wrong.
+   * Submodule status is ``blocked`` in that case. */
+  test_case_dispute: {
+    issue_kind:
+      | "wrong_selector"
+      | "missing_step"
+      | "impossible_action"
+      | "misleading_description"
+      | "precondition_failed"
+      | null;
+    evidence: string | null;
+    suggested_fix: string | null;
+    turn: number | null;
+  } | null;
+  /** Phase 14 — smart candidate selection result (ambiguous click
+   * disambiguated by vision LLM, skipping sponsored ads etc). */
+  smart_pick: {
+    strategy: "selector" | "coords" | "scroll" | "none" | null;
+    chosen_label: string | null;
+    rejected_labels: string[];
+    rejection_reasons: string[];
+    confidence: number | null;
+    reasoning: string | null;
+  } | null;
+  /** Phase 9 — semantic verify escalation. Vision LLM ruling on a
+   * literal verify that failed (cart wording mismatch, etc). */
+  semantic_verify: {
+    verdict: "pass" | "fail" | "inconclusive" | null;
+    reasoning: string | null;
+    confidence: number | null;
+    visible_evidence: string | null;
   } | null;
 }
 
@@ -967,6 +1041,11 @@ export const api = {
     apiFetch<AgentRunRead>(
       `/api/projects/${projectId}/agent-runs/${runId}/intervention`,
       { method: "POST", body: JSON.stringify(payload) },
+    ),
+  /** Phase 4 — fetch the open typed HITL prompt (if any) for a step. */
+  getOpenPrompt: (projectId: number, runId: number, stepId: number) =>
+    apiFetch<OpenPrompt>(
+      `/api/projects/${projectId}/agent-runs/${runId}/intervention/open?step_id=${stepId}`,
     ),
   getRunReport: (projectId: number, runId: number) =>
     apiFetch<ReportRead>(

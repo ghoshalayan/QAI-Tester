@@ -85,6 +85,13 @@ export function StartExecuteDialog({
   const [mode, setMode] = useState<"scripted" | "agentic" | "replay">(
     "scripted",
   );
+  // Phase 6 — within agentic mode, choose hybrid (DOM-first ladder)
+  // or vision_only (VL+coords for every click/type, computer-use
+  // pattern). hybrid is faster + cheaper on most apps; vision_only
+  // works on apps DOM resolution can't reach.
+  const [agentStrategy, setAgentStrategy] = useState<"hybrid" | "vision_only">(
+    "hybrid",
+  );
 
   useEffect(() => {
     if (open) {
@@ -94,6 +101,7 @@ export function StartExecuteDialog({
       setAutoAdjust(false);
       setPromoteFixes(false);
       setMode("scripted");
+      setAgentStrategy("hybrid");
     }
   }, [open, defaultPlanId]);
 
@@ -131,6 +139,7 @@ export function StartExecuteDialog({
         headless,
         speed,
         mode,
+        agent_strategy: agentStrategy,
         auto_adjust: autoAdjust,
         promote_fixes: promoteFixes,
         window_x: browserGeom?.x,
@@ -252,6 +261,15 @@ export function StartExecuteDialog({
                 rigid step-walker. Agentic is much smarter on flaky or
                 evolving pages but burns ~10× more LLM tokens. */}
             <ModePicker value={mode} onChange={setMode} />
+
+            {/* Phase 6 — Agentic strategy sub-toggle. Visible only when
+                Agentic mode is selected. */}
+            {mode === "agentic" && (
+              <AgentStrategyPicker
+                value={agentStrategy}
+                onChange={setAgentStrategy}
+              />
+            )}
 
             {/* Speed knob — slow is the default for heavy-data sites where
                 an over-eager click on a skeleton row beats the actual data.
@@ -482,6 +500,64 @@ function PlanSummary({ plan }: { plan: PlanReadCompact }) {
     </div>
   );
 }
+
+function AgentStrategyPicker({
+  value,
+  onChange,
+}: {
+  value: "hybrid" | "vision_only";
+  onChange: (next: "hybrid" | "vision_only") => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">Agent strategy</label>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={() => onChange("hybrid")}
+          aria-pressed={value === "hybrid"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "hybrid"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Bot className="size-4" />
+            Hybrid (DOM + vision)
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            DOM-first ladder with vision rescue. Fast + cheap on most
+            apps. Recommended.
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange("vision_only")}
+          aria-pressed={value === "vision_only"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "vision_only"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Eye className="size-4" />
+            Vision-only (computer use)
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            Every click + type via VL pixel coords. Bypasses DOM
+            entirely. ~3-5× tokens. Pick for SAP / heavy canvas /
+            sealed-shadow-DOM apps.
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 
 function ModePicker({
   value,

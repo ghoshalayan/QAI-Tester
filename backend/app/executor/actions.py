@@ -60,6 +60,13 @@ _URL_RE = re.compile(r"""https?://[^\s'"<>)]+""")
 
 # Per-action defaults
 _NAVIGATE_TIMEOUT_MS = 30_000
+# Phase B.4 — bounded click timeout. Playwright's default 30s left
+# the agent stuck for half a minute every time a fixed-position
+# overlay intercepted a click. 8s is plenty for a real interactive
+# element (most clicks resolve in <500ms); intercepted clicks now
+# fail fast and route to the rescue stack (dismiss_modal / scroll /
+# vision search / coord-click) before the user notices.
+_CLICK_TIMEOUT_MS = 8_000
 _WAIT_DEFAULT_MS = 1_000
 _WAIT_MAX_MS = 30_000
 _VERIFY_BODY_TIMEOUT_MS = 5_000
@@ -294,7 +301,10 @@ def _resolve_or_fail(
             status="failed",
             narration=f"{label}: target not visible",
             error_message=str(e),
-            details={"target_hint": ctx.target_hint},
+            details={
+                "target_hint": ctx.target_hint,
+                "failure_kind": "selector_not_found",
+            },
         )
 
 
@@ -304,13 +314,32 @@ def _do_click(page: Page, ctx: ActionContext) -> ActionResult:
         return fail
     _glide_cursor(page, target, ctx.speed_config)
     try:
-        target.locator.click()
+        # Phase B.4 — bounded click timeout. Default Playwright
+        # timeout is 30s, which is far too patient for an interactive
+        # agent: when the target is intercepted by an overlay
+        # (a fixed grid, a sticky header, an unrelated modal), every
+        # failed click ate 30 seconds before we got the error and
+        # routed to the rescue stack. 8s is plenty for stable
+        # elements and lets the agent move on quickly when it isn't.
+        target.locator.click(timeout=_CLICK_TIMEOUT_MS)
     except Exception as e:
         return ActionResult(
             status="failed",
             narration=f"click failed: {ctx.target_hint!r}",
             error_message=f"{type(e).__name__}: {e}",
-            details={"strategy": target.strategy},
+            details={
+                "strategy": target.strategy,
+                # Mark intercepted clicks as a separate failure_kind
+                # so the rescue stack can pick the right path
+                # (overlay → dismiss_modal/scroll, vs missing →
+                # vision search). Detection is by error string —
+                # Playwright's wording is stable across versions.
+                "failure_kind": (
+                    "click_intercepted"
+                    if "intercepts pointer events" in str(e).lower()
+                    else "click_failed"
+                ),
+            },
         )
     return ActionResult(
         status="passed",
@@ -436,7 +465,10 @@ def _do_verify(page: Page, ctx: ActionContext) -> ActionResult:
                 status="failed",
                 narration=f"verify: target not visible {ctx.target_hint!r}",
                 error_message=str(e),
-                details={"target_hint": ctx.target_hint},
+                details={
+                    "target_hint": ctx.target_hint,
+                    "failure_kind": "selector_not_found",
+                },
             )
         # Visibly mark the verified element with a green ring that fades.
         # Without this, verify steps look like "the page just sat there".
@@ -453,6 +485,37 @@ def _do_verify(page: Page, ctx: ActionContext) -> ActionResult:
 
     if has_expected:
         expected = (ctx.expected or "").strip()
+        # Phase B.3 — natural-language guard. When ``expected`` is a
+        # whole sentence (the agent passed its reasoning text instead
+        # of a literal token to look for), the substring check on
+        # body_text is meaningless — pages never contain verbatim
+        # natural-language descriptions. We mark the literal check
+        # as ``not_attempted`` so the orchestrator routes straight to
+        # semantic verify (Phase 9) without the noisy "expected
+        # substring missing" failure step in between. Heuristic:
+        # > 80 chars OR > 8 whitespace-separated tokens = sentence.
+        word_count = len(expected.split())
+        is_natural_language = (
+            len(expected) > 80 or word_count > 8
+        )
+        if is_natural_language:
+            return ActionResult(
+                status="failed",
+                narration=(
+                    "verify: skipped literal check (expected is a "
+                    f"sentence — {word_count} words)"
+                ),
+                error_message=(
+                    "literal substring check not applicable — "
+                    "passing to semantic verify"
+                ),
+                details={
+                    "expected": expected[:300],
+                    "failure_kind": "literal_check_skipped",
+                    "natural_language": True,
+                    **details,
+                },
+            )
         try:
             body_text = page.locator("body").inner_text(
                 timeout=_VERIFY_BODY_TIMEOUT_MS,
@@ -468,7 +531,11 @@ def _do_verify(page: Page, ctx: ActionContext) -> ActionResult:
                 status="failed",
                 narration=f"verify: expected text not found",
                 error_message=f"expected substring missing: {expected[:200]!r}",
-                details={"expected": expected[:200], **details},
+                details={
+                    "expected": expected[:200],
+                    "failure_kind": "literal_check_missed",
+                    **details,
+                },
             )
         parts.append(f"expected text {expected[:60]!r} present")
 
@@ -490,6 +557,10 @@ def _do_wait(page: Page, ctx: ActionContext) -> ActionResult:
                 status="failed",
                 narration=f"wait: {ctx.target_hint!r} never appeared",
                 error_message=str(e),
+                details={
+                    "target_hint": ctx.target_hint,
+                    "failure_kind": "selector_not_found",
+                },
             )
         return ActionResult(
             status="passed",

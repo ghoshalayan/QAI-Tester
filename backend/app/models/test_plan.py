@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -111,9 +112,23 @@ class TestPlanCredential(Base):
     )
 
     label: Mapped[str] = mapped_column(String(64), nullable=False)
+    # ``username`` / ``password`` / ``totp_secret`` are Fernet-encrypted
+    # at rest when ``encrypted=True``. Read via vault.decrypt_credential
+    # to get plaintext. Direct DB inspection shows ciphertext.
     username: Mapped[str] = mapped_column(String(512), nullable=False)
-    # ⚠ plaintext per MVP "no master key" policy — see top of module
     password: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Phase 3 — TOTP secret (RFC 6238). When set, the agent generates
+    # 2FA codes itself instead of prompting for HITL. NULL / empty
+    # means "no TOTP; OTP screens fall back to HITL prompt".
+    totp_secret: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    # Phase 3 — encryption-at-rest marker. False on legacy MVP rows
+    # (plaintext); True on rows written through the hardened vault.
+    # Vault read path branches on this flag.
+    encrypted: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="0",
+    )
 
     # Optional URL pattern this credential applies to. NULL → applies to the
     # plan's ``target_url``. Used by the runtime intervention vault when

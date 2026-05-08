@@ -14,7 +14,7 @@
  * store buffers the recent ones so we can render a scrolling feed.
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -40,7 +40,9 @@ import {
   ApiError,
   type AgentRunRead,
   type AgentStatus,
+  type OpenPrompt,
 } from "@/lib/api";
+import { HitlPromptCard } from "@/components/hitl-prompt-card";
 import { Button } from "@/components/ui/button";
 import {
   useActiveInterventions,
@@ -169,6 +171,15 @@ export default function LivePresenterPage() {
         />
       )}
 
+      {/* Phase 4 — typed HITL prompts. Mounted unconditionally; the
+          component only renders when there's an open prompt for any
+          step that's currently surfaced via the events. */}
+      <HitlPromptArea
+        projectId={projectId}
+        runId={runId}
+        events={events}
+      />
+
       <CostMeter run={run ?? null} />
 
       <div className="flex-1 overflow-y-auto px-3 py-2">
@@ -281,6 +292,102 @@ function Controls({
     </div>
   );
 }
+
+/**
+ * Phase 4 — typed HITL prompt area.
+ *
+ * Watches for ``hitl_prompt_opened`` SSE events and renders the
+ * ``HitlPromptCard`` for the latest open prompt INLINE in the
+ * popup so the user doesn't have to leave the live view to enter
+ * an OTP / credential / captcha solve.
+ *
+ * The card disappears when:
+ * - The user submits (provideIntervention success → prompt cleared
+ *   server-side).
+ * - The agent's wait timed out / was cancelled
+ *   (``hitl_prompt_answered`` event with status="cancelled").
+ *
+ * On mount we also fetch ``GET /intervention/open`` so a popup
+ * reload picks up an in-flight prompt.
+ */
+function HitlPromptArea({
+  projectId,
+  runId,
+  events,
+}: {
+  projectId: number;
+  runId: number;
+  events: readonly LiveEvent[];
+}) {
+  // Track the most recent (step_id, prompt) pair from events.
+  const [openStepId, setOpenStepId] = useState<number | null>(null);
+  const [prompt, setPrompt] = useState<OpenPrompt | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    // Walk backwards through the events for the latest open/answered
+    // pair. answered → close. opened → open.
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev.type === "hitl_prompt_answered") {
+        setOpenStepId(null);
+        setPrompt(null);
+        return;
+      }
+      if (ev.type === "hitl_prompt_opened") {
+        const stepId = (ev.data as { step_id?: number }).step_id;
+        if (typeof stepId === "number") {
+          setOpenStepId(stepId);
+          // Pull the freshest prompt from the server (event payload
+          // intentionally doesn't carry ``fields`` to keep the SSE
+          // stream small).
+          setLoading(true);
+          api
+            .getOpenPrompt(projectId, runId, stepId)
+            .then((p) => {
+              if (p.open) {
+                setPrompt(p);
+              } else {
+                setPrompt(null);
+                setOpenStepId(null);
+              }
+            })
+            .catch(() => {
+              setPrompt(null);
+              setOpenStepId(null);
+            })
+            .finally(() => setLoading(false));
+        }
+        return;
+      }
+    }
+  }, [events, projectId, runId]);
+
+  if (!prompt || openStepId === null) {
+    return null;
+  }
+  return (
+    <div className="border-b px-3 py-2">
+      {loading ? (
+        <p className="text-xs text-muted-foreground">
+          Loading prompt…
+        </p>
+      ) : (
+        <HitlPromptCard
+          projectId={projectId}
+          runId={runId}
+          stepId={openStepId}
+          prompt={prompt}
+          onSubmitted={() => {
+            setPrompt(null);
+            setOpenStepId(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 
 function InterventionBanner({
   projectId,
@@ -821,6 +928,138 @@ function EventRow({ event }: { event: LiveEvent }) {
         }
         title={data.narration as string | undefined}
         sublabel={data.error as string | undefined}
+      />
+    );
+  }
+
+  // Phase 14 — smart candidate selection
+  if (type === "smart_pick_started") {
+    const matches =
+      typeof data.match_count === "number" ? data.match_count : "?";
+    return (
+      <Row
+        icon={<Bot className="size-3.5 text-violet-500" />}
+        label={`smart-pick · ${matches} matches`}
+        title={
+          typeof data.target_hint === "string"
+            ? `picking the right one for ${data.target_hint}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "smart_pick_completed") {
+    const strat = (data.strategy as string | undefined) ?? "?";
+    const conf =
+      typeof data.confidence === "number"
+        ? `${Math.round(data.confidence * 100)}%`
+        : undefined;
+    const rejected =
+      typeof data.rejected_count === "number" && data.rejected_count > 0
+        ? ` · ${data.rejected_count} rejected`
+        : "";
+    return (
+      <Row
+        icon={<Bot className="size-3.5 text-violet-500" />}
+        label={`smart-pick · ${strat}${rejected}`}
+        title={data.chosen_label as string | undefined}
+        sublabel={conf ? `confidence ${conf}` : undefined}
+      />
+    );
+  }
+
+  // Phase 10 — popup/overlay classifier
+  if (type === "popup_classified") {
+    const kind = (data.kind as string | undefined) ?? "?";
+    const conf =
+      typeof data.confidence === "number"
+        ? `${Math.round(data.confidence * 100)}%`
+        : undefined;
+    const colorClass =
+      kind === "required_step"
+        ? "text-emerald-500"
+        : kind === "ad"
+          ? "text-red-500"
+          : kind === "dismissable_blocker"
+            ? "text-amber-500"
+            : "text-muted-foreground";
+    return (
+      <Row
+        icon={<AlertTriangle className={`size-3.5 ${colorClass}`} />}
+        label={`popup · ${kind}`}
+        title={data.reasoning as string | undefined}
+        sublabel={conf ? `confidence ${conf}` : undefined}
+      />
+    );
+  }
+
+  // Phase 11 — test-case dispute
+  if (type === "test_case_disputed") {
+    const kind = (data.kind as string | undefined) ?? "?";
+    return (
+      <Row
+        icon={<AlertTriangle className="size-3.5 text-amber-500" />}
+        label={`test case disputed · ${kind}`}
+        title={data.evidence as string | undefined}
+        sublabel={
+          typeof data.suggested_fix === "string" && data.suggested_fix
+            ? `fix: ${data.suggested_fix}`
+            : undefined
+        }
+      />
+    );
+  }
+
+  // Phase 1 — provider tier escalation
+  if (type === "llm_escalated") {
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-amber-500" />}
+        label={`llm escalated · ${data.role ?? "?"}`}
+        title={
+          typeof data.from_model === "string"
+            ? `cheap tier (${data.from_model}) → strong`
+            : undefined
+        }
+        sublabel={data.reason as string | undefined}
+      />
+    );
+  }
+
+  // Phase 9 — semantic verify (filled in after the helper lands)
+  if (type === "semantic_verify_started") {
+    return (
+      <Row
+        icon={<Bot className="size-3.5 text-cyan-500" />}
+        label="semantic verify · checking screenshot"
+        title={data.expected as string | undefined}
+      />
+    );
+  }
+  if (type === "semantic_verify_completed") {
+    const verdict = (data.verdict as string | undefined) ?? "?";
+    const Icon =
+      verdict === "pass"
+        ? CheckCircle2
+        : verdict === "fail"
+          ? XCircle
+          : AlertTriangle;
+    const colorClass =
+      verdict === "pass"
+        ? "text-emerald-500"
+        : verdict === "fail"
+          ? "text-red-500"
+          : "text-amber-500";
+    return (
+      <Row
+        icon={<Icon className={`size-3.5 ${colorClass}`} />}
+        label={`semantic verify · ${verdict}`}
+        title={data.reasoning as string | undefined}
+        sublabel={
+          typeof data.confidence === "number"
+            ? `confidence ${Math.round(data.confidence * 100)}%`
+            : undefined
+        }
       />
     );
   }

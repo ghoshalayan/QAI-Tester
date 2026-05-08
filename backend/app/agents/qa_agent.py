@@ -97,9 +97,23 @@ ToolName = Literal[
 ACTION_TOOLS: frozenset[str] = frozenset({
     "navigate", "click", "type", "select", "verify", "wait",
     "scroll", "extract_text", "dismiss_modal",
+    # Phase 0.10 — palette completion. press_key was missing entirely
+    # (agent had no way to press Enter / Escape / Tab); type now
+    # accepts a `submit` boolean so "type query and search" is one
+    # tool call; go_back exposes the browser-history primitive that
+    # complex flows (graph-like navigation, return-to-search-results)
+    # need without re-navigating to a remembered URL.
+    "press_key", "go_back",
 })
 META_TOOLS: frozenset[str] = frozenset({
     "mark_goal_complete", "mark_goal_failed", "ask_human",
+    # Phase 11 — test-case dispute. Agent flags a step as provably
+    # wrong (selector dead, action impossible, precondition not met).
+    # Logged to the report; submodule status flips to ``blocked``
+    # with the dispute attached. Frozen path is suppressed for the
+    # disputed run. STRICT v1 — agent should ONLY use this when the
+    # test step is physically impossible to follow, not just hard.
+    "flag_test_case_issue",
 })
 
 
@@ -126,6 +140,25 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         "question": {"type": "string"},
         "reasoning": {"type": "string"},
         "confidence": {"type": "number"},
+        # Phase 0.10 — keyboard primitive. ``key`` carries the value
+        # for the press_key tool AND can be set on type() to fire an
+        # extra key after typing (most commonly Enter, equivalent to
+        # `submit: true`). Empty string when not used.
+        "key": {
+            "type": "string",
+            "enum": [
+                "", "Enter", "Tab", "Escape",
+                "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                "Backspace", "Delete", "Home", "End",
+                "PageUp", "PageDown", "Space",
+            ],
+        },
+        # Phase 0.10 — type-and-submit. When true on a ``type`` call,
+        # the executor presses Enter on the same field after typing.
+        # Most form fields submit on Enter; folding "type+submit"
+        # into one tool call avoids the agent's separate "now find
+        # the submit button" dance.
+        "submit": {"type": "boolean"},
         # Page memory — agent produces a 1-2 line "what's on this
         # page right now" summary alongside the tool call. We cache it
         # keyed by URL so future turns on the same page can read the
@@ -140,6 +173,35 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         # Empty string when not applicable.
         "current_sub_goal_id": {"type": "string"},
         "sub_goal_completed_id": {"type": "string"},
+        # Phase B.1 — sub-goal SKIP. The agent marks a sub-goal as
+        # NOT-APPLICABLE when the page's current state makes the
+        # sub-goal physically impossible (e.g. "click remove on
+        # cart item" when cart is empty; "verify post-login dashboard"
+        # when login was already done in a prior submodule). Goal
+        # completion accepts all-done-OR-skipped sub-goals so a
+        # correctly-judged "already satisfied" run isn't trapped
+        # in inconclusive. ``skip_sub_goal_reason`` is mandatory
+        # when ``skip_sub_goal_id`` is set — surfaces in the report
+        # so the user sees WHY the sub-goal was skipped.
+        "skip_sub_goal_id": {"type": "string"},
+        "skip_sub_goal_reason": {"type": "string"},
+        # Phase 11 — test-case dispute. Set ONLY when tool=
+        # ``flag_test_case_issue``. Carries the structured payload
+        # the agent uses to claim the test step is provably wrong.
+        # Empty strings on every other turn.
+        "issue_kind": {
+            "type": "string",
+            "enum": [
+                "",
+                "wrong_selector",
+                "missing_step",
+                "impossible_action",
+                "misleading_description",
+                "precondition_failed",
+            ],
+        },
+        "issue_evidence": {"type": "string"},
+        "issue_suggested_fix": {"type": "string"},
     },
     "required": [
         "tool", "target_hint", "value", "url", "expected",
@@ -147,6 +209,9 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         "question", "reasoning", "confidence",
         "page_memory_note",
         "current_sub_goal_id", "sub_goal_completed_id",
+        "key", "submit",
+        "skip_sub_goal_id", "skip_sub_goal_reason",
+        "issue_kind", "issue_evidence", "issue_suggested_fix",
     ],
     "additionalProperties": False,
 }
@@ -180,9 +245,25 @@ tester: small, deliberate steps; verify after each meaningful action.
 ACTION TOOLS (mutate the page):
 - navigate(url): go to url
 - click(target_hint): click an element
-- type(target_hint, value): type into a field
+- type(target_hint, value, submit?): type into a field. Set submit=true
+  when typing into a SEARCH FIELD or SINGLE-INPUT FORM that should
+  submit on Enter — this types AND presses Enter in one go. Cheaper
+  and more reliable than typing then hunting for a submit button
+  (Amazon, Google, most search bars have unlabelled submit icons).
+  Leave submit=false when the form has explicit submit/save buttons
+  (checkout forms, multi-field registration, etc.).
+- press_key(key): press one key — Enter, Tab, Escape, Arrow*, Backspace,
+  Delete, Home, End, PageUp, PageDown, Space. Whichever element has
+  focus receives it. Use this when the previous action left a field
+  focused and you need to dispatch a key without a separate click.
 - select(target_hint, value): pick a dropdown option
-- verify(target_hint?, expected?): assert visibility or text presence
+- verify(target_hint?, expected?): assert visibility or text presence.
+  ``expected`` should be a SHORT, CONCRETE token you'd literally find
+  on the page (e.g. "Cart", "Sign out", "Order placed", "₹"). Do NOT
+  pass a long sentence describing the goal — the literal substring
+  check skips natural-language descriptions and the call gets routed
+  to semantic verify. Use ``mark_goal_complete`` for goal-level
+  semantic claims; use ``verify`` for spot-checks on visible text.
 - wait(duration_ms? OR target_hint?): wait for time or element
 - scroll(scroll_direction, scroll_amount?): scroll the page
 - extract_text(target_hint): read text out of an element (returned in
@@ -190,6 +271,9 @@ ACTION TOOLS (mutate the page):
 - dismiss_modal(): close any blocking modal (cookie banner, signup
   popup, etc.). Use this BEFORE retrying a click that fails because
   something is overlaying the page.
+- go_back(): browser back. Use for cascade flows like
+  "search → product → back to results → another product" — cheaper
+  than re-navigating to a remembered URL on heavy SPAs.
 
 META TOOLS (terminate the loop):
 - mark_goal_complete(reasoning): the goal is verifiably achieved.
@@ -203,11 +287,38 @@ META TOOLS (terminate the loop):
   (page broken, feature missing, login expired). Different from
   the test being wrong — this is the APP failing.
 - ask_human(question): you're stuck and need guidance. Use sparingly.
+- flag_test_case_issue(issue_kind, issue_evidence, issue_suggested_fix):
+  flag a test step as PROVABLY WRONG. Submodule is marked
+  ``blocked`` (not failed — failure means the APP is broken; this
+  means the TEST is broken). STRICT criteria — only use when:
+    * issue_kind="wrong_selector" — the target_hint is dead and
+      the page has a clearly equivalent element with a different
+      label/selector. ``issue_suggested_fix`` should name it.
+    * issue_kind="missing_step" — the test skipped a required
+      page (e.g. variant-selector dialog before "Add to cart").
+    * issue_kind="impossible_action" — the action can't physically
+      happen on this page (clicking "Proceed to checkout" on an
+      empty cart, "remove item" with no items, etc.).
+    * issue_kind="misleading_description" — the test's narrative
+      describes a different page or flow than the actual app.
+    * issue_kind="precondition_failed" — a prior submodule was
+      supposed to set up state this submodule needs (cart having
+      items; user logged in; etc.) and that state is absent.
+  ALWAYS provide ``issue_evidence`` (1-2 verbatim phrases from
+  the page that prove the dispute). DO NOT use this tool just
+  because something is hard to find — that's what the search /
+  fuzzy / vision tools are for. This tool is for "the test case
+  itself is wrong, not just a poor selector hint".
 
 RULES:
 - target_hint: a Playwright-resolvable hint. CSS selector, "text 'Sign In'",
   or "role=button[name='Sign In']". Prefer stable hints (data-testid,
   text, role) over fragile ones (nth-child).
+- SEARCH/SINGLE-FIELD FORMS: prefer ``type(..., submit=true)`` over
+  ``type`` followed by ``click("Search button")``. The submit button
+  on most search bars has no readable text (just a magnifying glass
+  icon) and the click hunt usually fails. Pressing Enter is what a
+  human actually does there.
 - If WHAT CHANGED SINCE LAST TURN says "PAGE UNCHANGED", your previous
   action had NO visible effect. Do NOT repeat it. Try a fundamentally
   different approach: dismiss_modal first, scroll, change selector,
@@ -248,10 +359,26 @@ SUB-GOALS:
       sub-goal → set the corresponding sub-goal id.
   Do NOT mark a sub-goal complete just because you took an action
   toward it — only when the OUTCOME confirms it.
-- Don't call ``mark_goal_complete`` until ALL sub-goals are done.
-  If you skip a sub-goal because the page architecture differs
-  from the test case's assumption, that's fine — pick the next
-  one and proceed.
+- ``skip_sub_goal_id`` + ``skip_sub_goal_reason``: when a sub-goal
+  is PHYSICALLY IMPOSSIBLE on the current page state, skip it.
+  The completion gate accepts skipped sub-goals as closed.
+  When to skip:
+    * Sub-goal "click remove on cart item" but cart is already
+      empty → skip with reason "cart is already empty; nothing
+      to remove".
+    * Sub-goal "verify post-login dashboard" but login was
+      already done by an earlier submodule → skip with reason
+      "already logged in; dashboard verified earlier".
+    * Sub-goal "select variant" but the product has only one
+      variant → skip with reason "no variant selector — single
+      SKU product".
+  ALWAYS provide ``skip_sub_goal_reason``; the user reads it in
+  the report. Do NOT skip a sub-goal just because it's hard or
+  the test case wording is ambiguous — that's not "impossible",
+  that's "the agent gave up", which is a different failure mode.
+- Call ``mark_goal_complete`` when ALL sub-goals are either
+  ``done`` or ``skipped`` AND the goal's success criteria are
+  observably met.
 
 Output JSON only.
 """
@@ -291,11 +418,22 @@ class TurnRecord:
     # / dismiss / drill) and their LLM cost get folded in here so the
     # report timeline shows the recovery path.
     search_log: dict[str, Any] | None = None
+    # Set True for any turn whose successful execution depended on a
+    # human typing a value (credentials, OTP, captcha, passkey
+    # resume) into the live HITL popup. The freeze gate skips runs
+    # that contain ANY such turn — a path that only passed because a
+    # human filled in a one-time secret is NOT a deterministic
+    # replay candidate. See ``_build_frozen_path`` callers.
+    manual_intervention_used: bool = False
 
 
 HaltReason = Literal[
     "complete", "agent_failed", "ask_human", "stall", "oscillation",
     "max_turns", "max_wallclock", "budget", "cancelled",
+    # Phase 11 — agent flagged a test step as provably wrong via
+    # ``flag_test_case_issue``. Submodule status flips to ``blocked``
+    # with the dispute attached. Frozen path is suppressed.
+    "test_case_disputed",
 ]
 
 
@@ -341,6 +479,14 @@ def _build_frozen_path(
         if t.tool not in (
             "navigate", "click", "type", "select", "verify", "wait",
             "scroll", "extract_text", "dismiss_modal",
+            # Phase 0.10 — keyboard / history primitives are
+            # deterministic and replayable. press_key fires the same
+            # key against whatever has focus (which is determined by
+            # prior steps in the path); go_back walks history one
+            # entry. type-with-submit is captured by carrying the
+            # ``submit`` arg through ``slim_args`` below — replay
+            # dispatches both the type and the Enter press.
+            "press_key", "go_back",
         ):
             continue
         # Strip empty / zero args before persisting — keeps the frozen
@@ -554,6 +700,34 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively replace JSON-incompatible values (bytes, sets, etc.)
+    in a dict/list tree with serializable placeholders.
+
+    Why this exists
+    ---------------
+    ``details_json`` is a SQLAlchemy ``JSON`` column — anything we put
+    in it gets serialized via ``json.dumps`` on commit. A single rogue
+    ``bytes`` value (e.g. a screenshot leaking through ``search_log``)
+    raises ``TypeError`` mid-flush and rolls back the entire run's
+    transaction, losing other completed steps' updates too.
+
+    This sanitizer is the seatbelt: walk the tree right before commit
+    and swap any ``bytes`` for ``"<bytes:N>"``, sets/tuples for lists.
+    The structure stays intact for the report; only the offending
+    value is replaced. Cheap defence against future regressions
+    where someone adds a new field carrying binary data without
+    realizing it'll be persisted.
+    """
+    if isinstance(value, bytes | bytearray):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _emit(
     emit_event: Callable[[str, dict], None] | None,
     event_type: str,
@@ -688,8 +862,17 @@ def _format_page_memory_for_prompt(
     if not memory:
         return ""
     # Sort by turn (most recent first) and cap to avoid prompt bloat.
+    # Skip sidecar keys like ``_graph`` — they're tracking metadata,
+    # not page memory entries.
+    page_entries = {
+        k: v for k, v in memory.items()
+        if not k.startswith("_") and isinstance(v, dict)
+        and "note" in v
+    }
+    if not page_entries:
+        return ""
     items = sorted(
-        memory.items(),
+        page_entries.items(),
         key=lambda kv: kv[1].get("turn", 0),
         reverse=True,
     )[:max_entries]
@@ -706,6 +889,66 @@ def _format_page_memory_for_prompt(
         note = (entry.get("note") or "")[:240]
         lines.append(
             f"- {path} (T{entry.get('turn', '?')}): {note}{marker}",
+        )
+    return "\n".join(lines)
+
+
+def _format_page_graph_for_prompt(
+    page_graph: dict[str, Any],
+    current_url: str,
+    *,
+    max_edges: int = 10,
+) -> str:
+    """Phase 12 — render the navigation graph as a compact prompt
+    block. Lets the agent reason about how to back-navigate ("I was
+    on /search-results, then clicked into /product/X — to go back
+    I can use go_back or navigate to the recorded URL").
+
+    Returns "" when the graph is empty so the caller can skip the
+    block. Edges are de-duplicated and capped — the LLM doesn't
+    need a full history, just the recent path.
+    """
+    if not page_graph:
+        return ""
+    edges = page_graph.get("edges") or []
+    if not edges:
+        return ""
+    # Show last N edges. De-dup adjacent identical (from, to)
+    # transitions — they bloat without adding info.
+    recent: list[dict[str, Any]] = []
+    seen_pair: tuple[str, str] | None = None
+    for edge in edges[-max_edges * 2:]:
+        pair = (edge.get("from", ""), edge.get("to", ""))
+        if pair == seen_pair:
+            continue
+        recent.append(edge)
+        seen_pair = pair
+        if len(recent) >= max_edges:
+            break
+    if not recent:
+        return ""
+    try:
+        from urllib.parse import urlparse  # noqa: PLC0415
+    except Exception:
+        urlparse = None  # type: ignore[assignment]
+
+    def _path(url: str) -> str:
+        if urlparse:
+            try:
+                p = urlparse(url).path or url
+                return p[:80]
+            except Exception:
+                pass
+        return url[:80]
+
+    lines: list[str] = []
+    for edge in recent:
+        from_p = _path(str(edge.get("from", "")))
+        to_p = _path(str(edge.get("to", "")))
+        tool = edge.get("tool") or "?"
+        marker = "  ← YOU ARE HERE" if edge.get("to") == current_url else ""
+        lines.append(
+            f"- T{edge.get('turn', '?')}: {from_p} -> {to_p} (via {tool}){marker}",
         )
     return "\n".join(lines)
 
@@ -936,20 +1179,38 @@ def _do_scroll(page, args: dict[str, Any]) -> tuple[str, str, str | None]:
 
 def _do_extract_text(
     page, args: dict[str, Any],
-) -> tuple[str, str, str | None, str]:
-    """Extract text — returns (status, narration, error, extracted_text)."""
+) -> tuple[str, str, str | None, str, dict[str, Any]]:
+    """Extract text — returns (status, narration, error, extracted_text, details).
+
+    The ``details`` slot carries ``failure_kind`` for typed dispatch on
+    the failure side: orchestrators downstream branch on
+    ``selector_not_found`` to decide whether to run vision search /
+    coord-click rescues without string-matching the narration.
+    """
     target = args.get("target_hint") or ""
     if not target:
-        return "failed", "extract_text: target_hint required", None, ""
+        return "failed", "extract_text: target_hint required", None, "", {}
     try:
         resolved = resolve(page, target)
     except SelectorNotFound as e:
-        return "failed", f"extract_text: target not visible {target!r}", str(e), ""
+        return (
+            "failed",
+            f"extract_text: target not visible {target!r}",
+            str(e),
+            "",
+            {"target_hint": target, "failure_kind": "selector_not_found"},
+        )
     try:
         text = resolved.locator.inner_text(timeout=5000)
     except Exception as e:
-        return "failed", "extract_text: could not read text", f"{type(e).__name__}: {e}", ""
-    return "ok", f"extracted from {target!r}: {text[:120]!r}", None, text[:1000]
+        return (
+            "failed",
+            "extract_text: could not read text",
+            f"{type(e).__name__}: {e}",
+            "",
+            {},
+        )
+    return "ok", f"extracted from {target!r}: {text[:120]!r}", None, text[:1000], {}
 
 
 def _do_dismiss_modal(page) -> tuple[str, str, str | None]:
@@ -989,6 +1250,449 @@ def _do_dismiss_modal(page) -> tuple[str, str, str | None]:
         return "failed", "no modal close affordance found", f"{type(e).__name__}: {e}"
 
 
+_VALID_KEYS: frozenset[str] = frozenset({
+    "Enter", "Tab", "Escape",
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "Backspace", "Delete", "Home", "End",
+    "PageUp", "PageDown", "Space",
+})
+
+
+def _do_press_key(
+    page, args: dict[str, Any],
+) -> tuple[str, str, str | None]:
+    """Phase 0.10 — keyboard primitive.
+
+    Submits a single keystroke against whatever element currently has
+    focus. Most useful for ``Enter`` to submit a form after typing
+    (Amazon's search button is hard to locate by selector); ``Escape``
+    to bail a stuck modal that ``dismiss_modal`` couldn't close;
+    ``Tab`` to advance focus into a hidden field; arrow keys to step
+    through a date picker / autocomplete.
+
+    The caller is expected to have given the field focus already (via
+    a click or via the typed-into field still being active). We do
+    NOT take focus here — that's the agent's job in the prior turn.
+
+    Returns ``(status, narration, error)`` matching the other ``_do_*``
+    helpers' shape.
+    """
+    key = (args.get("key") or "").strip()
+    if not key:
+        return (
+            "failed",
+            "press_key: 'key' arg is required",
+            "no key specified",
+        )
+    if key not in _VALID_KEYS:
+        return (
+            "failed",
+            f"press_key: unsupported key {key!r}",
+            f"key must be one of {sorted(_VALID_KEYS)}",
+        )
+    try:
+        page.keyboard.press(key)
+    except Exception as e:
+        return (
+            "failed",
+            f"press_key {key!r} dispatch failed",
+            f"{type(e).__name__}: {e}",
+        )
+    return "ok", f"pressed {key!r}", None
+
+
+def _do_go_back(page) -> tuple[str, str, str | None]:
+    """Phase 0.10 — browser back primitive.
+
+    Wraps ``page.go_back()`` so cascade flows (e.g. "search → product
+    → back to results → another product") don't have to round-trip
+    through a remembered URL with ``navigate``. Materially cheaper
+    on heavy SPAs that re-execute their full bootstrap on a fresh
+    navigate but keep the prior page hot in history.
+
+    Waits for the post-back navigation to settle so the next turn's
+    observation reflects the restored page, not a transient.
+    """
+    try:
+        response = page.go_back(wait_until="domcontentloaded", timeout=10_000)
+    except Exception as e:
+        return (
+            "failed",
+            "go_back: browser refused (no history?)",
+            f"{type(e).__name__}: {e}",
+        )
+    if response is None:
+        # Playwright returns None when there's no entry to go back to.
+        return (
+            "failed",
+            "go_back: no previous page in history",
+            "history empty",
+        )
+    return "ok", f"navigated back to {page.url}", None
+
+
+def _vision_only_dispatch(
+    *,
+    page,
+    tool: str,
+    args: dict[str, Any],
+    provider: LLMProvider,
+    cheap_provider: LLMProvider | None,
+    emit_event: Callable[[str, dict], None] | None,
+    on_escalate: Any,
+    submodule_run_id: int | None,
+    submodule_step_id: int | None,
+) -> dict[str, Any] | None:
+    """Phase 6 — vision-only action dispatch.
+
+    Bypasses the DOM resolver entirely. The vision LLM looks at the
+    full-resolution screenshot and returns pixel coordinates; we
+    dispatch via ``page.mouse.click(x, y)`` (and for ``type``,
+    follow with ``page.keyboard.type(value)`` plus an Enter when
+    the agent set ``submit: true``).
+
+    Returns a dict with ``outcome`` (the standard outcome shape
+    callers expect) plus token counts. Returns ``None`` when the
+    LLM call failed or returned low confidence — caller falls
+    through to the regular DOM dispatch as a safety net (vision-
+    only doesn't mean "no fallback ever"; it means "VL coords first,
+    DOM only when the agent's vision call genuinely couldn't
+    decide").
+    """
+    target_hint = str(args.get("target_hint") or "").strip()
+    if not target_hint:
+        return None
+    try:
+        from app.agents.page_intel import (  # noqa: PLC0415
+            propose_click_coordinates,
+        )
+        coords = propose_click_coordinates(
+            provider, page,
+            target_hint=target_hint,
+        )
+    except Exception as e:
+        logger.warning("vision-only coord LLM call failed: %s", e)
+        return None
+    if coords.confidence < 0.6:
+        # Low confidence → fall back to DOM. The strict-only mode
+        # would refuse here, but for v1 we trade purity for
+        # robustness on ambiguous screens.
+        logger.info(
+            "vision-only confidence %.2f < 0.6 — falling through to DOM",
+            coords.confidence,
+        )
+        return None
+
+    _emit(emit_event, "vision_only_action", {
+        "run_id": submodule_run_id,
+        "step_id": submodule_step_id,
+        "tool": tool,
+        "x": coords.x,
+        "y": coords.y,
+        "label_visible": coords.label_visible[:120],
+        "confidence": coords.confidence,
+    })
+
+    # Dispatch.
+    try:
+        if tool == "click":
+            page.mouse.click(coords.x, coords.y)
+            outcome = {
+                "status": "ok",
+                "narration": (
+                    f"vision-only click at ({coords.x},{coords.y}) — "
+                    f"{coords.label_visible[:80]}"
+                ),
+                "error_message": None,
+                "extracted_text": "",
+                "details": {"strategy": "vision_only_coords"},
+            }
+        elif tool == "type":
+            value = str(args.get("value") or "")
+            page.mouse.click(coords.x, coords.y)
+            try:
+                page.keyboard.type(value, delay=20)
+            except Exception:
+                page.keyboard.type(value)
+            if bool(args.get("submit")):
+                page.keyboard.press("Enter")
+            outcome = {
+                "status": "ok",
+                "narration": (
+                    f"vision-only type at ({coords.x},{coords.y}) — "
+                    f"{len(value)} chars"
+                    + (" + Enter" if args.get("submit") else "")
+                ),
+                "error_message": None,
+                "extracted_text": "",
+                "details": {"strategy": "vision_only_coords"},
+            }
+        else:
+            return None
+    except Exception as e:
+        outcome = {
+            "status": "failed",
+            "narration": (
+                f"vision-only {tool} dispatch failed at "
+                f"({coords.x},{coords.y})"
+            ),
+            "error_message": f"{type(e).__name__}: {e}",
+            "extracted_text": "",
+            "details": {"strategy": "vision_only_coords"},
+        }
+
+    # ``cheap_provider`` and ``on_escalate`` are threaded through for
+    # the future tier-aware coord dispatch path; unused here today.
+    del cheap_provider, on_escalate
+    return {
+        "outcome": outcome,
+        "input_tokens": coords.input_tokens,
+        "output_tokens": coords.output_tokens,
+    }
+
+
+def _maybe_run_smart_pick(
+    *,
+    page,
+    provider: LLMProvider,
+    cheap_provider: LLMProvider | None,
+    goal: Goal,
+    tool: str,
+    args: dict[str, Any],
+    emit_event: Callable[[str, dict], None] | None,
+    on_escalate: Any,
+    submodule_run_id: int | None,
+    submodule_step_id: int | None,
+) -> dict[str, Any] | None:
+    """Phase 14 — smart candidate selection.
+
+    Probes whether ``args.target_hint`` is ambiguous (3+ visible
+    matches). If yes, runs the vision LLM to pick the right one
+    among them (or scroll / give up) and applies the result:
+
+    - ``selector`` → mutates ``args.target_hint`` to the picked
+      selector. Caller's downstream dispatcher then resolves and
+      clicks normally. Search-log captures the substitution.
+    - ``coords``  → dispatches the click directly via
+      ``page.mouse.click(x, y)`` and returns a ``preempt_outcome``
+      that the caller substitutes for the regular dispatcher.
+    - ``scroll``  → dispatches the scroll, returns a "skip the
+      click this turn" preempt outcome so the next turn sees the
+      scrolled page.
+    - ``none``    → returns ``None`` to leave normal dispatch alone.
+
+    Returns ``None`` when smart-pick is not applicable (no ambiguity,
+    no vision, helper raised), or a record dict when it ran. The
+    record carries ``input_tokens``, ``output_tokens``, and
+    optionally ``preempt_outcome`` (when the helper itself dispatched
+    the action and the caller should NOT call _execute_tool_call).
+    """
+    target_hint = (args.get("target_hint") or "").strip()
+    if not target_hint:
+        return None
+
+    # Cheap probe: count locator matches. Locator-builder mirrors the
+    # shape ``selectors.resolve`` accepts so the count reflects the
+    # same population the resolver would draw from.
+    try:
+        locator = page.locator(target_hint)
+        match_count = locator.count()
+    except Exception as e:
+        # Build/probe failed — let normal resolve() raise downstream.
+        logger.debug(
+            "smart-pick ambiguity probe failed for %r: %s",
+            target_hint, e,
+        )
+        return None
+
+    # Threshold: 3+ visible matches qualifies as ambiguous. 1-2
+    # matches → existing fuzzy / vision-search ladder is fine.
+    if match_count < 3:
+        return None
+
+    _emit(emit_event, "smart_pick_started", {
+        "run_id": submodule_run_id,
+        "step_id": submodule_step_id,
+        "target_hint": target_hint,
+        "match_count": match_count,
+        "tool": tool,
+    })
+
+    # Build the criteria block from the goal's success criteria +
+    # sub-goal context. Empty list is fine — helper will pick by
+    # general fitness.
+    criteria: list[str] = list(goal.success_criteria or [])
+
+    # Build a small candidate pre-filter from the AX tree so the
+    # LLM doesn't have to re-derive it from the screenshot alone.
+    visible_candidates: list[dict[str, Any]] = []
+    try:
+        from app.executor.selectors import (  # noqa: PLC0415
+            _capture_ax_tree,
+        )
+        ax = _capture_ax_tree(page)
+        # Crude pre-filter: items whose name contains the literal
+        # token of the target_hint (the agent's hint after stripping
+        # quotes / "text " prefix). Keeps the LLM focused.
+        token = target_hint
+        for prefix in ("text '", 'text "', "text "):
+            if token.lower().startswith(prefix):
+                token = token[len(prefix):].rstrip("'\"").strip()
+                break
+        token_lower = token.lower()
+        for item in ax[:60]:
+            name = (item.get("name") or "")
+            if token_lower and token_lower in name.lower():
+                visible_candidates.append({
+                    "role": item.get("role"),
+                    "name": name,
+                    "selector_hint": item.get("selector_hint"),
+                })
+    except Exception as e:
+        logger.debug("smart-pick AX pre-filter skipped: %s", e)
+
+    # Build target description from the agent's reasoning + sub-goal.
+    current_sg = next(
+        (sg for sg in goal.sub_goals
+         if sg.id == args.get("current_sub_goal_id")),
+        None,
+    )
+    target_description = (
+        (args.get("target_hint") or "")
+        + (f" — sub-goal: {current_sg.description}" if current_sg else "")
+        + (f" — goal: {goal.description}" if goal.description else "")
+    )
+
+    from app.agents.page_intel import (  # noqa: PLC0415
+        capture_screenshot_for_vision, propose_smart_candidate,
+    )
+    try:
+        screenshot = capture_screenshot_for_vision(page, downscale=False)
+    except Exception as e:
+        logger.warning("smart-pick screenshot capture failed: %s", e)
+        return None
+
+    try:
+        pick = propose_smart_candidate(
+            provider, page,
+            target_description=target_description,
+            criteria=criteria,
+            visible_candidates=visible_candidates or None,
+            screenshot_bytes=screenshot,
+            cheap_provider=cheap_provider,
+            on_escalate=on_escalate,
+        )
+    except Exception as e:
+        logger.warning("smart-pick LLM call failed: %s", e)
+        _emit(emit_event, "smart_pick_completed", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "outcome": "llm_error",
+            "error": str(e)[:200],
+        })
+        return None
+
+    _emit(emit_event, "smart_pick_completed", {
+        "run_id": submodule_run_id,
+        "step_id": submodule_step_id,
+        "strategy": pick.strategy,
+        "chosen_label": pick.chosen_label[:160],
+        "rejected_count": len(pick.rejected_labels),
+        "confidence": pick.confidence,
+    })
+
+    record: dict[str, Any] = {
+        "input_tokens": pick.input_tokens,
+        "output_tokens": pick.output_tokens,
+        "strategy": pick.strategy,
+        "chosen_label": pick.chosen_label,
+        "rejected_labels": list(pick.rejected_labels),
+        "rejection_reasons": list(pick.rejection_reasons),
+        "reasoning": pick.reasoning,
+        "confidence": pick.confidence,
+    }
+
+    if pick.strategy == "selector" and pick.selector:
+        # Patch args in place — downstream dispatcher resolves the
+        # picked selector cleanly. Keep the original hint visible
+        # for telemetry.
+        record["original_target_hint"] = target_hint
+        args["target_hint"] = pick.selector
+        return record
+
+    if pick.strategy == "coords" and pick.x > 0 and pick.y > 0:
+        # Direct dispatch via mouse — skip the resolver entirely.
+        # Caller substitutes preempt_outcome for the dispatcher's
+        # would-be result.
+        try:
+            page.mouse.click(pick.x, pick.y)
+            preempt = {
+                "status": "ok",
+                "narration": (
+                    f"smart-pick clicked at ({pick.x},{pick.y}) — "
+                    f"{pick.chosen_label[:60]}"
+                ),
+                "error_message": None,
+                "extracted_text": "",
+                "details": {"smart_pick_strategy": "coords"},
+            }
+        except Exception as e:
+            preempt = {
+                "status": "failed",
+                "narration": (
+                    f"smart-pick coord click failed at "
+                    f"({pick.x},{pick.y})"
+                ),
+                "error_message": f"{type(e).__name__}: {e}",
+                "extracted_text": "",
+                "details": {"smart_pick_strategy": "coords"},
+            }
+        record["preempt_outcome"] = preempt
+        return record
+
+    if pick.strategy == "scroll" and pick.scroll_direction:
+        # Scroll the requested direction; skip the click for now —
+        # the next turn re-evaluates against the scrolled page.
+        amount = pick.scroll_amount_px or 600
+        try:
+            if pick.scroll_direction == "down":
+                page.mouse.wheel(0, amount)
+            elif pick.scroll_direction == "up":
+                page.mouse.wheel(0, -amount)
+            elif pick.scroll_direction == "right":
+                page.mouse.wheel(amount, 0)
+            elif pick.scroll_direction == "left":
+                page.mouse.wheel(-amount, 0)
+            preempt = {
+                "status": "ok",
+                "narration": (
+                    f"smart-pick scrolled {pick.scroll_direction} {amount}px "
+                    f"(no visible candidate matched criteria)"
+                ),
+                "error_message": None,
+                "extracted_text": "",
+                "details": {
+                    "smart_pick_strategy": "scroll",
+                    "scroll_skip_click": True,
+                },
+            }
+        except Exception as e:
+            preempt = {
+                "status": "failed",
+                "narration": "smart-pick scroll dispatch failed",
+                "error_message": f"{type(e).__name__}: {e}",
+                "extracted_text": "",
+                "details": {"smart_pick_strategy": "scroll"},
+            }
+        record["preempt_outcome"] = preempt
+        return record
+
+    # strategy == "none" or malformed → fall through to normal
+    # dispatch. The caller's existing fuzzy + vision-search rescue
+    # path can still try, OR the dispute tool (Phase 11) can flag it.
+    return record
+
+
 def _vision_search_for_target(
     page,
     provider: LLMProvider,
@@ -998,6 +1702,8 @@ def _vision_search_for_target(
     emit_event: Callable[[str, dict], None] | None = None,
     submodule_run_id: int | None = None,
     submodule_step_id: int | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
 ) -> dict[str, Any]:
     """Vision-guided target search (Phase A4.1b).
 
@@ -1033,6 +1739,12 @@ def _vision_search_for_target(
     total_in = 0
     total_out = 0
     halt_reason = "max_attempts"
+    # Surface the LAST iteration's near_misses + screenshot bytes to
+    # the caller so the coord-click rescue (which runs on the same
+    # page state, after this function exhausts) doesn't have to
+    # recompute the AX tree OR re-screenshot the page.
+    last_near_misses: list[dict[str, Any]] = []
+    last_screenshot: bytes | None = None
 
     if not getattr(provider, "supports_vision", False):
         # No vision capability → can't run search. Caller falls
@@ -1067,6 +1779,26 @@ def _vision_search_for_target(
             }
             for score, item in scored[:5]
         ]
+        last_near_misses = near_misses
+
+        # Snapshot the page ONCE per attempt, pass it down so the
+        # vision LLM and any rescue rung that runs after this
+        # function exhausts (coord-click) reuses the same bytes.
+        # On the LAST attempt, capture full_page so the LLM can see
+        # off-viewport content (the typical "user said scroll but
+        # the target is way down the page" scenario).
+        try:
+            full_page = (attempt == max_attempts)
+            from app.agents.page_intel import (  # noqa: PLC0415
+                capture_screenshot_for_vision,
+            )
+            attempt_screenshot = capture_screenshot_for_vision(
+                page, full_page=full_page,
+            )
+            last_screenshot = attempt_screenshot
+        except Exception as e:
+            logger.debug("vision-search screenshot failed: %s", e)
+            attempt_screenshot = None
 
         _emit(emit_event, "agent_searching", {
             "run_id": submodule_run_id,
@@ -1082,6 +1814,9 @@ def _vision_search_for_target(
                 provider, page,
                 target_hint=target_hint,
                 near_misses=near_misses,
+                screenshot_bytes=attempt_screenshot,
+                cheap_provider=cheap_provider,
+                on_escalate=on_escalate,
             )
         except Exception as e:
             logger.warning("vision search call failed: %s", e)
@@ -1192,6 +1927,8 @@ def _vision_search_for_target(
         "input_tokens": total_in,
         "output_tokens": total_out,
         "halted": halt_reason,
+        "last_near_misses": last_near_misses,
+        "last_screenshot": last_screenshot,
     }
 
 
@@ -1213,14 +1950,16 @@ def _execute_tool_call(
             "narration": narration,
             "error_message": error,
             "extracted_text": "",
+            "details": {},
         }
     if tool == "extract_text":
-        status, narration, error, text = _do_extract_text(page, args)
+        status, narration, error, text, details = _do_extract_text(page, args)
         return {
             "status": status,
             "narration": narration,
             "error_message": error,
             "extracted_text": text,
+            "details": details,
         }
     if tool == "dismiss_modal":
         status, narration, error = _do_dismiss_modal(page)
@@ -1229,6 +1968,25 @@ def _execute_tool_call(
             "narration": narration,
             "error_message": error,
             "extracted_text": "",
+            "details": {},
+        }
+    if tool == "press_key":
+        status, narration, error = _do_press_key(page, args)
+        return {
+            "status": status,
+            "narration": narration,
+            "error_message": error,
+            "extracted_text": "",
+            "details": {"key": args.get("key", "")},
+        }
+    if tool == "go_back":
+        status, narration, error = _do_go_back(page)
+        return {
+            "status": status,
+            "narration": narration,
+            "error_message": error,
+            "extracted_text": "",
+            "details": {},
         }
 
     # Wrapped action tools — go through the existing dispatcher.
@@ -1253,15 +2011,40 @@ def _execute_tool_call(
             "narration": "dispatcher raised",
             "error_message": f"{type(e).__name__}: {e}",
             "extracted_text": "",
+            "details": {},
         }
+
+    # Phase 0.10 — type-and-submit. When the agent set ``submit: true``
+    # on a ``type`` call AND the type itself succeeded, fire Enter on
+    # the same field so the form actually submits. Folding the press
+    # into the same tool call avoids the agent's "now find the
+    # submit button" misadventure (Amazon's submit button is hard
+    # to locate by text). A failed Enter is a soft warning, not a
+    # type failure — the typed value did make it into the field.
+    submit_after = bool(args.get("submit")) and tool == "type"
+    submit_warning: str | None = None
+    if submit_after and result.status == "passed":
+        try:
+            page.keyboard.press("Enter")
+        except Exception as e:
+            submit_warning = f"Enter dispatch failed: {type(e).__name__}: {e}"
+
+    narration = result.narration
+    if submit_after and result.status == "passed":
+        narration = (
+            f"{narration}; pressed Enter to submit"
+            if submit_warning is None
+            else f"{narration}; submit-Enter softly failed ({submit_warning})"
+        )
 
     return {
         "status": "ok" if result.status == "passed" else (
             "blocked" if result.status == "blocked" else "failed"
         ),
-        "narration": result.narration,
+        "narration": narration,
         "error_message": result.error_message,
         "extracted_text": "",
+        "details": result.details,
     }
 
 
@@ -1291,6 +2074,26 @@ def run_agent_for_goal(
     is_cancelled: Callable[[], bool] | None = None,
     submodule_run_id: int | None = None,
     submodule_step_id: int | None = None,
+    # Plan-scoped page memory: when the orchestrator passes one in,
+    # observations on URLs visited by EARLIER submodules can be
+    # served from the cached note instead of re-parsing the AX tree.
+    # When None, a fresh local dict is used (legacy single-submodule
+    # behavior preserved). Mutated in place — caller keeps the dict
+    # alive across submodules.
+    page_memory: dict[str, dict[str, Any]] | None = None,
+    # Phase 1 — provider tiering. ``provider`` is the STRONG model
+    # (always used for the per-turn planner call). ``cheap_provider``
+    # is the cheap-tier model used as the first-attempt for VL
+    # helpers (vision-search, on-track, goal-verify, smart-pick,
+    # semantic-verify). When None, every helper routes to ``provider``
+    # and tiering is disabled — legacy single-model behavior.
+    cheap_provider: LLMProvider | None = None,
+    # Phase 6 — agent strategy. ``hybrid`` (default) keeps the
+    # DOM-first ladder. ``vision_only`` routes click / type through
+    # VL+coords directly, bypassing DOM resolution. Used for apps
+    # where DOM resolution can't reach (heavy canvas, sealed shadow
+    # DOM, etc.).
+    agent_strategy: str = "hybrid",
 ) -> AgentSubmoduleResult:
     """Drive ONE submodule to completion via the observe-think-act loop.
 
@@ -1325,13 +2128,48 @@ def run_agent_for_goal(
     provider_supports_vision = bool(
         getattr(provider, "supports_vision", False),
     )
-    # Page memory — persistent within this submodule's loop, keyed by
-    # URL. Each entry is the agent's own 1-2 line "what's on this
-    # page" note from a previous turn. Future turns on the same URL
-    # read the cached note instead of re-parsing the AX tree, the
-    # Atlas/Comet site-map pattern. Cuts observation tokens by ~80%
-    # on multi-page flows where the agent revisits pages.
-    page_memory: dict[str, dict[str, Any]] = {}
+    # Page memory — keyed by URL, each entry is the agent's own 1-2
+    # line "what's on this page" note from a previous turn. Future
+    # turns on the same URL read the cached note instead of re-
+    # parsing the AX tree (Atlas/Comet site-map pattern). Cuts
+    # observation tokens by ~80% on multi-page flows where the
+    # agent revisits pages.
+    #
+    # When the orchestrator passes a dict in, it's shared across
+    # submodules — entries written during submodule N stay readable
+    # for submodule N+1, so e.g. a login screen catalogued during
+    # the auth submodule isn't re-scraped during a follow-up flow.
+    # Default: a fresh local dict (legacy single-submodule scope).
+    if page_memory is None:
+        page_memory = {}
+
+    # Phase 12 — page graph. Edge-list of URL transitions observed
+    # during this submodule. Each edge is keyed by ``from_url`` and
+    # carries the agent's tool that caused the transition (navigate,
+    # click, go_back, etc.) plus the destination URL. Future turns
+    # use this to back-navigate cheaply (look up "how did I get to
+    # page X from Y?") without re-deriving the path. The structure
+    # is intentionally tiny — keys/values are URLs and short tool
+    # names, never full content. Survives the submodule via
+    # plan-scoped page_memory's "_graph" sidecar.
+    graph_key = "_graph"
+    if graph_key not in page_memory:
+        page_memory[graph_key] = {"edges": [], "visited_urls": []}
+    page_graph = page_memory[graph_key]
+
+    # Phase 1 — escalation emitter. Wires the router's on_escalate
+    # callback to the live-feed event stream so the user can watch
+    # tier transitions in real time. Closure captures emit_event +
+    # the run/step context so the emit signature matches what the
+    # presenter expects.
+    def _emit_escalation(role_name: str, from_model: str, reason: str) -> None:
+        _emit(emit_event, "llm_escalated", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "role": role_name,
+            "from_model": from_model,
+            "reason": (reason or "")[:200],
+        })
 
     halt_reason: HaltReason = "max_turns"
     final_status: Literal["passed", "failed", "blocked", "inconclusive"] = (
@@ -1423,6 +2261,15 @@ def run_agent_for_goal(
         #  - provider can't see images
         #  - it's still the first few turns (nothing to assess yet)
         #  - all sub-goals are already done (no point checking)
+        #
+        # Phase B.6 — smart gating. Even at the cadence interval,
+        # SKIP the check when the agent is clearly making healthy
+        # progress (a sub-goal closed in the last K turns AND the
+        # observation hash has been changing). The on-track check
+        # is meant to catch "stuck without realising it" — when the
+        # checklist is moving and the page is moving, the call adds
+        # cost without value. The deterministic stall guard still
+        # catches bona fide stuck states.
         on_track_block = ""
         unverified_sub_goals = (
             bool(goal.sub_goals)
@@ -1431,12 +2278,24 @@ def run_agent_for_goal(
                 for sg in goal.sub_goals
             )
         )
+        # Healthy-progress signals.
+        recent_window = max(3, on_track_interval - 1)
+        sub_goal_advanced_recently = any(
+            sg.completed_at_turn is not None
+            and (turn_idx - sg.completed_at_turn) <= recent_window
+            for sg in goal.sub_goals
+        )
+        page_state_moving = len(set(obs_hashes)) >= 2
+        healthy_progress = (
+            sub_goal_advanced_recently or page_state_moving
+        )
         should_check_on_track = (
             provider_supports_vision
             and on_track_interval > 0
             and turn_idx >= on_track_interval
             and turn_idx % on_track_interval == 0
             and unverified_sub_goals
+            and not healthy_progress  # B.6 — skip when moving
         )
         if should_check_on_track:
             try:
@@ -1454,6 +2313,8 @@ def run_agent_for_goal(
                     goal_description=goal.description,
                     sub_goal_summary=sg_summary,
                     recent_turns_summary=recent_summary,
+                    cheap_provider=cheap_provider,
+                    on_escalate=_emit_escalation,
                 )
             except Exception as e:
                 logger.debug("on-track check skipped: %s", e)
@@ -1499,6 +2360,19 @@ def run_agent_for_goal(
             if memory_text else ""
         )
 
+        # Phase 12 — page graph block. Shows recent URL transitions
+        # so the agent can back-navigate via go_back() or by knowing
+        # the URL it came from. Especially useful for cascade flows
+        # ("search -> product -> back to results -> another product").
+        graph_text = _format_page_graph_for_prompt(
+            page_graph, current_url,
+        )
+        graph_block = (
+            f"\nNAV GRAPH (recent URL transitions in this submodule; "
+            f"use go_back or navigate(url) to return):\n{graph_text}\n"
+            if graph_text else ""
+        )
+
         # If the agent has already memorized THIS URL, send a TRIMMED
         # observation (just URL + title + element_count) — the memory
         # note + the diff block (which names any new/removed elements)
@@ -1535,7 +2409,8 @@ def run_agent_for_goal(
             f"{vision_note}"
             f"{diff_block}"
             f"{on_track_block}"
-            f"{memory_block}\n"
+            f"{memory_block}"
+            f"{graph_block}\n"
             f"{_format_goal_for_prompt(goal, turn_idx=turn_idx)}\n\n"
             f"HISTORY (last few turns):\n{_format_history_for_prompt(turn_log)}\n\n"
             f"{obs_block}\n\n"
@@ -1556,7 +2431,12 @@ def run_agent_for_goal(
                 schema=TOOL_CALL_SCHEMA,
                 schema_name="qa_tool_call",
                 temperature=0.3,
-                max_output_tokens=1024,
+                # TOOL_CALL_SCHEMA requires ~200-300 output tokens
+                # at the median (tool name + args + reasoning + a
+                # short page_memory_note). 512 leaves comfortable
+                # headroom for verbose reasoning while cutting the
+                # tail-latency / cost ceiling vs the prior 1024.
+                max_output_tokens=512,
             )
             if attach_screenshot:
                 vision_calls += 1
@@ -1608,6 +2488,8 @@ def run_agent_for_goal(
         # turn's prompt renders the up-to-date checklist.
         current_sg_id = str(parsed.get("current_sub_goal_id", "")).strip()
         completed_sg_id = str(parsed.get("sub_goal_completed_id", "")).strip()
+        skip_sg_id = str(parsed.get("skip_sub_goal_id", "")).strip()
+        skip_sg_reason = str(parsed.get("skip_sub_goal_reason", "")).strip()
         if goal.sub_goals:
             for sg in goal.sub_goals:
                 if sg.id == current_sg_id and sg.status == "pending":
@@ -1630,11 +2512,43 @@ def run_agent_for_goal(
                             ),
                             "total": len(goal.sub_goals),
                         })
+            # Phase B.1 — sub-goal SKIP application. Agent marks a
+            # sub-goal as not applicable; emit progress so the live
+            # presenter shows the skip + reason. Reason is mandatory;
+            # if the agent omitted it we still apply the skip but
+            # log a warning so we can spot bad flagging in telemetry.
+            if skip_sg_id:
+                if not skip_sg_reason:
+                    logger.warning(
+                        "skip_sub_goal_id=%s without reason on turn %d",
+                        skip_sg_id, turn_idx,
+                    )
+                for sg in goal.sub_goals:
+                    if sg.id == skip_sg_id and sg.status not in (
+                        "done", "skipped",
+                    ):
+                        sg.status = "skipped"
+                        sg.completed_at_turn = turn_idx
+                        _emit(emit_event, "sub_goal_progress", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "sub_goal_id": sg.id,
+                            "description": sg.description,
+                            "status": "skipped",
+                            "skip_reason": skip_sg_reason[:200],
+                            "turn": turn_idx,
+                            "remaining": sum(
+                                1 for s in goal.sub_goals
+                                if s.status not in ("done", "skipped")
+                            ),
+                            "total": len(goal.sub_goals),
+                        })
         args = {
             k: v for k, v in parsed.items()
             if k not in (
                 "tool", "reasoning", "confidence", "page_memory_note",
                 "current_sub_goal_id", "sub_goal_completed_id",
+                "skip_sub_goal_id", "skip_sub_goal_reason",
             )
         }
 
@@ -1670,15 +2584,23 @@ def run_agent_for_goal(
             # (some agents call mark_goal_complete with the final
             # sub-goal still "in_progress" because the verify itself
             # closed it). So the bar is "≥ 80% done OR ≥ all-but-1".
+            #
+            # Phase B.1 — count SKIPPED sub-goals as "closed". An
+            # agent that correctly recognizes a sub-goal is not
+            # applicable (e.g. "remove cart items" when cart is
+            # already empty) shouldn't be punished. SKIP requires
+            # a reason and surfaces in the live feed, so it's
+            # auditable.
             sub_goal_completion_ok = True
             if goal.sub_goals:
-                done = sum(
-                    1 for sg in goal.sub_goals if sg.status == "done"
+                closed = sum(
+                    1 for sg in goal.sub_goals
+                    if sg.status in ("done", "skipped")
                 )
                 total = len(goal.sub_goals)
-                pct = done / total if total else 1.0
+                pct = closed / total if total else 1.0
                 sub_goal_completion_ok = (
-                    pct >= 0.80 or done >= total - 1
+                    pct >= 0.80 or closed >= total - 1
                 )
 
             # A4.1a: vision-grounded verdict. Only run when the
@@ -1694,12 +2616,21 @@ def run_agent_for_goal(
                 if not verified:
                     reasons.append("no successful verify/extract_text")
                 if not sub_goal_completion_ok:
-                    done = sum(
-                        1 for sg in goal.sub_goals if sg.status == "done"
+                    closed = sum(
+                        1 for sg in goal.sub_goals
+                        if sg.status in ("done", "skipped")
+                    )
+                    skipped = sum(
+                        1 for sg in goal.sub_goals
+                        if sg.status == "skipped"
                     )
                     total = len(goal.sub_goals)
                     reasons.append(
-                        f"only {done}/{total} sub-goals closed"
+                        f"only {closed}/{total} sub-goals closed"
+                        + (
+                            f" ({skipped} skipped)"
+                            if skipped else ""
+                        )
                     )
                 final_narration = (
                     "Agent marked complete but flagged inconclusive: "
@@ -1733,6 +2664,8 @@ def run_agent_for_goal(
                             provider, page,
                             goal_description=goal.description,
                             success_criteria=list(goal.success_criteria),
+                            cheap_provider=cheap_provider,
+                            on_escalate=_emit_escalation,
                         )
                     except Exception as e:
                         logger.warning(
@@ -1839,6 +2772,71 @@ def run_agent_for_goal(
             ))
             break
 
+        # Phase 11 — test-case dispute. Agent flags the test step as
+        # provably wrong (selector dead, action impossible, precondition
+        # not met). We halt with status=blocked, halt_reason=
+        # test_case_disputed, and attach the structured dispute payload
+        # to the turn record so the report can render it. Frozen-path
+        # capture is suppressed for this run (the disputed flow is
+        # not a deterministic replay candidate).
+        if tool == "flag_test_case_issue":
+            issue_kind = str(args.get("issue_kind") or "").strip()
+            issue_evidence = str(args.get("issue_evidence") or "").strip()
+            issue_fix = str(args.get("issue_suggested_fix") or "").strip()
+            valid_kinds = (
+                "wrong_selector", "missing_step", "impossible_action",
+                "misleading_description", "precondition_failed",
+            )
+            if issue_kind not in valid_kinds:
+                # Malformed dispute — log, treat as a soft failure
+                # rather than halting on a meta misuse.
+                logger.warning(
+                    "flag_test_case_issue with invalid kind=%r — "
+                    "treating as ask_human", issue_kind,
+                )
+                halt_reason = "ask_human"
+                final_status = "blocked"
+                final_narration = (
+                    f"Agent tried to dispute the test case but the "
+                    f"issue_kind {issue_kind!r} is not recognized. "
+                    f"Reasoning: {reasoning[:200]}"
+                )
+            else:
+                halt_reason = "test_case_disputed"
+                final_status = "blocked"
+                final_narration = (
+                    f"TEST CASE DISPUTED ({issue_kind}): "
+                    f"{issue_evidence[:160]}"
+                )
+                if issue_fix:
+                    final_narration += f" — suggested fix: {issue_fix[:120]}"
+                _emit(emit_event, "test_case_disputed", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "kind": issue_kind,
+                    "evidence": issue_evidence[:400],
+                    "suggested_fix": issue_fix[:400],
+                    "turn": turn_idx,
+                    "reasoning": reasoning[:300],
+                })
+            dispute_record = TurnRecord(
+                turn=turn_idx, tool=tool, args=args, reasoning=reasoning,
+                confidence=confidence, status="blocked",
+                narration=final_narration[:500],
+                page_url=observation.get("url", ""),
+            )
+            # Reuse search_log for the structured dispute payload —
+            # report_service lifts it into the per-step surface.
+            dispute_record.search_log = {
+                "kind": "test_case_dispute",
+                "issue_kind": issue_kind,
+                "evidence": issue_evidence,
+                "suggested_fix": issue_fix,
+                "turn": turn_idx,
+            }
+            turn_log.append(dispute_record)
+            break
+
         # ── Action tool: oscillation guard ─────────────────────────
         sig = _signature(tool, args)
         history_signatures.append(sig)
@@ -1858,12 +2856,293 @@ def run_agent_for_goal(
             ))
             break
 
+        # ── Phase 14: smart candidate selection (PRE-action) ───────
+        # Before a click on a target_hint that resolves to multiple
+        # candidates, ask the vision LLM to pick the BEST one given
+        # the goal's criteria (skip sponsored ads, items without
+        # prices, items violating a goal constraint, etc.).
+        #
+        # Triggers when ALL of:
+        #   - tool is click (extending to type/select later)
+        #   - target_hint is set
+        #   - the resolver finds >= 3 visible matches (ambiguous)
+        #   - provider supports vision
+        # On success the LLM returns either:
+        #   - a precise selector → we patch args[target_hint] with it
+        #     and let the normal click dispatch use it
+        #   - pixel coords → we click at coords directly via mouse
+        #   - "scroll" → scroll the requested direction and skip the
+        #     click this turn (next turn's observation reflects the
+        #     scrolled state)
+        #   - "none" → leave args alone and let the regular dispatch
+        #     fail; the next turn can dispute or improvise
+        #
+        # When provider has no vision OR the resolver finds 0-2
+        # matches, this whole block is skipped — zero cost on the
+        # happy path.
+        smart_pick_record: dict[str, Any] | None = None
+        if (
+            tool == "click"
+            and provider_supports_vision
+            and isinstance(args.get("target_hint"), str)
+            and args["target_hint"].strip()
+        ):
+            smart_pick_record = _maybe_run_smart_pick(
+                page=page,
+                provider=provider,
+                cheap_provider=cheap_provider,
+                goal=goal,
+                tool=tool,
+                args=args,
+                emit_event=emit_event,
+                on_escalate=_emit_escalation,
+                submodule_run_id=submodule_run_id,
+                submodule_step_id=submodule_step_id,
+            )
+            if smart_pick_record is not None:
+                vision_calls += 1
+                llm_calls += 1
+                if isinstance(smart_pick_record.get("input_tokens"), int):
+                    total_input += smart_pick_record["input_tokens"]
+                if isinstance(smart_pick_record.get("output_tokens"), int):
+                    total_output += smart_pick_record["output_tokens"]
+
         # ── Act ────────────────────────────────────────────────────
-        outcome = _execute_tool_call(
-            page, tool, args,
-            plan_target_url=plan_target_url,
-            speed_config=speed_config,
-        )
+        # Phase 6 — vision-only mode. When agent_strategy == "vision_
+        # only" AND tool is click/type AND we have a target_hint, route
+        # via VL+coords directly (DOM resolution bypassed entirely).
+        # This is the "computer use" path — slower / more vision tokens
+        # but works on apps the DOM resolver can't reach (heavy canvas,
+        # sealed shadow DOM, hostile rotating classes, SAP GUI for HTML
+        # in legacy frames). Smart-pick still runs first because it
+        # ALSO returns coords for ambiguous cases — when smart-pick
+        # already preempted with a coord click, we use that and skip
+        # this branch (no point re-clicking).
+        vision_only_outcome: dict[str, Any] | None = None
+        if (
+            agent_strategy == "vision_only"
+            and tool in ("click", "type")
+            and provider_supports_vision
+            and isinstance(args.get("target_hint"), str)
+            and args["target_hint"].strip()
+            and (
+                smart_pick_record is None
+                or smart_pick_record.get("preempt_outcome") is None
+            )
+        ):
+            vision_only_outcome = _vision_only_dispatch(
+                page=page,
+                tool=tool,
+                args=args,
+                provider=provider,
+                cheap_provider=cheap_provider,
+                emit_event=emit_event,
+                on_escalate=_emit_escalation,
+                submodule_run_id=submodule_run_id,
+                submodule_step_id=submodule_step_id,
+            )
+            if vision_only_outcome is not None:
+                outcome = vision_only_outcome["outcome"]
+                if isinstance(vision_only_outcome.get("input_tokens"), int):
+                    total_input += vision_only_outcome["input_tokens"]
+                if isinstance(vision_only_outcome.get("output_tokens"), int):
+                    total_output += vision_only_outcome["output_tokens"]
+                vision_calls += 1
+                llm_calls += 1
+
+        # Smart-pick may have written a coord-click outcome already;
+        # in that case skip the normal dispatcher and use that result
+        # directly (see ``_maybe_run_smart_pick`` for the contract).
+        if vision_only_outcome is not None:
+            pass  # already set
+        elif (
+            smart_pick_record is not None
+            and smart_pick_record.get("preempt_outcome") is not None
+        ):
+            outcome = smart_pick_record["preempt_outcome"]
+        else:
+            outcome = _execute_tool_call(
+                page, tool, args,
+                plan_target_url=plan_target_url,
+                speed_config=speed_config,
+            )
+
+        # ── Phase 10: popup classifier on intercepted clicks ──────
+        # When a click failed because something is overlaying the
+        # target (Playwright reports "intercepts pointer events"),
+        # ask the vision LLM what the overlay IS — required step
+        # (engage), dismissable blocker (close it), non-blocking
+        # banner (ignore), or ad (close aggressively). On low
+        # confidence we ENGAGE (your locked policy from plan Q3:
+        # the cost of skipping a required step is much worse than
+        # one extra modal click).
+        popup_record: dict[str, Any] | None = None
+        outcome_details_after = outcome.get("details") or {}
+        if (
+            outcome["status"] == "failed"
+            and outcome_details_after.get("failure_kind") == "click_intercepted"
+            and provider_supports_vision
+        ):
+            try:
+                from app.agents.page_intel import (  # noqa: PLC0415
+                    classify_popup, capture_screenshot_for_vision,
+                )
+                popup_screenshot = capture_screenshot_for_vision(page)
+                pc = classify_popup(
+                    provider, page,
+                    goal_context=(
+                        f"{goal.description} (current target: "
+                        f"{args.get('target_hint', '')!r})"
+                    )[:400],
+                    screenshot_bytes=popup_screenshot,
+                    cheap_provider=cheap_provider,
+                    on_escalate=_emit_escalation,
+                )
+                if isinstance(pc.input_tokens, int):
+                    total_input += pc.input_tokens
+                if isinstance(pc.output_tokens, int):
+                    total_output += pc.output_tokens
+                vision_calls += 1
+                llm_calls += 1
+                _emit(emit_event, "popup_classified", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "kind": pc.kind,
+                    "confidence": pc.confidence,
+                    "reasoning": pc.reasoning[:200],
+                })
+                popup_record = {
+                    "kind": pc.kind,
+                    "dismiss_hint": pc.dismiss_hint,
+                    "confidence": pc.confidence,
+                    "reasoning": pc.reasoning,
+                    "input_tokens": pc.input_tokens,
+                    "output_tokens": pc.output_tokens,
+                }
+
+                # Resolve based on kind. Low confidence (< 0.7) →
+                # default to engage (treat as required_step).
+                effective_kind = (
+                    pc.kind if pc.confidence >= 0.7 else "required_step"
+                )
+
+                if effective_kind in ("dismissable_blocker", "ad"):
+                    # Try the LLM-supplied hint first; fall through
+                    # to the heuristic dismiss_modal otherwise.
+                    dismissed = False
+                    if pc.dismiss_hint:
+                        try:
+                            page.locator(pc.dismiss_hint).first.click(
+                                timeout=3_000,
+                            )
+                            dismissed = True
+                        except Exception as e:
+                            logger.debug(
+                                "popup dismiss_hint %r failed: %s",
+                                pc.dismiss_hint, e,
+                            )
+                    if not dismissed:
+                        ds_status, _, _ = _do_dismiss_modal(page)
+                        dismissed = ds_status == "ok"
+                    if dismissed:
+                        # Retry the original click ONCE post-dismiss.
+                        retry_outcome = _execute_tool_call(
+                            page, tool, args,
+                            plan_target_url=plan_target_url,
+                            speed_config=speed_config,
+                        )
+                        retry_outcome["narration"] = (
+                            f"{retry_outcome.get('narration') or tool}"
+                            f" (after popup dismiss: {pc.kind})"
+                        )
+                        outcome = retry_outcome
+                # required_step / non_blocking_overlay / none →
+                # leave the failed outcome alone; the agent's next
+                # turn will see the popup in its observation and
+                # engage with it via normal click.
+            except Exception as e:
+                logger.warning("popup classifier call failed: %s", e)
+
+        # ── Phase 9 + 13: semantic verify escalation ──────────────
+        # When a literal `verify` step fails, ask the vision LLM
+        # whether the SCREENSHOT shows the expected outcome anyway.
+        # Wins the spurious-fail case where the page wraps text
+        # differently than the test case anticipated ("Cart" vs
+        # "Your Amazon Cart") but the goal is semantically met.
+        # Strict prompt — biased toward inconclusive/fail on doubt
+        # so we never mask a real bug behind a generous read.
+        semantic_verify_record: dict[str, Any] | None = None
+        if (
+            tool == "verify"
+            and outcome["status"] == "failed"
+            and provider_supports_vision
+        ):
+            expected_text = (
+                str(args.get("expected") or "").strip()
+                or str(args.get("target_hint") or "").strip()
+            )
+            if expected_text:
+                _emit(emit_event, "semantic_verify_started", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "expected": expected_text[:200],
+                })
+                try:
+                    from app.agents.page_intel import (  # noqa: PLC0415
+                        verify_semantic,
+                    )
+                    sv = verify_semantic(
+                        provider, page,
+                        expected=expected_text,
+                        target_hint=str(args.get("target_hint") or "") or None,
+                        full_page=True,  # revalidation per user spec
+                        cheap_provider=cheap_provider,
+                        on_escalate=_emit_escalation,
+                    )
+                    if isinstance(sv.input_tokens, int):
+                        total_input += sv.input_tokens
+                    if isinstance(sv.output_tokens, int):
+                        total_output += sv.output_tokens
+                    vision_calls += 1
+                    llm_calls += 1
+                    semantic_verify_record = {
+                        "verdict": sv.verdict,
+                        "reasoning": sv.reasoning,
+                        "confidence": sv.confidence,
+                        "visible_evidence": sv.visible_evidence,
+                        "input_tokens": sv.input_tokens,
+                        "output_tokens": sv.output_tokens,
+                    }
+                    _emit(emit_event, "semantic_verify_completed", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "verdict": sv.verdict,
+                        "confidence": sv.confidence,
+                        "reasoning": sv.reasoning[:200],
+                    })
+                    # Upgrade ONLY on an unambiguous "pass". Strict
+                    # rubric: confidence >= 0.85 to flip a failed
+                    # literal verify into ok. Anything weaker keeps
+                    # the failure (we'd rather false-flag a passing
+                    # test than mask a real bug).
+                    if sv.verdict == "pass" and sv.confidence >= 0.85:
+                        outcome["status"] = "ok"
+                        outcome["narration"] = (
+                            f"{outcome.get('narration') or 'verify'}"
+                            f" — semantically passed via vision: "
+                            f"{sv.visible_evidence[:120]}"
+                        )
+                        outcome["error_message"] = None
+                except Exception as e:
+                    logger.warning(
+                        "semantic verify escalation failed: %s", e,
+                    )
+                    _emit(emit_event, "semantic_verify_completed", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "verdict": "error",
+                        "error": str(e)[:200],
+                    })
 
         # ── A4.1b: vision-guided target search on a missed selector ─
         # When a target-bound action just failed because the selector
@@ -1876,11 +3155,17 @@ def run_agent_for_goal(
         # - all sub-goals are already done (no point searching for a
         #   target the agent's chasing past completion)
         target_bound = tool in ("click", "type", "select", "verify", "wait")
+        # Prefer the typed ``failure_kind`` flag set by actions.py /
+        # _do_extract_text. Fall back to the legacy string match so
+        # any not-yet-typed call site still triggers the rescue path
+        # (defence in depth — the typed flag is authoritative when
+        # present).
+        outcome_details = outcome.get("details") or {}
         miss_due_to_selector = (
             outcome["status"] == "failed"
-            and isinstance(outcome.get("error_message"), str)
             and (
-                "target not visible" in (outcome.get("narration") or "").lower()
+                outcome_details.get("failure_kind") == "selector_not_found"
+                or "target not visible" in (outcome.get("narration") or "").lower()
                 or "no visible element" in (outcome.get("error_message") or "").lower()
             )
         )
@@ -1905,7 +3190,18 @@ def run_agent_for_goal(
                 emit_event=emit_event,
                 submodule_run_id=submodule_run_id,
                 submodule_step_id=submodule_step_id,
+                cheap_provider=cheap_provider,
+                on_escalate=_emit_escalation,
             )
+            # Strip the in-memory ONLY screenshot bytes out of
+            # search_result before anything reads it as `search_log`:
+            # search_log is folded into TurnRecord.search_log and
+            # serialized to details_json, which goes through JSON.
+            # Bytes aren't JSON-serializable. Coord-click can't
+            # reuse this anyway — vision-search captures downscaled
+            # bytes; coord-click needs original viewport pixel
+            # space — so the bytes are simply discarded here.
+            search_result.pop("last_screenshot", None)
             # Roll vision search tokens into the run-level cost meter.
             if isinstance(search_result.get("input_tokens"), int):
                 total_input += search_result["input_tokens"]
@@ -1967,9 +3263,28 @@ def run_agent_for_goal(
                         from app.agents.page_intel import (  # noqa: PLC0415
                             propose_click_coordinates,
                         )
+                        # Reuse the AX-tree near-misses AND the
+                        # screenshot bytes the vision search just
+                        # computed for this exact page state. Saves
+                        # the coord-click LLM from a cold start AND
+                        # avoids recomputing the AX tree / re-
+                        # screenshotting (the page hasn't moved
+                        # since search exhausted).
+                        coord_near_misses = (
+                            search_result.get("last_near_misses") or None
+                        )
+                        # NOTE: do NOT reuse the vision-search
+                        # screenshot here — that one is downscaled.
+                        # Coord-click MUST see the page at its true
+                        # pixel dimensions because its output goes
+                        # straight into ``page.mouse.click(x, y)``.
+                        # Letting propose_click_coordinates capture
+                        # internally (with downscale=False) keeps
+                        # the click coordinates in viewport space.
                         coords = propose_click_coordinates(
                             provider, page,
                             target_hint=str(args.get("target_hint", "")),
+                            near_misses=coord_near_misses,
                         )
                     except Exception as e:
                         logger.warning(
@@ -2071,6 +3386,52 @@ def run_agent_for_goal(
                             "status": outcome["status"],
                         })
 
+        # Phase 14 — fold the smart-pick record into search_log so
+        # the report timeline shows what was rejected and why. Done
+        # AFTER any vision-search rescue so we don't clobber that
+        # record (smart_pick lives alongside, not instead of).
+        if smart_pick_record is not None:
+            existing_log = outcome.get("search_log")
+            if isinstance(existing_log, dict):
+                existing_log["smart_pick"] = {
+                    k: v for k, v in smart_pick_record.items()
+                    if k != "preempt_outcome"
+                }
+            else:
+                outcome["search_log"] = {
+                    "kind": "smart_pick",
+                    **{
+                        k: v for k, v in smart_pick_record.items()
+                        if k != "preempt_outcome"
+                    },
+                }
+
+        # Phase 9 — fold semantic verify result into search_log so
+        # the report shows BOTH the literal failure AND the LLM's
+        # escalation verdict (and the visible evidence it cited).
+        if semantic_verify_record is not None:
+            existing_log = outcome.get("search_log")
+            if isinstance(existing_log, dict):
+                existing_log["semantic_verify"] = semantic_verify_record
+            else:
+                outcome["search_log"] = {
+                    "kind": "semantic_verify",
+                    "semantic_verify": semantic_verify_record,
+                }
+
+        # Phase 10 — fold popup classification + dismissal trace into
+        # search_log so the report timeline shows what overlay was
+        # detected and how the agent handled it.
+        if popup_record is not None:
+            existing_log = outcome.get("search_log")
+            if isinstance(existing_log, dict):
+                existing_log["popup"] = popup_record
+            else:
+                outcome["search_log"] = {
+                    "kind": "popup",
+                    "popup": popup_record,
+                }
+
         # Update banner phase to reflect outcome
         phase = (
             "did" if outcome["status"] == "ok"
@@ -2107,7 +3468,10 @@ def run_agent_for_goal(
         # on success — keeps token cost zero on the happy path.
         if outcome["status"] == "failed" and provider_supports_vision:
             try:
-                pending_screenshot = page.screenshot(full_page=False)
+                from app.agents.page_intel import (  # noqa: PLC0415
+                    capture_screenshot_for_vision,
+                )
+                pending_screenshot = capture_screenshot_for_vision(page)
             except Exception as e:
                 logger.debug(
                     "post-failure screenshot capture failed: %s", e,
@@ -2124,6 +3488,32 @@ def run_agent_for_goal(
             "error": rec.error_message,
             "vision_pending": pending_screenshot is not None,
         })
+
+        # Phase 12 — page graph edge. When the URL changed during
+        # this turn, record (from, to, tool) so future turns can
+        # back-navigate or recognise "I've been here before via
+        # this path". Edge list capped at 60 to bound memory.
+        from_url = (
+            prev_observation.get("url", "")
+            if prev_observation else ""
+        )
+        to_url = observation.get("url", "")
+        if from_url and to_url and from_url != to_url:
+            edges = page_graph.setdefault("edges", [])
+            edges.append({
+                "from": from_url,
+                "to": to_url,
+                "tool": rec.tool,
+                "turn": turn_idx,
+            })
+            if len(edges) > 60:
+                page_graph["edges"] = edges[-60:]
+        if to_url:
+            visited = page_graph.setdefault("visited_urls", [])
+            if not visited or visited[-1] != to_url:
+                visited.append(to_url)
+                if len(visited) > 60:
+                    page_graph["visited_urls"] = visited[-60:]
 
         # Snapshot for next turn's diff. Only update at end of a
         # successful loop iteration so the diff compares against the
@@ -2253,6 +3643,16 @@ def run_qa_agent_for_plan(
     wait_for_intervention: Callable[[int], dict | None] | None = None,  # noqa: ARG001
     max_turns_per_goal: int = 30,
     max_wallclock_s_per_goal: int = 300,
+    # Phase 1 — provider tiering. When the caller hasn't supplied
+    # both, we look them up via build_tier_pair() from app_settings.
+    # Strong = ``provider`` (existing arg, kept for back-compat).
+    # Cheap = optional cheaper model that handles VL helpers with
+    # escalation. None disables tiering — every call goes to strong.
+    cheap_provider: LLMProvider | None = None,
+    # Phase 6 — action strategy. ``hybrid`` (DOM-first) or
+    # ``vision_only`` (VL+coords for click/type). Threaded into
+    # each submodule's ``run_agent_for_goal``.
+    agent_strategy: str = "hybrid",
 ) -> ExecutionResult:
     """Run the agentic executor: one agent-loop per submodule.
 
@@ -2399,6 +3799,13 @@ def run_qa_agent_for_plan(
                         ),
                     })
 
+            # Plan-scoped page memory — passed into every submodule's
+            # agent loop. URLs catalogued during submodule N stay
+            # readable to submodule N+1, so e.g. a login screen
+            # already mapped during auth doesn't get re-scraped on a
+            # follow-up checkout flow that bounces through it.
+            plan_page_memory: dict[str, dict[str, Any]] = {}
+
             for idx, ((submodule, steps), row) in enumerate(zip(groups, rows)):
                 if is_cancelled and is_cancelled():
                     cancelled = True
@@ -2480,6 +3887,9 @@ def run_qa_agent_for_plan(
                     is_cancelled=is_cancelled,
                     submodule_run_id=run_id,
                     submodule_step_id=row.id,
+                    page_memory=plan_page_memory,
+                    cheap_provider=cheap_provider,
+                    agent_strategy=agent_strategy,
                 )
 
                 total_input_tokens += result.input_tokens
@@ -2506,7 +3916,7 @@ def run_qa_agent_for_plan(
                 row.narration = result.final_narration[:1024]
                 row.error_message = result.error_message
                 row.screenshot_path = screenshot
-                row.details_json = {
+                row.details_json = _json_safe({
                     "mode": "agentic",
                     "goal": goal.to_dict(),
                     "halt_reason": result.halt_reason,
@@ -2530,7 +3940,7 @@ def run_qa_agent_for_plan(
                     "llm_calls": result.llm_calls,
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
-                }
+                })
                 counts[result.status] = counts.get(result.status, 0) + 1
                 db.commit()
 
@@ -2556,9 +3966,22 @@ def run_qa_agent_for_plan(
                 # (b) vision didn't run (no provider vision support)
                 # but everything else passed. Don't freeze on
                 # partial/fail.
+                #
+                # Also skip when any turn was rescued by a human
+                # typing into the HITL popup (creds / OTP / captcha
+                # solve). Those values are one-time and the page
+                # state on a future replay won't match — freezing
+                # such a path would hard-code a stale secret as a
+                # selector arg or canonicalize a non-deterministic
+                # step. The human still gets prompted next time.
+                manual_intervention_in_run = any(
+                    getattr(t, "manual_intervention_used", False)
+                    for t in result.turn_log
+                )
                 should_freeze = (
                     result.status == "passed"
                     and vision_verdict in (None, "pass")
+                    and not manual_intervention_in_run
                 )
                 if should_freeze:
                     frozen = _build_frozen_path(

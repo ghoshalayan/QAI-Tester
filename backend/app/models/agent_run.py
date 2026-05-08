@@ -59,6 +59,18 @@ class AgentRun(Base):
         String(16), default="queued", nullable=False,
     )
 
+    # Phase 6 — agent strategy. Only meaningful for ``kind='execute'``
+    # runs in agentic mode. ``hybrid`` (default) = DOM-first ladder
+    # with vision rescue. ``vision_only`` = pure VL+coords (slower /
+    # costlier but works on apps DOM resolution can't reach: heavy
+    # canvas, sealed shadow DOM, hostile sites).
+    agent_strategy: Mapped[str] = mapped_column(
+        String(16),
+        default="hybrid",
+        server_default="hybrid",
+        nullable=False,
+    )
+
     input_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     output_summary_json: Mapped[dict] = mapped_column(
         JSON, default=dict, nullable=False,

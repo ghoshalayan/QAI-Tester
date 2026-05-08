@@ -61,6 +61,7 @@ export default function SettingsPage() {
 
   const [provider, setProvider] = useState<Provider>("gemini");
   const [model, setModel] = useState("");
+  const [cheapModel, setCheapModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [testResult, setTestResult] = useState<TestConnectionResult | null>(null);
@@ -70,6 +71,7 @@ export default function SettingsPage() {
     if (!settings) return;
     if (settings.provider) setProvider(settings.provider);
     if (settings.model) setModel(settings.model);
+    if (settings.cheap_model) setCheapModel(settings.cheap_model);
     if (settings.base_url) setBaseUrl(settings.base_url);
   }, [settings]);
 
@@ -80,6 +82,9 @@ export default function SettingsPage() {
 
   const buildPayload = (): SettingsWrite => {
     const payload: SettingsWrite = { provider, model: model.trim() };
+    // Send cheap_model on every save (empty string clears tiering) so
+    // the user can disable an existing tier by blanking the field.
+    payload.cheap_model = cheapModel.trim();
     if (apiKey.trim()) payload.api_key = apiKey.trim();
     if (isCompat) payload.base_url = baseUrl.trim();
     return payload;
@@ -200,7 +205,7 @@ export default function SettingsPage() {
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="model">Model</Label>
+            <Label htmlFor="model">Model (strong)</Label>
             <Input
               id="model"
               list={`model-suggestions-${provider}`}
@@ -221,6 +226,31 @@ export default function SettingsPage() {
                 {MODEL_SUGGESTIONS[provider].slice(0, 4).join(", ")}…
               </p>
             )}
+            <p className="text-xs text-muted-foreground">
+              Used for the per-turn planner, action reasoning, and
+              coordinate-click. Always the highest-precision tier.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="cheap-model">
+              Cheap model (optional, escalation tier)
+            </Label>
+            <Input
+              id="cheap-model"
+              list={`model-suggestions-${provider}`}
+              value={cheapModel}
+              onChange={(e) => setCheapModel(e.target.value)}
+              placeholder="leave blank to disable tiering"
+            />
+            <p className="text-xs text-muted-foreground">
+              When set, the agent runs vision-search, on-track checks,
+              goal verification, smart-pick, and semantic verify on
+              this model first. If the cheap tier returns confidence
+              below 0.7 or fails validation, the agent re-runs the
+              call on the strong model above. Leave blank to send
+              every call to the strong model (legacy behavior).
+            </p>
           </div>
 
           <div className="space-y-2">

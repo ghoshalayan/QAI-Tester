@@ -278,6 +278,7 @@ def start_execute(
             "auto_adjust": payload.auto_adjust,
             "promote_fixes": payload.promote_fixes,
             "mode": payload.mode,
+            "agent_strategy": payload.agent_strategy,
             "window_x": payload.window_x,
             "window_y": payload.window_y,
             "window_width": payload.window_width,
@@ -613,6 +614,11 @@ def submit_intervention(
         "override_target_hint": payload.override_target_hint,
         "override_action_type": payload.override_action_type,
         "apply_to_submodule": payload.apply_to_submodule,
+        # Phase 4 — typed HITL input. The auth-flow orchestrator
+        # reads these when choice in {provide_text, manual_solved}.
+        "text_value": payload.text_value,
+        "text_kind": payload.text_kind,
+        "text_value_secondary": payload.text_value_secondary,
     }
     delivered = provide_intervention(run.id, payload.step_id, choice_payload)
     if not delivered:
@@ -631,6 +637,32 @@ def submit_intervention(
         " (apply_to_submodule)" if payload.apply_to_submodule else "",
     )
     return run
+
+
+@router.get("/{run_id}/intervention/open")
+def get_open_intervention_prompt(
+    project_id: int,
+    run_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase 4 — return the open typed HITL prompt (if any) for a step.
+
+    The live popup polls this on mount so it can re-render the
+    pending input form after a hard reload (the SSE
+    ``hitl_prompt_opened`` event would otherwise be missed). Returns
+    a small dict with ``kind``, ``question``, and ``fields``, or
+    ``{"open": false}`` when nothing is pending.
+    """
+    # Validates that the run belongs to this project (raises 404).
+    _require_run(db, project_id, run_id)
+    from app.services.agent_run_service import (  # noqa: PLC0415
+        get_open_prompt,
+    )
+    prompt = get_open_prompt(run_id, step_id)
+    if prompt is None:
+        return {"open": False}
+    return {"open": True, **prompt}
 
 
 @router.get("/{run_id}/steps", response_model=list[ExecutionStepRead])

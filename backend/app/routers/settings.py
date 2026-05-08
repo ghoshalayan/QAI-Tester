@@ -27,6 +27,7 @@ def _to_read(row: AppSettings | None) -> AppSettingsRead:
         is_configured=bool(row.provider and row.model and row.api_key),
         provider=row.provider,  # type: ignore[arg-type]
         model=row.model,
+        cheap_model=getattr(row, "cheap_model", None) or None,
         base_url=row.base_url,
         api_key_set=bool(row.api_key),
         ai_mode=bool(getattr(row, "ai_mode", False)),
@@ -65,6 +66,7 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
         payload.ai_mode is not None
         and payload.provider is None
         and payload.model is None
+        and payload.cheap_model is None
         and payload.api_key is None
         and payload.base_url is None
     )
@@ -76,10 +78,20 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
                 "Configure an LLM provider before enabling AI Mode.",
             )
         _validate_for_create(payload)
+        # Phase 1 — cheap_model: must NOT equal model (would be a no-op
+        # tier and adds DB ambiguity). Empty string = no tiering.
+        cheap = (payload.cheap_model or "").strip() or None
+        if cheap and cheap == payload.model:
+            raise HTTPException(
+                400,
+                "cheap_model must differ from model — they form the "
+                "(primary, escalation) pair for tiering.",
+            )
         row = AppSettings(
             id=1,
             provider=payload.provider,
             model=payload.model,
+            cheap_model=cheap,
             api_key=payload.api_key,
             base_url=payload.base_url if payload.provider == "openai_compat" else None,
             ai_mode=bool(payload.ai_mode) if payload.ai_mode is not None else False,
@@ -113,6 +125,19 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
         row.provider = new_provider
         if payload.model:
             row.model = payload.model
+        # Phase 1 — cheap_model partial update. ``None`` means "leave
+        # alone"; empty string means "clear tiering". Otherwise the
+        # supplied value is set, with the not-equal-to-model guard.
+        if payload.cheap_model is not None:
+            cheap = payload.cheap_model.strip() or None
+            effective_model = payload.model or row.model
+            if cheap and cheap == effective_model:
+                raise HTTPException(
+                    400,
+                    "cheap_model must differ from model — they form "
+                    "the (primary, escalation) pair for tiering.",
+                )
+            row.cheap_model = cheap
         if payload.api_key:
             row.api_key = payload.api_key
         row.base_url = new_base_url

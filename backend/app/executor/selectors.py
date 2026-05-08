@@ -410,6 +410,20 @@ def resolve(
         fuzzy_target.attempts = list(attempts)
         return fuzzy_target
 
+    # SAP.1 — child-frame penetration. Many enterprise apps (SAP GUI
+    # for HTML, ServiceNow, Salesforce embedded scenarios) render the
+    # actual UI inside an iframe. The top-level locator never sees
+    # those elements. Walk every same-origin child frame and re-run
+    # the literal + fuzzy stack against each. Cross-origin frames
+    # are silently skipped (Playwright can't access their DOM).
+    frame_match = _resolve_in_frames(
+        page, raw, timeout_ms=timeout_ms,
+    )
+    if frame_match is not None:
+        attempts.append(frame_match.strategy)
+        frame_match.attempts = list(attempts)
+        return frame_match
+
     # Final failure — include near-miss candidates so the agent's next
     # turn can target them directly. Distinguishes "page has no
     # similar element" from "page has something close but not close
@@ -426,3 +440,91 @@ def resolve(
         )
         msg += f". Closest candidates on page: {candidates_str}"
     raise SelectorNotFound(msg)
+
+
+def _resolve_in_frames(
+    page: Page,
+    hint: str,
+    *,
+    timeout_ms: int,
+) -> ResolvedTarget | None:
+    """SAP.1 — walk same-origin child frames looking for the hint.
+
+    SAP Fiori / GUI for HTML, plus a long tail of legacy enterprise
+    apps, render their real UI inside iframes. Top-level Playwright
+    selectors never see those elements; we have to search frames
+    explicitly.
+
+    Strategy: for each frame (excluding the main frame, already
+    searched), try the same waterfall — text marker, CSS, get_by_text,
+    role probes. Skips cross-origin frames (Playwright reports them
+    but DOM access raises). First match wins; later frames aren't
+    searched. Returns ``None`` when no frame yielded a hit.
+    """
+    raw = (hint or "").strip()
+    if not raw:
+        return None
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return None
+    main = page.main_frame
+    for frame in frames:
+        if frame is main:
+            continue
+        # Cross-origin / detached frames raise on access — skip.
+        # Touching ``.url`` is the probe; the value is discarded.
+        try:
+            frame.url  # noqa: B018
+        except Exception:
+            continue
+
+        def _frame_probe(
+            builder: Callable[[], Locator],
+            label: str,
+        ) -> ResolvedTarget | None:
+            try:
+                loc = builder()
+            except Exception:
+                return None
+            try:
+                if loc.count() == 0:
+                    return None
+                loc.first.wait_for(state="visible", timeout=timeout_ms)
+            except (PWTimeoutError, Exception):
+                return None
+            return ResolvedTarget(
+                locator=loc.first,
+                strategy=f"frame:{label}",
+                raw_hint=raw,
+            )
+
+        # Same waterfall as resolve(), bound to this frame.
+        m = _TEXT_MARKER_RE.match(raw)
+        if m:
+            text = m.group(1)
+            r = _frame_probe(
+                lambda: frame.get_by_text(text, exact=False),
+                "text-marker",
+            )
+            if r:
+                return r
+
+        r = _frame_probe(lambda: frame.locator(raw), "css")
+        if r:
+            return r
+
+        r = _frame_probe(
+            lambda: frame.get_by_text(raw, exact=False), "text",
+        )
+        if r:
+            return r
+
+        for role in _ROLE_PROBE:
+            r = _frame_probe(
+                lambda role=role: frame.get_by_role(role, name=raw),  # type: ignore[arg-type]
+                f"role:{role}",
+            )
+            if r:
+                return r
+    return None

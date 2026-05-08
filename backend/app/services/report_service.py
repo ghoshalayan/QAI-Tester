@@ -77,6 +77,17 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
     fuzzy_rescues = 0
     vision_rescues = 0
     goal_verification: dict | None = None
+    # Phase 11 — test-case dispute. Lifted from any turn whose
+    # search_log carries kind == "test_case_dispute". When present,
+    # the report renders a "test case issue" callout with the
+    # agent's structured evidence + suggested fix.
+    test_case_dispute: dict | None = None
+    # Phase 14 — smart candidate selection. Lifted from any turn
+    # whose search_log carries a "smart_pick" sub-record (it lives
+    # alongside vision_search rescue, not in place of it).
+    smart_pick: dict | None = None
+    # Phase 9 — semantic verify escalation result.
+    semantic_verify: dict | None = None
 
     if isinstance(details, dict) and details.get("mode") == "agentic":
         mode = "agentic"
@@ -120,6 +131,56 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
                 }
                 break
 
+        # Phase 11 — lift the test-case dispute payload (if any).
+        # Search ALL turns; a dispute typically lives on the halt
+        # turn, but we don't want to depend on ordering.
+        for t in agent_log:
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and sl.get("kind") == "test_case_dispute":
+                test_case_dispute = {
+                    "issue_kind": sl.get("issue_kind"),
+                    "evidence": sl.get("evidence"),
+                    "suggested_fix": sl.get("suggested_fix"),
+                    "turn": sl.get("turn"),
+                }
+                break
+
+        # Phase 14 — lift the most recent smart-pick record. The
+        # ``smart_pick`` sub-key lives ON a regular turn's search_log
+        # (smart_pick is a pre-action selector picker, not a halt
+        # event). LAST one wins so the report shows the freshest
+        # decision.
+        for t in reversed(agent_log):
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and isinstance(sl.get("smart_pick"), dict):
+                sp = sl["smart_pick"]
+                smart_pick = {
+                    "strategy": sp.get("strategy"),
+                    "chosen_label": sp.get("chosen_label"),
+                    "rejected_labels": list(sp.get("rejected_labels") or []),
+                    "rejection_reasons": list(
+                        sp.get("rejection_reasons") or []
+                    ),
+                    "confidence": sp.get("confidence"),
+                    "reasoning": sp.get("reasoning"),
+                }
+                break
+
+        # Phase 9 — lift the most recent semantic-verify escalation.
+        for t in reversed(agent_log):
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and isinstance(
+                sl.get("semantic_verify"), dict,
+            ):
+                sv = sl["semantic_verify"]
+                semantic_verify = {
+                    "verdict": sv.get("verdict"),
+                    "reasoning": sv.get("reasoning"),
+                    "confidence": sv.get("confidence"),
+                    "visible_evidence": sv.get("visible_evidence"),
+                }
+                break
+
     return ReportStepRead(
         id=step.id,
         tc_node_id=step.tc_node_id,
@@ -145,6 +206,9 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         fuzzy_rescues=fuzzy_rescues,
         vision_rescues=vision_rescues,
         goal_verification=goal_verification,
+        test_case_dispute=test_case_dispute,
+        smart_pick=smart_pick,
+        semantic_verify=semantic_verify,
     )
 
 

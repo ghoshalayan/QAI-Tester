@@ -548,6 +548,88 @@ def _capture_page_summary(page: Page, *, max_chars: int = 8_000) -> str:
     return s
 
 
+def capture_screenshot_for_vision(
+    page: Page,
+    *,
+    full_page: bool = False,
+    max_dim: int = 1024,
+    quality: int = 80,
+    downscale: bool = True,
+) -> bytes:
+    """Capture + downscale + JPEG-encode a screenshot meant for the
+    vision LLM.
+
+    Why this helper exists
+    ----------------------
+    Raw ``page.screenshot()`` produces a viewport-sized PNG (default
+    1280×720 → ~1.5K image tokens at OpenAI "high detail"). Vision
+    quality on UI screenshots is unaffected by:
+      - dropping to JPEG quality 80 (≈ 60-70 % byte reduction)
+      - clamping the longest side to 1024 px (≈ 50 % token reduction
+        on most layouts; OpenAI charges per 512×512 tile)
+
+    Combined: ~3-5× cheaper per VL call with no measurable loss in
+    field-localisation accuracy on UI screens.
+
+    ``full_page=True`` re-engages full-page capture for retry /
+    revalidation passes (per the user's spec: viewport by default,
+    full page on repetitive failures or end-of-flow verification
+    where above-the-fold isn't enough).
+
+    ``downscale=False`` MUST be set by callers that consume **pixel
+    coordinates** from the LLM (e.g. ``propose_click_coordinates``).
+    The LLM returns coords in the image's pixel space — if we shrink
+    the image, the returned coords are in shrunken space and a
+    naive ``page.mouse.click(x, y)`` lands at the wrong place on
+    the actual viewport. Vision QUALITY is preserved by downscale;
+    coordinate FIDELITY is not. Same goes for any future field-
+    coordinate output (auth-flow's screen classifier, etc.).
+
+    Falls back to the raw screenshot bytes if Pillow isn't available
+    (e.g. a partially-installed dev environment) — the call still
+    succeeds, it just doesn't get the size cut.
+    """
+    raw = page.screenshot(full_page=full_page)
+    if not downscale:
+        return raw
+    try:
+        from io import BytesIO  # noqa: PLC0415
+        from PIL import Image  # noqa: PLC0415
+    except ImportError:
+        logger.debug(
+            "Pillow not installed — sending raw screenshot bytes",
+        )
+        return raw
+
+    try:
+        img = Image.open(BytesIO(raw))
+        # Drop alpha → JPEG can't carry it. White background matches
+        # what users see on a normal page render.
+        if img.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        longest = max(w, h)
+        if longest > max_dim:
+            scale = max_dim / longest
+            new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning(
+            "screenshot downscale failed (%s) — sending raw bytes",
+            e,
+        )
+        return raw
+
+
 def _safe_url(page: Page) -> str:
     try:
         return page.url
@@ -604,7 +686,7 @@ def propose_recovery(
     screenshot_bytes: bytes | None = None
     if include_screenshot and getattr(provider, "supports_vision", False):
         try:
-            screenshot_bytes = page.screenshot(full_page=False)
+            screenshot_bytes = capture_screenshot_for_vision(page)
         except Exception as e:
             logger.warning(
                 "propose_recovery: screenshot capture failed: %s", e,
@@ -782,6 +864,9 @@ def propose_search_action(
     *,
     target_hint: str,
     near_misses: list[dict[str, Any]] | None = None,
+    screenshot_bytes: bytes | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
 ) -> SearchSuggestion:
     """Vision LLM call: given a missed target_hint and a page screenshot,
     return ONE concrete next step (scroll / click-to-drill / navigate /
@@ -812,13 +897,16 @@ def propose_search_action(
             f"{type(provider).__name__} reports supports_vision=False",
         )
 
-    try:
-        screenshot = page.screenshot(full_page=False)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to capture screenshot for search-action: "
-            f"{type(e).__name__}: {e}",
-        ) from e
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            screenshot = capture_screenshot_for_vision(page)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for search-action: "
+                f"{type(e).__name__}: {e}",
+            ) from e
 
     near_text = "  (none — fuzzy resolver returned no candidates above 0.30)"
     if near_misses:
@@ -839,24 +927,50 @@ def propose_search_action(
         "and fill in the relevant fields."
     )
 
+    messages = [
+        ChatMessage(
+            role="system",
+            content=SEARCH_ACTION_SYSTEM_PROMPT,
+        ),
+        ChatMessage(
+            role="user",
+            content=user_prompt,
+            image=screenshot,
+        ),
+    ]
     try:
-        result = provider.chat_structured(
-            messages=[
-                ChatMessage(
-                    role="system",
-                    content=SEARCH_ACTION_SYSTEM_PROMPT,
-                ),
-                ChatMessage(
-                    role="user",
-                    content=user_prompt,
-                    image=screenshot,
-                ),
-            ],
+        # Phase 1 — route through tiered router. Cheap tier handles
+        # most "should I scroll or click-to-drill?" calls fine; we
+        # escalate to ``provider`` only when the cheap model's
+        # confidence is < 0.7 OR returns a malformed action. When
+        # ``cheap_provider`` isn't supplied (legacy callers), the
+        # router routes everything to ``provider`` — original
+        # behavior.
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            return parsed.get("action") in (
+                "scroll", "navigate", "click_to_drill",
+                "dismiss_modal", "give_up",
+            )
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.VISION_SEARCH,
+            messages=messages,
             schema=SEARCH_ACTION_SCHEMA,
             schema_name="search_action",
             temperature=0.2,
             max_output_tokens=512,
+            validate=_validate,
+            on_escalate=on_escalate,
         )
+        result = tiered.chat
     except Exception as e:
         raise RuntimeError(
             f"LLM call failed for search-action: "
@@ -898,6 +1012,8 @@ def verify_goal_via_screenshot(
     *,
     goal_description: str,
     success_criteria: list[str],
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
 ) -> GoalVerification:
     """A4.1a: ground-truth check on a claimed-completed goal.
 
@@ -924,7 +1040,11 @@ def verify_goal_via_screenshot(
         )
 
     try:
-        screenshot = page.screenshot(full_page=False)
+        # Goal verification — full_page=True so the LLM sees the whole
+        # post-flow result (e.g. confirmation messages below the fold,
+        # cart contents at the bottom of a long page). The audit's
+        # spec: viewport by default, full page on revalidation.
+        screenshot = capture_screenshot_for_vision(page, full_page=True)
     except Exception as e:
         raise RuntimeError(
             f"Failed to capture screenshot for goal verification: "
@@ -942,24 +1062,40 @@ def verify_goal_via_screenshot(
         "and return the structured verification."
     )
 
+    messages = [
+        ChatMessage(
+            role="system",
+            content=GOAL_VERIFICATION_SYSTEM_PROMPT,
+        ),
+        ChatMessage(
+            role="user",
+            content=user_prompt,
+            image=screenshot,
+        ),
+    ]
     try:
-        result = provider.chat_structured(
-            messages=[
-                ChatMessage(
-                    role="system",
-                    content=GOAL_VERIFICATION_SYSTEM_PROMPT,
-                ),
-                ChatMessage(
-                    role="user",
-                    content=user_prompt,
-                    image=screenshot,
-                ),
-            ],
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            return parsed.get("verdict") in ("pass", "partial", "fail")
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.GOAL_VERIFIER,
+            messages=messages,
             schema=GOAL_VERIFICATION_SCHEMA,
             schema_name="goal_verification",
             temperature=0.1,
             max_output_tokens=512,
+            validate=_validate,
+            on_escalate=on_escalate,
         )
+        result = tiered.chat
     except Exception as e:
         raise RuntimeError(
             f"LLM call failed for goal verification: "
@@ -1003,6 +1139,8 @@ def check_on_track(
     goal_description: str,
     sub_goal_summary: str,
     recent_turns_summary: str,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
 ) -> OnTrackCheck:
     """A4.1c: periodic mid-flow gut-check.
 
@@ -1025,7 +1163,7 @@ def check_on_track(
         )
 
     try:
-        screenshot = page.screenshot(full_page=False)
+        screenshot = capture_screenshot_for_vision(page)
     except Exception as e:
         raise RuntimeError(
             f"Failed to capture screenshot for on-track check: "
@@ -1041,24 +1179,27 @@ def check_on_track(
         "give one concrete next-action suggestion."
     )
 
+    messages = [
+        ChatMessage(role="system", content=ON_TRACK_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_prompt, image=screenshot),
+    ]
     try:
-        result = provider.chat_structured(
-            messages=[
-                ChatMessage(
-                    role="system",
-                    content=ON_TRACK_SYSTEM_PROMPT,
-                ),
-                ChatMessage(
-                    role="user",
-                    content=user_prompt,
-                    image=screenshot,
-                ),
-            ],
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.ON_TRACK_CHECK,
+            messages=messages,
             schema=ON_TRACK_SCHEMA,
             schema_name="on_track_check",
             temperature=0.2,
             max_output_tokens=256,
+            on_escalate=on_escalate,
         )
+        result = tiered.chat
     except Exception as e:
         raise RuntimeError(
             f"LLM call failed for on-track check: "
@@ -1163,6 +1304,7 @@ def propose_click_coordinates(
     *,
     target_hint: str,
     near_misses: list[dict[str, Any]] | None = None,
+    screenshot_bytes: bytes | None = None,
 ) -> CoordinateClick:
     """Vision LLM call: point at pixel coordinates for a target the DOM
     chain couldn't resolve.
@@ -1170,6 +1312,13 @@ def propose_click_coordinates(
     Caller dispatches the click via ``page.mouse.click(x, y)``. This
     is the LAST resort — only fires when fuzzy + vision-guided search
     have both already exhausted.
+
+    Args:
+        screenshot_bytes: Pre-captured screenshot to reuse. When the
+            orchestrator runs this immediately after vision-search
+            exhausts (page hasn't moved since the last search
+            attempt), passing the cached bytes saves one
+            ``page.screenshot()`` round-trip per failed action.
 
     Raises:
         RuntimeError: provider lacks vision OR LLM call fails OR
@@ -1181,13 +1330,25 @@ def propose_click_coordinates(
             f"{type(provider).__name__} reports supports_vision=False",
         )
 
-    try:
-        screenshot = page.screenshot(full_page=False)
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to capture screenshot for coordinate click: "
-            f"{type(e).__name__}: {e}",
-        ) from e
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            # MUST stay at original viewport size — the LLM returns
+            # pixel coords that we dispatch directly via
+            # page.mouse.click(x, y). A downscaled image would yield
+            # coords in shrunken space → clicks land at the wrong
+            # spot on the real viewport. Cost trade-off: ~1.5K
+            # image tokens vs. coordinate accuracy. Coord-click is
+            # the last-resort rescue, fires rarely; worth it.
+            screenshot = capture_screenshot_for_vision(
+                page, downscale=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for coordinate click: "
+                f"{type(e).__name__}: {e}",
+            ) from e
 
     near_text = ""
     if near_misses:
@@ -1246,6 +1407,798 @@ def propose_click_coordinates(
         x=int(parsed.get("x", 0) or 0),
         y=int(parsed.get("y", 0) or 0),
         label_visible=str(parsed.get("label_visible", "")),
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+
+# ── Phase 14: smart candidate selection ────────────────────────────
+#
+# When the agent's target_hint is ambiguous (resolver finds 3+
+# matches) OR the goal carries explicit criteria the test case didn't
+# bake into the hint (e.g. "phone under 50000 rupees"), the orchestrator
+# calls this VL helper to PICK the right one among visible candidates.
+#
+# The LLM returns one of:
+#   - selector  : a precise CSS / Playwright selector pointing at the
+#                 chosen element (preferred — DOM-resolvable).
+#   - coords    : pixel coords (x, y) when no clean selector exists
+#                 — orchestrator dispatches via page.mouse.click().
+#   - scroll    : "no visible candidate matches; scroll {direction}"
+#   - none      : "no candidate matches even after a full survey"
+#                 — orchestrator can flag via the test-case dispute
+#                 tool (Phase 11).
+#
+# Bridges the DOM ↔ browser-use gap that `text 'phone'` resolution
+# blew up on Amazon: DOM picks the first match (a sponsored ad);
+# this helper picks the one that visibly satisfies the criteria.
+
+
+SmartCandidateStrategy = Literal["selector", "coords", "scroll", "none"]
+
+
+@dataclass
+class SmartCandidate:
+    """Vision LLM's choice of best candidate matching target + criteria."""
+
+    strategy: SmartCandidateStrategy
+    # Populated when strategy == "selector"
+    selector: str = ""
+    # Populated when strategy == "coords"
+    x: int = 0
+    y: int = 0
+    # Populated when strategy == "scroll"
+    scroll_direction: str = ""  # "up" | "down" | "left" | "right" | ""
+    scroll_amount_px: int = 0
+    # Always set
+    chosen_label: str = ""    # Verbatim text of the picked candidate
+    rejected_labels: list[str] = field(default_factory=list)
+    # Why these candidates were rejected — one per rejected_labels entry.
+    rejection_reasons: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    confidence: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+SMART_CANDIDATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "strategy": {
+            "type": "string",
+            "enum": ["selector", "coords", "scroll", "none"],
+        },
+        "selector": {"type": "string"},
+        "x": {"type": "integer"},
+        "y": {"type": "integer"},
+        "scroll_direction": {
+            "type": "string",
+            "enum": ["up", "down", "left", "right", ""],
+        },
+        "scroll_amount_px": {"type": "integer"},
+        "chosen_label": {"type": "string"},
+        "rejected_labels": {"type": "array", "items": {"type": "string"}},
+        "rejection_reasons": {"type": "array", "items": {"type": "string"}},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": [
+        "strategy", "selector", "x", "y",
+        "scroll_direction", "scroll_amount_px",
+        "chosen_label", "rejected_labels", "rejection_reasons",
+        "reasoning", "confidence",
+    ],
+    "additionalProperties": False,
+}
+
+
+SMART_CANDIDATE_SYSTEM_PROMPT = """You are a senior QA tester picking the RIGHT element from a list of visible candidates on a real browser page.
+
+The agent's target_hint matched MULTIPLE elements (typically a list-
+of-products page on e-commerce, a search-results page, a feed). Your
+job is to pick the ONE that best satisfies BOTH:
+1. The TARGET DESCRIPTION (what the agent is looking for)
+2. The CRITERIA (constraints from the goal: price under X, "real"
+   product not an ad, must have a visible price, etc.)
+
+How to choose
+-------------
+- READ the labels visible on the candidates the AX tree gave you.
+- LOOK at the screenshot to spot non-textual cues:
+  * "Sponsored" / "Ad" / "Promoted" tags → SKIP these — they pollute
+    the top of every search results page and rarely match the test's
+    intent.
+  * Missing price / "Currently unavailable" / "Out of stock" → SKIP
+    when the test obviously needs to add to cart.
+  * Visibly distinct in a way the criteria reject (price > limit,
+    wrong category) → SKIP.
+- Pick the FIRST candidate from the visible set that satisfies the
+  criteria. Don't try to be clever — the first non-rejected match
+  is usually the right one.
+- When NO visible candidate satisfies (e.g. all top results are
+  ads), return strategy="scroll" with a reasonable amount (~600px)
+  in the natural direction (usually "down").
+- When the page genuinely has no matching candidate (wrong page,
+  no results, etc.), return strategy="none".
+
+Output strategy
+---------------
+Prefer "selector" when you can identify a precise CSS / role+name
+selector for the chosen element from the AX tree (e.g.
+"role=link[name='Samsung Galaxy M14 5G ₹12,999']"). The orchestrator
+will resolve via DOM, faster and more reliable than coordinates.
+
+Use "coords" only when:
+- No clean selector is identifiable (canvas-rendered content,
+  highly dynamic class names, no role+name pair)
+- The target is clearly visible at specific pixel coordinates
+
+Constraints
+-----------
+- Coords MUST be in the FULL viewport pixel space (the screenshot's
+  native dimensions). Do NOT shrink.
+- chosen_label: copy the visible text VERBATIM (no paraphrasing).
+- rejected_labels + rejection_reasons: same length, paired. List
+  the candidates you considered AND skipped with a 1-line reason
+  (e.g. "Sponsored placement", "no price visible", "₹65,999 over
+  limit").
+- confidence: 0.9+ when the choice is unambiguous; 0.7 when you
+  picked the best of several plausible options; <0.7 when uncertain.
+
+Output JSON only.
+"""
+
+
+def propose_smart_candidate(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    target_description: str,
+    criteria: list[str],
+    visible_candidates: list[dict[str, Any]] | None = None,
+    screenshot_bytes: bytes | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
+) -> SmartCandidate:
+    """Vision LLM call: pick the best candidate matching target + criteria.
+
+    Phase 14 — bridges the gap that pure DOM resolution can't cross:
+    when ``target_hint='text phone'`` resolves to 30 elements, the
+    DOM resolver picks the first; this helper picks the BEST. Skips
+    sponsored ads, products without prices, items that violate goal
+    constraints (price > limit, wrong category, etc.).
+
+    Args:
+        target_description: What the agent is looking for, in natural
+            language. Usually the test step's narrative or a synthesis
+            of the target_hint + sub-goal context.
+        criteria: List of constraint strings drawn from the goal's
+            success_criteria — e.g.
+            ["price under 50000 rupees", "must have a visible price"].
+            Empty list is fine (will pick by general fitness).
+        visible_candidates: Optional list of AX-tree items the
+            resolver matched on (label, role, selector hint). When
+            given, the LLM is told these are the candidates to choose
+            among — narrower context, less hallucination. When None,
+            the LLM picks freely from what's visible in the screenshot.
+        screenshot_bytes: Pre-captured ORIGINAL-SIZE screenshot. MUST
+            NOT be downscaled — the LLM may return pixel coords.
+        cheap_provider: Optional cheap-tier model — see Phase 1
+            tiering. Escalates to ``provider`` on low confidence /
+            invalid strategy.
+
+    Returns:
+        SmartCandidate — caller dispatches based on ``.strategy``:
+            "selector" → resolve(.selector) and act
+            "coords"   → page.mouse.click(.x, .y) (or type, etc.)
+            "scroll"   → page.mouse.wheel + retry the original step
+            "none"     → flag via test-case dispute (Phase 11) +
+                         halt the step
+
+    Raises:
+        RuntimeError: provider lacks vision OR LLM call fails OR
+            response shape is malformed.
+    """
+    if not getattr(provider, "supports_vision", False):
+        raise RuntimeError(
+            "propose_smart_candidate requires a vision-capable provider; "
+            f"{type(provider).__name__} reports supports_vision=False",
+        )
+
+    # Coord-bearing helper → MUST stay at original viewport size.
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            screenshot = capture_screenshot_for_vision(page, downscale=False)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for smart candidate: "
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+    crit_block = "\n".join(
+        f"  - {c}" for c in criteria
+    ) or "  (none — pick by general fitness)"
+
+    cand_block = "  (use the screenshot — no AX-tree pre-filter passed in)"
+    if visible_candidates:
+        cand_lines = []
+        for i, c in enumerate(visible_candidates[:25], start=1):
+            role = c.get("role") or "?"
+            name = (c.get("name") or "")[:120]
+            sel = c.get("selector_hint") or ""
+            cand_lines.append(
+                f"  {i}. {role}: {name!r}"
+                + (f"   [{sel}]" if sel else "")
+            )
+        cand_block = "\n".join(cand_lines)
+
+    user_prompt = (
+        f"TARGET DESCRIPTION:\n  {target_description}\n\n"
+        f"CRITERIA (must hold for the chosen candidate):\n{crit_block}\n\n"
+        f"VISIBLE CANDIDATES (AX-tree pre-filter):\n{cand_block}\n\n"
+        f"PAGE URL: {_safe_url(page)}\n\n"
+        "Look at the screenshot. Pick ONE candidate that matches the "
+        "target AND all criteria. Skip sponsored / ad placements, "
+        "out-of-stock items, and anything that visibly violates a "
+        "criterion. If no visible candidate matches, return strategy="
+        "'scroll' (and a reasonable direction/amount) or strategy="
+        "'none' if the page genuinely has nothing."
+    )
+
+    messages = [
+        ChatMessage(role="system", content=SMART_CANDIDATE_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_prompt, image=screenshot),
+    ]
+    try:
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            strat = parsed.get("strategy")
+            if strat not in ("selector", "coords", "scroll", "none"):
+                return False
+            # Strategy-specific structural checks.
+            if strat == "selector" and not parsed.get("selector"):
+                return False
+            if strat == "coords":
+                try:
+                    if int(parsed.get("x", 0)) <= 0:
+                        return False
+                    if int(parsed.get("y", 0)) <= 0:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            if strat == "scroll" and not parsed.get("scroll_direction"):
+                return False
+            return True
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.SMART_PICKER,
+            messages=messages,
+            schema=SMART_CANDIDATE_SCHEMA,
+            schema_name="smart_candidate",
+            temperature=0.1,
+            max_output_tokens=512,
+            validate=_validate,
+            on_escalate=on_escalate,
+        )
+        result = tiered.chat
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for smart candidate: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"smart candidate returned unexpected shape: "
+            f"{type(parsed).__name__}",
+        )
+
+    strat = parsed.get("strategy")
+    if strat not in ("selector", "coords", "scroll", "none"):
+        raise RuntimeError(
+            f"smart candidate returned invalid strategy: {strat!r}",
+        )
+
+    raw_rejected = parsed.get("rejected_labels") or []
+    raw_reasons = parsed.get("rejection_reasons") or []
+    return SmartCandidate(
+        strategy=strat,  # type: ignore[arg-type]
+        selector=str(parsed.get("selector", "")),
+        x=int(parsed.get("x", 0) or 0),
+        y=int(parsed.get("y", 0) or 0),
+        scroll_direction=str(parsed.get("scroll_direction", "")),
+        scroll_amount_px=int(parsed.get("scroll_amount_px", 0) or 0),
+        chosen_label=str(parsed.get("chosen_label", "")),
+        rejected_labels=[
+            str(s) for s in raw_rejected if isinstance(s, str) and s.strip()
+        ],
+        rejection_reasons=[
+            str(s) for s in raw_reasons if isinstance(s, str) and s.strip()
+        ],
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+
+# ── Phase 9 + 13: semantic verify (strict-fail mode) ───────────────
+#
+# When a literal verify (DOM selector resolution OR exact substring
+# match) fails, the test case may still be semantically passing —
+# the page just wraps "Cart" as "Your Amazon Cart", or the count text
+# is "Showing 1-48 of over 100,000 results" instead of plain
+# "results". A QA expert reads the page and says "yes, the goal is
+# met"; literal matching says "no, the exact string isn't present."
+#
+# This helper is the escalation: vision LLM looks at the screenshot
+# + the expected condition and rules pass/fail/inconclusive under a
+# STRICT prompt — biased toward "fail" when uncertain so we never
+# mask a real bug behind a generous semantic interpretation.
+
+
+SemanticVerdict = Literal["pass", "fail", "inconclusive"]
+
+
+@dataclass
+class SemanticVerification:
+    """LLM judgment on whether the screenshot satisfies an expected
+    state when literal/DOM matching couldn't decide cleanly."""
+
+    verdict: SemanticVerdict
+    reasoning: str
+    confidence: float
+    visible_evidence: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+SEMANTIC_VERIFY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["pass", "fail", "inconclusive"],
+        },
+        "visible_evidence": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["verdict", "visible_evidence", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+
+SEMANTIC_VERIFY_SYSTEM_PROMPT = """You are a strict QA verifier. The agent's literal/DOM check for a step's expected outcome did NOT match. Your job: rule on whether the SCREENSHOT shows that expected state semantically — even when the exact text differs, IF it's clearly the same outcome.
+
+Inputs you'll see:
+- EXPECTED: the test step's expected state (a phrase, sentence, or
+  short claim — e.g. "Cart contains the added phone", "Search results
+  for 'phone' are displayed", "Order placed successfully").
+- TARGET HINT: an optional Playwright-resolvable hint that the
+  literal verifier just couldn't find (selector / text marker).
+- PAGE URL.
+- SCREENSHOT.
+
+Verdict rubric — STRICT
+-----------------------
+- "pass": The screenshot UNAMBIGUOUSLY shows the expected outcome.
+  Examples that count as pass:
+    * EXPECTED says "Cart" and the page header reads "Your Amazon Cart"
+    * EXPECTED says "results" and the page shows "Showing 1-48 of
+      over 100,000 results for ..."
+    * EXPECTED says "logged in" and the header shows the user's name
+      with a "Sign out" link.
+  The wrapping text is fine; the substantive claim must hold.
+
+- "fail": The screenshot CONTRADICTS the expected outcome, OR shows
+  evidence the test failed:
+    * EXPECTED says "added to cart" but cart count is 0 or the page
+      shows "your cart is empty"
+    * EXPECTED says "payment page" but the page is still a cart or
+      shows a "checkout failed" banner
+    * EXPECTED says "results" but the page shows "no results found"
+
+- "inconclusive": You CANNOT tell from the screenshot alone:
+    * Page is mid-load / blank / partially rendered
+    * The expected state lives below the fold (you can't see it)
+    * Genuine ambiguity ("login OR signup" — page shows form but
+      labels are too generic to decide)
+
+Bias toward "fail" or "inconclusive" when uncertain — DO NOT swing
+toward "pass" to be helpful. The whole point of this escalation is
+to catch real failures the agent's literal check missed; a loose
+"pass" verdict masks bugs.
+
+Output
+------
+- verdict: pass / fail / inconclusive
+- visible_evidence: 1-2 phrases from the screenshot you used to
+  decide (verbatim, in quotes when possible — "Your Amazon Cart",
+  "Showing 1-48 of over 100,000 results", etc.).
+- reasoning: 1 sentence explaining the call.
+- confidence: 0.0-1.0. Only >= 0.85 counts as "definite"; <= 0.7
+  ought to come with a "fail" or "inconclusive" verdict, not "pass".
+
+Output JSON only.
+"""
+
+
+def verify_semantic(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    expected: str,
+    target_hint: str | None = None,
+    full_page: bool = False,
+    screenshot_bytes: bytes | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
+) -> SemanticVerification:
+    """Phase 9 — semantic verify escalation.
+
+    Called when the literal ``verify`` action just failed (DOM
+    resolution missed OR substring check returned False) but the
+    test step's intent might still be satisfied semantically.
+
+    Returns one of:
+    - ``pass`` — vision LLM unambiguously sees the expected state;
+      the literal check failed because of copy/wording mismatch.
+      Caller upgrades the verify outcome to passed.
+    - ``fail`` — vision LLM sees a clear contradiction; the original
+      failed verdict stands.
+    - ``inconclusive`` — vision LLM cannot tell from the screenshot;
+      caller leaves the failed verdict as-is. We do NOT swing to
+      pass on inconclusive — that would mask real bugs.
+
+    ``full_page=True`` triggers full-page capture for revalidation
+    passes (per the user's spec: viewport by default, full page when
+    the expected outcome lives below the fold — confirmation banners,
+    cart contents, etc.).
+    """
+    if not getattr(provider, "supports_vision", False):
+        raise RuntimeError(
+            "verify_semantic requires a vision-capable provider; "
+            f"{type(provider).__name__} reports supports_vision=False",
+        )
+
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            screenshot = capture_screenshot_for_vision(
+                page, full_page=full_page,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for semantic verify: "
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+    target_block = (
+        f"TARGET HINT (literal verifier couldn't find): "
+        f"{target_hint!r}\n"
+        if target_hint else ""
+    )
+    user_prompt = (
+        f"EXPECTED:\n  {expected}\n\n"
+        f"{target_block}"
+        f"PAGE URL: {_safe_url(page)}\n\n"
+        "Look at the screenshot. Apply the strict rubric and rule "
+        "pass / fail / inconclusive. Bias toward inconclusive or "
+        "fail when uncertain — do NOT pass to be helpful."
+    )
+
+    messages = [
+        ChatMessage(role="system", content=SEMANTIC_VERIFY_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_prompt, image=screenshot),
+    ]
+    try:
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            return parsed.get("verdict") in ("pass", "fail", "inconclusive")
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.SEMANTIC_VERIFIER,
+            messages=messages,
+            schema=SEMANTIC_VERIFY_SCHEMA,
+            schema_name="semantic_verify",
+            temperature=0.1,
+            max_output_tokens=384,
+            validate=_validate,
+            on_escalate=on_escalate,
+        )
+        result = tiered.chat
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for semantic verify: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"semantic verify returned unexpected shape: "
+            f"{type(parsed).__name__}",
+        )
+
+    verdict = parsed.get("verdict")
+    if verdict not in ("pass", "fail", "inconclusive"):
+        raise RuntimeError(
+            f"semantic verify returned invalid verdict: {verdict!r}",
+        )
+
+    return SemanticVerification(
+        verdict=verdict,  # type: ignore[arg-type]
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        visible_evidence=str(parsed.get("visible_evidence", "")),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+
+# ── Phase 10: popup / overlay classifier ───────────────────────────
+#
+# When the agent hits an intercepted click OR observes a modal-shaped
+# DOM region after a navigation, this helper classifies the overlay
+# so the orchestrator picks the right action:
+#
+#   required_step    : the modal IS part of the test flow (variant
+#                      selector, address picker, "are you sure?" on
+#                      a destructive action). Engage with it.
+#   dismissable_blocker : modal blocks the page but isn't part of
+#                      the test (sign-in nag, cookie consent, app
+#                      install banner). Dismiss via close button or
+#                      Escape.
+#   non_blocking_overlay : a banner / toast at the edge of the
+#                      viewport that doesn't block clicks (cookie
+#                      banner at the bottom, "your order placed"
+#                      toast). Ignore.
+#   ad               : promotional content (interstitial signup
+#                      offers, full-screen ads). Dismiss aggressively
+#                      — these are the most disruptive on retail
+#                      sites.
+#
+# Confidence: when < 0.7, the orchestrator defaults to ENGAGE
+# (your answer to Q3) because the cost of skipping a required step
+# is much worse than the cost of clicking through one extra modal.
+
+
+PopupKind = Literal[
+    "none", "required_step", "dismissable_blocker",
+    "non_blocking_overlay", "ad",
+]
+
+
+@dataclass
+class PopupClassification:
+    """LLM's verdict on what the visible overlay (if any) is."""
+
+    kind: PopupKind
+    # Optional concrete dismissal hint when kind allows dismissal.
+    # The LLM picks a verbatim selector / role+name from the AX
+    # tree the orchestrator can resolve.
+    dismiss_hint: str = ""
+    # Reasoning the user sees in the live feed.
+    reasoning: str = ""
+    confidence: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+POPUP_CLASSIFY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": [
+                "none", "required_step", "dismissable_blocker",
+                "non_blocking_overlay", "ad",
+            ],
+        },
+        "dismiss_hint": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["kind", "dismiss_hint", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+
+POPUP_CLASSIFY_SYSTEM_PROMPT = """You classify visible overlays / modals / popups on a real browser page so a QA agent decides what to do with them.
+
+Inputs:
+- GOAL CONTEXT: short description of what the agent is trying to do
+  on this page (e.g. "search for phones and add to cart").
+- PAGE URL.
+- SCREENSHOT.
+
+Categories
+----------
+- "none": No popup or overlay is visibly blocking the page. The
+  agent can act normally.
+
+- "required_step": The overlay IS part of the user's flow and must
+  be engaged. Examples: a variant-selector dialog before adding to
+  cart; a quantity / address picker; a "review your order" panel
+  before checkout; an OTP / 2FA prompt during login; a system
+  message asking "Save changes? Yes / No / Cancel" on navigation.
+  CLUE: the overlay's content directly references the goal (cart,
+  checkout, save, confirm an action you just took).
+
+- "dismissable_blocker": The overlay blocks interaction but is NOT
+  part of the test flow. Examples: a sign-in / sign-up nag; cookie
+  consent dialog; "install our app" banner with an X button; a
+  newsletter capture popup. CLUE: the overlay is generic (no link
+  to the user's specific action), has a visible close affordance,
+  and dismissing it returns the agent to where they were.
+
+- "non_blocking_overlay": A banner / toast / floating element at the
+  edge of the viewport that doesn't intercept clicks. Examples:
+  cookie consent at the bottom (with no full-screen scrim); an
+  "added to cart" toast on the right; a region-picker chip
+  pinned to the top. CLUE: the rest of the page IS clickable;
+  ignoring it is fine.
+
+- "ad": Promotional content unrelated to the goal. Examples: a
+  full-screen offer ("save 30% with our credit card"); a holiday
+  sale interstitial; a sponsored signup form blocking the
+  product list. CLUE: aggressive marketing copy, large hero
+  image, irrelevant to what the user is doing. Dismiss
+  aggressively.
+
+dismiss_hint
+------------
+When kind is dismissable_blocker, ad, or sometimes
+non_blocking_overlay, return a Playwright-resolvable hint for the
+close button. Examples:
+- "[aria-label='Close']"
+- "role=button[name='No thanks']"
+- "text 'Maybe later'"
+- "" (empty) when no clean dismissal exists — orchestrator falls
+  back to Escape key / close icon heuristic.
+
+When kind is required_step or none, leave dismiss_hint empty.
+
+confidence
+----------
+0.9+ when the classification is unambiguous. < 0.7 when uncertain
+between two categories — the orchestrator defaults to ENGAGE
+(treats as required_step) on low confidence, because skipping a
+required step is worse than clicking through one extra modal.
+
+Output JSON only.
+"""
+
+
+def classify_popup(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    goal_context: str,
+    screenshot_bytes: bytes | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
+) -> PopupClassification:
+    """Phase 10 — classify a visible overlay so the orchestrator picks
+    the right action (engage / dismiss / ignore).
+
+    Called when:
+    - A click failed with ``failure_kind == "click_intercepted"``
+      (something is overlaying the target).
+    - A fresh navigation completed and the agent observes
+      modal-shaped DOM (role=dialog, fixed-position large element,
+      etc.). Detection lives in qa_agent.py before the next turn.
+
+    Returns ``PopupClassification`` — caller dispatches based on
+    ``.kind`` (see categories above). On low confidence (< 0.7) the
+    orchestrator engages with the popup (treats as required_step)
+    rather than dismissing — your locked policy from plan Q3.
+
+    Token cost: one cheap-tier vision call per intercepted click.
+    Cached per (URL, screenshot hash) at the orchestrator level so
+    repeat hits don't re-pay.
+    """
+    if not getattr(provider, "supports_vision", False):
+        raise RuntimeError(
+            "classify_popup requires a vision-capable provider; "
+            f"{type(provider).__name__} reports supports_vision=False",
+        )
+
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            screenshot = capture_screenshot_for_vision(page)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for popup classify: "
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+    user_prompt = (
+        f"GOAL CONTEXT:\n  {goal_context}\n\n"
+        f"PAGE URL: {_safe_url(page)}\n\n"
+        "Look at the screenshot. Classify any overlay you see using "
+        "the four categories. If no overlay is visibly blocking, "
+        "return kind='none'."
+    )
+
+    messages = [
+        ChatMessage(role="system", content=POPUP_CLASSIFY_SYSTEM_PROMPT),
+        ChatMessage(role="user", content=user_prompt, image=screenshot),
+    ]
+    try:
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            return parsed.get("kind") in (
+                "none", "required_step", "dismissable_blocker",
+                "non_blocking_overlay", "ad",
+            )
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.FAST_CLASSIFY,
+            messages=messages,
+            schema=POPUP_CLASSIFY_SCHEMA,
+            schema_name="popup_classify",
+            temperature=0.1,
+            max_output_tokens=320,
+            validate=_validate,
+            on_escalate=on_escalate,
+        )
+        result = tiered.chat
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for popup classify: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"popup classify returned unexpected shape: "
+            f"{type(parsed).__name__}",
+        )
+
+    kind = parsed.get("kind")
+    if kind not in (
+        "none", "required_step", "dismissable_blocker",
+        "non_blocking_overlay", "ad",
+    ):
+        raise RuntimeError(
+            f"popup classify returned invalid kind: {kind!r}",
+        )
+
+    return PopupClassification(
+        kind=kind,  # type: ignore[arg-type]
+        dismiss_hint=str(parsed.get("dismiss_hint", "")),
         reasoning=str(parsed.get("reasoning", "")),
         confidence=float(parsed.get("confidence", 0.0)),
         input_tokens=result.input_tokens,

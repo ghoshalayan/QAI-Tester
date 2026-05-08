@@ -157,6 +157,12 @@ def _drop_pause(run_id: int) -> None:
 
 _intervention_events: dict[tuple[int, int], "threading.Event"] = {}
 _intervention_responses: dict[tuple[int, int], dict] = {}
+# Phase 4 — typed HITL prompts. Tracks the OPEN prompt for a
+# (run_id, step_id) so the live presenter can render the right
+# input form (OTP code box, credentials pair, manual-solve resume
+# button). Set by ``open_typed_prompt``; cleared on response
+# delivery. Read by GET endpoint or surfaced via SSE event.
+_open_prompts: dict[tuple[int, int], dict] = {}
 _intervention_lock = threading.Lock()
 
 
@@ -197,6 +203,54 @@ def request_intervention(
             return None
 
 
+def open_typed_prompt(
+    run_id: int,
+    step_id: int,
+    *,
+    kind: str,
+    question: str,
+    fields: list[dict] | None = None,
+) -> None:
+    """Phase 4 — record an open typed HITL prompt.
+
+    Called by the agent's auth-flow orchestrator BEFORE blocking on
+    ``request_intervention`` so the live presenter has enough info
+    to render the right input form. ``kind`` is one of:
+      - ``request_text`` (single free-form input — OTP, captcha solve)
+      - ``request_credentials`` (paired username + password)
+      - ``await_manual_solve`` (just a "I solved it, continue" button)
+
+    ``fields`` lets the agent specify what to label each input field
+    (e.g. ``[{name: "otp", label: "Enter the 6-digit code"}]``).
+    Optional — when None the presenter uses sensible defaults from
+    ``kind``.
+
+    Pairs with ``close_typed_prompt`` (called by provide_intervention
+    on response delivery).
+    """
+    key = (run_id, step_id)
+    with _intervention_lock:
+        _open_prompts[key] = {
+            "kind": kind,
+            "question": question[:400],
+            "fields": list(fields or []),
+        }
+
+
+def get_open_prompt(run_id: int, step_id: int) -> dict | None:
+    """Return the open typed prompt for a step, or None when there
+    isn't one. Used by the GET endpoint that the popup polls on
+    mount (in case it missed the SSE open-event)."""
+    with _intervention_lock:
+        prompt = _open_prompts.get((run_id, step_id))
+        return dict(prompt) if prompt else None
+
+
+def close_typed_prompt(run_id: int, step_id: int) -> None:
+    with _intervention_lock:
+        _open_prompts.pop((run_id, step_id), None)
+
+
 def provide_intervention(
     run_id: int, step_id: int, choice: dict,
 ) -> bool:
@@ -212,6 +266,10 @@ def provide_intervention(
         if ev is None:
             return False
         _intervention_responses[key] = dict(choice)
+        # Phase 4 — clear any open typed prompt so a stale form
+        # doesn't render after the agent's already received the
+        # value and moved on.
+        _open_prompts.pop(key, None)
         ev.set()
     return True
 
@@ -232,6 +290,11 @@ def _drop_interventions(run_id: int) -> None:
     with _intervention_lock:
         keys = [k for k in _intervention_events if k[0] == run_id]
         events = [_intervention_events[k] for k in keys]
+        # Phase 4 — also drop any open typed prompts for this run so
+        # the popup-side form doesn't linger after a cancel.
+        prompt_keys = [k for k in _open_prompts if k[0] == run_id]
+        for k in prompt_keys:
+            _open_prompts.pop(k, None)
     for ev in events:
         ev.set()
 
@@ -613,6 +676,17 @@ def execute_run(run_id: int) -> None:
         mode = input_data.get("mode", "scripted")
         if mode not in ("scripted", "agentic", "replay"):
             mode = "scripted"
+        # Phase 6 — agent strategy. Only meaningful for ``agentic``.
+        # Persist on the run row so the report can show which path
+        # actually drove the run.
+        agent_strategy = input_data.get("agent_strategy", "hybrid")
+        if agent_strategy not in ("hybrid", "vision_only"):
+            agent_strategy = "hybrid"
+        try:
+            run.agent_strategy = agent_strategy
+            db.commit()
+        except Exception:
+            db.rollback()
 
         # Window geometry — frontend computes from screen.availWidth/Height
         # so the headed Chromium fits the user's monitor with the live
@@ -638,9 +712,20 @@ def execute_run(run_id: int) -> None:
         # the executor usable without an LLM (auto-retry only) and supports
         # the "tester ran offline" scenario.
         provider = None
+        cheap_provider = None
         if ai_assist:
             try:
-                provider = get_provider_from_db(db)
+                # Phase 1 — provider tiering. ``build_tier_pair`` returns
+                # (strong, cheap_or_None) from app_settings. When the
+                # user hasn't configured a ``cheap_model``, ``cheap`` is
+                # None and the agent runs in single-model mode (legacy
+                # behavior preserved). When configured, the cheap model
+                # handles the volume of VL helper calls (search, on-
+                # track, goal-verify, smart-pick, semantic-verify) with
+                # the strong model as the escalation tier.
+                from app.llm.router import build_tier_pair  # noqa: PLC0415
+
+                provider, cheap_provider = build_tier_pair(db)
             except RuntimeError as e:
                 logger.info(
                     "AI assist disabled for run %s — no LLM configured: %s",
@@ -670,6 +755,8 @@ def execute_run(run_id: int) -> None:
                     headless=headless,
                     speed=speed_raw,
                     provider=provider,
+                    cheap_provider=cheap_provider,
+                    agent_strategy=agent_strategy,
                     auto_adjust=auto_adjust,
                     promote_fixes=promote_fixes,
                     window_position=window_position,
