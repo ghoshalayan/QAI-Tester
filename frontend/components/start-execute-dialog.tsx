@@ -31,25 +31,25 @@ const SPEED_OPTIONS: {
   icon: typeof Turtle;
   hint: string;
 }[] = [
-  {
-    value: "slow",
-    label: "Slow",
-    icon: Turtle,
-    hint: "Visible cursor glide, slow typing, 8s settle. Heavy SPAs friendly.",
-  },
-  {
-    value: "normal",
-    label: "Normal",
-    icon: Gauge,
-    hint: "Balanced. 5s settle, smaller cursor glide.",
-  },
-  {
-    value: "fast",
-    label: "Fast",
-    icon: Zap,
-    hint: "No typing animation, 2s settle. May fail on lazy-loading sites.",
-  },
-];
+    {
+      value: "slow",
+      label: "Slow",
+      icon: Turtle,
+      hint: "Visible cursor glide, slow typing, 8s settle. Heavy SPAs friendly.",
+    },
+    {
+      value: "normal",
+      label: "Normal",
+      icon: Gauge,
+      hint: "Balanced. 5s settle, smaller cursor glide.",
+    },
+    {
+      value: "fast",
+      label: "Fast",
+      icon: Zap,
+      hint: "No typing animation, 2s settle. May fail on lazy-loading sites.",
+    },
+  ];
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -141,7 +141,11 @@ export function StartExecuteDialog({
     },
     onSuccess: (run) => {
       // Open the live presenter sized to match the layout used for the
-      // browser (40% on the right when headed, 100% when headless).
+      // browser. The popup features string is only a HINT — Chromium
+      // sometimes ignores it when DPI scaling is on, when the popup
+      // blocker is aggressive, or when it decides to open as a tab.
+      // We back the hint up with explicit resizeTo() + moveTo() calls
+      // after the popup loads, which reliably set window geometry.
       try {
         const layout = computeWindowLayout(headless);
         if (layout) {
@@ -154,6 +158,25 @@ export function StartExecuteDialog({
               description:
                 "Allow popups for this site to see the live agent panel beside the browser.",
             });
+          } else {
+            // Belt-and-braces: explicitly position + size the popup
+            // after open. Chrome ignores the features `left`/`width`
+            // about half the time but reliably honors moveTo + resizeTo
+            // on a popup window.
+            const enforce = () => {
+              try {
+                popup.resizeTo(panel.w, panel.h);
+                popup.moveTo(panel.x, panel.y);
+              } catch {
+                /* same-origin policy or sandboxed — best-effort only */
+              }
+            };
+            // Fire once now, then again after a short delay — the
+            // popup needs a moment to navigate to the URL before
+            // resizeTo reliably sticks.
+            enforce();
+            setTimeout(enforce, 150);
+            setTimeout(enforce, 600);
           }
         }
       } catch {
@@ -380,19 +403,32 @@ function ToggleRow({
 }
 
 /**
- * Compute side-by-side window geometry from the user's actual screen.
+ * Compute window geometry for the headed browser + live panel popup.
  *
- * Headed runs: 60% browser on the left, 40% panel on the right —
- *   gives the headed Chromium room for a real desktop viewport while
- *   the panel still fits a comfortable column of agent narration.
- * Headless runs: panel takes the full screen — there's no headed
- *   browser to share with, so the panel is the only window.
+ * Strategy: the headed Chromium fills the FULL screen width, and the
+ * live panel popup sits ON TOP of its right edge as an overlay. This
+ * mirrors Atlas/Comet/Operator and avoids the "tile two windows
+ * flush" problem on Windows — Chrome's `--window-size` and
+ * `popup.moveTo` don't land pixel-exact under DPI scaling, so any
+ * tiled layout leaks a black seam between the two windows. Letting
+ * the browser extend past the popup means there's never a gap, no
+ * matter how Chrome rounds.
+ *
+ * Trade-off: the rightmost ~PANEL_W pixels of the page are occluded
+ * by the live panel. This is fine for QA — the agent renders a
+ * dedicated panel anyway, and most page content is on the left.
+ *
+ * Headless runs: panel takes the full screen, browser is null.
  *
  * Returns ``null`` when there's no DOM (SSR) or the screen is too
- * small to tile — in which case the caller skips popup geometry and
- * the backend uses its defaults.
+ * small — in which case the caller skips popup geometry and the
+ * backend uses its defaults.
  */
-const BROWSER_FRACTION = 0.6;  // headed: 60% browser, 40% panel
+// Live panel as a fraction of total screen width. ~13% gives ~250px
+// on a 1920px display — enough for one event per row.
+const PANEL_FRACTION = 0.13;
+const PANEL_MIN_W = 240;
+const PANEL_MAX_W = 360;
 const MIN_USEFUL_HEIGHT = 500;
 const MIN_USEFUL_WIDTH_HEADED = 1000;
 function computeWindowLayout(headless: boolean) {
@@ -402,7 +438,7 @@ function computeWindowLayout(headless: boolean) {
   if (availH < MIN_USEFUL_HEIGHT) return null;
 
   if (headless) {
-    // No headed browser to tile against — panel fills the screen.
+    // No headed browser to overlay against — panel fills the screen.
     if (availW < 400) return null;
     return {
       browser: null as null | { x: number; y: number; w: number; h: number },
@@ -410,12 +446,17 @@ function computeWindowLayout(headless: boolean) {
     };
   }
 
-  // Headed: split the screen 60/40.
+  // Headed: browser spans the full screen so it always extends past
+  // wherever the popup lands. The popup overlays the right strip.
   if (availW < MIN_USEFUL_WIDTH_HEADED) return null;
-  const browserW = Math.floor(availW * BROWSER_FRACTION);
+  const panelW = Math.min(
+    PANEL_MAX_W,
+    Math.max(PANEL_MIN_W, Math.floor(availW * PANEL_FRACTION)),
+  );
+  const panelX = availW - panelW;
   return {
-    browser: { x: 0, y: 0, w: browserW, h: availH },
-    panel: { x: browserW, y: 0, w: availW - browserW, h: availH },
+    browser: { x: 0, y: 0, w: availW, h: availH },
+    panel: { x: panelX, y: 0, w: panelW, h: availH },
   };
 }
 

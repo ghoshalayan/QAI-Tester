@@ -74,8 +74,8 @@ export function StatusDonut({ run }: Props) {
 
   return (
     <div className="relative">
-      <div className="h-56">
-        <ResponsiveContainer width="100%" height="100%">
+      <div className="h-56 min-w-0">
+        <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
           <PieChart>
             <Pie
               data={slices}

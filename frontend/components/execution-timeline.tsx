@@ -27,6 +27,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -616,6 +617,10 @@ function ScreenshotLightbox({
               </span>
             )}
           </DialogTitle>
+          <DialogDescription className="sr-only">
+            Step screenshot, narration, and any error message captured during
+            execution.
+          </DialogDescription>
         </DialogHeader>
         {step?.screenshot_path && (
           // eslint-disable-next-line @next/next/no-img-element

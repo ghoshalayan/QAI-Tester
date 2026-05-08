@@ -54,8 +54,8 @@ export function ModulePassBars({ modules }: Props) {
   const height = Math.min(Math.max(data.length * 32 + 24, 96), 320);
 
   return (
-    <div style={{ height }}>
-      <ResponsiveContainer width="100%" height="100%">
+    <div className="min-w-0" style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
         <BarChart
           data={data}
           layout="vertical"

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 
 import "./globals.css";
 import { Providers } from "./providers";
-import { Sidebar } from "@/components/sidebar";
+import { AppShell } from "@/components/app-shell";
 import { FirstRunGate } from "@/components/first-run-gate";
 
 export const metadata: Metadata = {
@@ -20,10 +20,7 @@ export default function RootLayout({
       <body className="antialiased">
         <Providers>
           <FirstRunGate>
-            <div className="flex h-screen w-full overflow-hidden">
-              <Sidebar />
-              <main className="flex-1 overflow-y-auto">{children}</main>
-            </div>
+            <AppShell>{children}</AppShell>
           </FirstRunGate>
         </Providers>
       </body>
