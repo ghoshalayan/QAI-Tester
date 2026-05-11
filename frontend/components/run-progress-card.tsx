@@ -476,6 +476,12 @@ export function RunProgressCard({
               out tokens
             </>
           )}
+          {typeof run.total_cost_usd === "number" && (
+            <>
+              {" "}
+              · <span className="font-mono">${run.total_cost_usd.toFixed(4)}</span>
+            </>
+          )}
         </div>
       )}
 

@@ -113,6 +113,8 @@ export default function RunReportPage() {
             </ChartCard>
           </div>
 
+          <RunCostCard runId={runId} />
+
           <RecommendationsPanel recommendations={recommendations} />
 
           {report.plan && <PlanCard plan={report.plan} />}
@@ -146,6 +148,176 @@ export default function RunReportPage() {
 }
 
 // ── Layout helpers ────────────────────────────────────────────────
+
+
+function RunCostCard({ runId }: { runId: number }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["run-cost", runId],
+    queryFn: () => api.getRunCost(runId),
+    // Refresh after the run completes — the cost columns are written
+    // in the agent loop's ``finally`` block.
+    staleTime: 10_000,
+  });
+
+  const fmtUsd = (n: number | null | undefined) =>
+    n == null ? "$—" : `$${n.toFixed(4)}`;
+  const fmtTokens = (n: number) => n.toLocaleString();
+
+  if (isLoading) {
+    return (
+      <div className="rounded-xl border bg-card p-4">
+        <Skeleton className="h-32 w-full" />
+      </div>
+    );
+  }
+  if (isError || !data) {
+    return null;
+  }
+
+  return (
+    <div className="rounded-xl border bg-card p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <h3 className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          Cost
+          {data.estimated_from_aggregate && (
+            <span className="ml-2 rounded bg-muted px-1 py-0.5 text-[9px] normal-case tracking-normal text-muted-foreground">
+              estimate (pre-tier-tracking run)
+            </span>
+          )}
+        </h3>
+        <div className="text-right">
+          <div className="text-xl font-semibold tabular-nums">
+            {data.total_cost_usd == null
+              ? "$—"
+              : `$${data.total_cost_usd.toFixed(4)}`}
+          </div>
+          {data.total_cost_usd == null && (
+            <div className="text-[10px] text-muted-foreground">
+              <Link
+                href="/settings"
+                className="underline hover:no-underline"
+              >
+                Configure pricing
+              </Link>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <CostTierBlock
+          title="Strong tier"
+          model={data.strong_model}
+          inputLine={data.lines.find(
+            (l) => l.tier === "strong" && l.direction === "input",
+          )}
+          cachedInputLine={data.lines.find(
+            (l) => l.tier === "strong" && l.direction === "input_cached",
+          )}
+          outputLine={data.lines.find(
+            (l) => l.tier === "strong" && l.direction === "output",
+          )}
+          fmtUsd={fmtUsd}
+          fmtTokens={fmtTokens}
+        />
+        <CostTierBlock
+          title="Cheap tier"
+          model={data.cheap_model}
+          inputLine={data.lines.find(
+            (l) => l.tier === "cheap" && l.direction === "input",
+          )}
+          cachedInputLine={data.lines.find(
+            (l) => l.tier === "cheap" && l.direction === "input_cached",
+          )}
+          outputLine={data.lines.find(
+            (l) => l.tier === "cheap" && l.direction === "output",
+          )}
+          fmtUsd={fmtUsd}
+          fmtTokens={fmtTokens}
+        />
+      </div>
+
+      <p className="mt-3 text-[10px] text-muted-foreground">
+        Embeddings (AKB + BRD ingest + requirement embeds) use a local
+        CPU model and are free — not included in this cost. Cached
+        input rows show prompt tokens the provider billed at the
+        cached rate (OpenAI auto-caches prompts ≥ 1024 tokens at
+        ~50%). Hidden when there&apos;s no cache hit.
+      </p>
+    </div>
+  );
+}
+
+
+function CostTierBlock({
+  title,
+  model,
+  inputLine,
+  cachedInputLine,
+  outputLine,
+  fmtUsd,
+  fmtTokens,
+}: {
+  title: string;
+  model: string | null;
+  inputLine: { tokens: number; price_per_m: number | null; cost_usd: number | null } | undefined;
+  cachedInputLine: { tokens: number; price_per_m: number | null; cost_usd: number | null } | undefined;
+  outputLine: { tokens: number; price_per_m: number | null; cost_usd: number | null } | undefined;
+  fmtUsd: (n: number | null | undefined) => string;
+  fmtTokens: (n: number) => string;
+}) {
+  const cachedTok = cachedInputLine?.tokens ?? 0;
+  const showCached = cachedTok > 0;
+  return (
+    <div className="rounded-md border bg-muted/20 p-3 text-xs">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="font-medium">{title}</span>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {model ?? "—"}
+        </span>
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        <div className="text-[10px] text-muted-foreground">direction</div>
+        <div className="text-right text-[10px] text-muted-foreground">
+          tokens
+        </div>
+        <div className="text-right text-[10px] text-muted-foreground">
+          cost
+        </div>
+
+        <div>input</div>
+        <div className="text-right font-mono">
+          {fmtTokens(inputLine?.tokens ?? 0)}
+        </div>
+        <div className="text-right font-mono">
+          {fmtUsd(inputLine?.cost_usd ?? null)}
+        </div>
+
+        {showCached && (
+          <>
+            <div className="text-muted-foreground">
+              input (cached)
+            </div>
+            <div className="text-right font-mono text-muted-foreground">
+              {fmtTokens(cachedTok)}
+            </div>
+            <div className="text-right font-mono text-muted-foreground">
+              {fmtUsd(cachedInputLine?.cost_usd ?? null)}
+            </div>
+          </>
+        )}
+
+        <div>output</div>
+        <div className="text-right font-mono">
+          {fmtTokens(outputLine?.tokens ?? 0)}
+        </div>
+        <div className="text-right font-mono">
+          {fmtUsd(outputLine?.cost_usd ?? null)}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 
 function ChartCard({

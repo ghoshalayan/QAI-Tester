@@ -6,7 +6,7 @@ to ``data/qai.db`` can read the API key. Surface this clearly in the UI.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -37,6 +37,45 @@ class AppSettings(Base):
     # GPT-5).
     cheap_model: Mapped[str | None] = mapped_column(
         String(128), nullable=True,
+    )
+
+    # ── Cost tracking (migration 0017) ────────────────────────────
+    # Per-tier pricing in USD per million tokens. The cost service
+    # multiplies ``run.{tier}_{io}_tokens / 1_000_000`` by the
+    # matching rate to produce dollar cost per run. NULL means
+    # "user hasn't configured pricing for this tier" — the cost
+    # surface renders ``$—`` for that row instead of $0.
+    #
+    # Pricing is provider-agnostic: same four fields for OpenAI /
+    # Gemini / Anthropic / any future provider. Update them when
+    # you switch models (cost service does NOT snapshot prices at
+    # run time; changing pricing re-costs historical runs at the
+    # new rate, which matches the "how much would this run cost
+    # at today's prices?" mental model).
+    strong_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    strong_output_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    cheap_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    cheap_output_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    # Migration 0019 — cached-input rates. Applied to the cached
+    # portion of input tokens (subset of strong/cheap_input_tokens).
+    # NULL means "user hasn't set a cached rate" → cost service
+    # falls back to the regular input rate (over-bills slightly
+    # but never under-bills, which is the safer default).
+    # Typical OpenAI: ~50% of regular input rate. Gemini cached_content:
+    # ~25% of regular rate.
+    strong_cached_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    cheap_cached_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
     )
 
     api_key: Mapped[str] = mapped_column(String(512), nullable=False, default="")

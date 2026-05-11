@@ -146,7 +146,13 @@ def call_for_role(
     happens — wire it to the live-feed event emitter so the user sees
     the tier transition.
     """
+    # Local imports to avoid circular deps with cost_tracker init.
+    import time as _time  # noqa: PLC0415
+
+    from app.llm.cost_tracker import record_call  # noqa: PLC0415
+
     if role in _STRONG_ONLY_ROLES or cheap is None:
+        _t0 = _time.monotonic()
         result = strong.chat_structured(
             messages=messages,
             schema=schema,
@@ -154,11 +160,25 @@ def call_for_role(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
+        # Per-call telemetry — role + model snapshotted so the drill-
+        # in UI can show which call did what. ``cached_input_tokens``
+        # comes from the provider response (OpenAI's automatic cache,
+        # Gemini's cached_content) so the cost surface bills the
+        # cached portion at the discounted rate.
+        record_call(
+            "strong", result.input_tokens, result.output_tokens,
+            role=role.value,
+            model=getattr(strong, "model", None),
+            cached_input_tokens=getattr(result, "cached_input_tokens", None),
+            escalated=False,
+            duration_ms=int((_time.monotonic() - _t0) * 1000),
+        )
         return TieredResult(chat=result, tier="strong", escalated=False)
 
     # Cheap-first path.
     cheap_reason: str | None = None
     cheap_output: Any | None = None
+    _t_cheap = _time.monotonic()
     try:
         cheap_result = cheap.chat_structured(
             messages=messages,
@@ -166,6 +186,19 @@ def call_for_role(
             schema_name=schema_name,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+        )
+        # Per-call telemetry: cheap-tier attempt is its own row.
+        # Whether or not escalation fires, the cheap-tier tokens
+        # were already spent and account separately.
+        record_call(
+            "cheap", cheap_result.input_tokens, cheap_result.output_tokens,
+            role=role.value,
+            model=getattr(cheap, "model", None),
+            cached_input_tokens=getattr(
+                cheap_result, "cached_input_tokens", None,
+            ),
+            escalated=False,
+            duration_ms=int((_time.monotonic() - _t_cheap) * 1000),
         )
         cheap_output = cheap_result.parsed
     except Exception as e:
@@ -176,12 +209,25 @@ def call_for_role(
         )
         if on_escalate:
             on_escalate(role.value, cheap.model, cheap_reason)
+        _t_strong = _time.monotonic()
         strong_result = strong.chat_structured(
             messages=messages,
             schema=schema,
             schema_name=schema_name,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+        )
+        record_call(
+            "strong",
+            strong_result.input_tokens,
+            strong_result.output_tokens,
+            role=role.value,
+            model=getattr(strong, "model", None),
+            cached_input_tokens=getattr(
+                strong_result, "cached_input_tokens", None,
+            ),
+            escalated=True,
+            duration_ms=int((_time.monotonic() - _t_strong) * 1000),
         )
         return TieredResult(
             chat=strong_result,
@@ -232,12 +278,23 @@ def call_for_role(
     )
     if on_escalate:
         on_escalate(role.value, cheap.model, cheap_reason or "")
+    _t_strong = _time.monotonic()
     strong_result = strong.chat_structured(
         messages=messages,
         schema=schema,
         schema_name=schema_name,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
+    )
+    record_call(
+        "strong", strong_result.input_tokens, strong_result.output_tokens,
+        role=role.value,
+        model=getattr(strong, "model", None),
+        cached_input_tokens=getattr(
+            strong_result, "cached_input_tokens", None,
+        ),
+        escalated=True,
+        duration_ms=int((_time.monotonic() - _t_strong) * 1000),
     )
     return TieredResult(
         chat=strong_result,

@@ -31,6 +31,29 @@ logger = logging.getLogger(__name__)
 _GEMINI_VISION_RE = re.compile(r"^gemini-(?:1\.5|2\.\d|3\.\d)", re.IGNORECASE)
 
 
+def _gemini_cached_tokens(usage: Any) -> int | None:
+    """Pull Gemini's cached-content token count off ``usage_metadata``.
+
+    Populated when the caller used the ``cached_content`` API (explicit
+    context caching) — we don't wire that yet, so this typically reads
+    0 / None on our calls. Returning it from day one means the cost
+    surface accounts cleanly the moment we add explicit caching
+    later. Same None-as-0 contract as OpenAI.
+    """
+    if usage is None:
+        return None
+    val = getattr(usage, "cached_content_token_count", None)
+    if val is None and hasattr(usage, "to_dict"):
+        try:
+            val = usage.to_dict().get("cached_content_token_count")
+        except Exception:
+            val = None
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 class GeminiProvider(LLMProvider):
     provider_id = "gemini"
 
@@ -115,6 +138,7 @@ class GeminiProvider(LLMProvider):
             model=self.model,
             input_tokens=getattr(usage, "prompt_token_count", None) if usage else None,
             output_tokens=getattr(usage, "candidates_token_count", None) if usage else None,
+            cached_input_tokens=_gemini_cached_tokens(usage),
             raw=response,
         )
 
@@ -180,6 +204,7 @@ class GeminiProvider(LLMProvider):
             model=self.model,
             input_tokens=getattr(usage, "prompt_token_count", None) if usage else None,
             output_tokens=getattr(usage, "candidates_token_count", None) if usage else None,
+            cached_input_tokens=_gemini_cached_tokens(usage),
             parsed=parsed,
             raw=response,
         )

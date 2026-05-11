@@ -20,6 +20,7 @@ as a numeric plan id.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -303,6 +304,21 @@ def create_plan(
 
     db.commit()
     db.refresh(plan)
+
+    # α.3 — push linked BRD/FRD chunks into AKB scoped to the plan's
+    # target_url so the runtime agent's RAG sees them. Best-effort
+    # (don't fail the plan-create on AKB errors); first run on this
+    # target_url pays the embed cost.
+    try:
+        from app.services.akb_ingest import (  # noqa: PLC0415
+            ingest_plan_documents_to_akb,
+        )
+        ingest_plan_documents_to_akb(db, plan)
+    except Exception as e:
+        logger.warning(
+            "AKB ingest on plan create failed (non-fatal): %s", e,
+        )
+
     return _to_plan_detail(db, plan)
 
 
@@ -349,12 +365,171 @@ def update_plan(
     if payload.status is not None:
         plan.status = payload.status
 
-    if payload.linked_document_ids is not None:
+    docs_changed = payload.linked_document_ids is not None
+    if docs_changed:
         _replace_linked_docs(db, plan, payload.linked_document_ids)
 
     db.commit()
     db.refresh(plan)
+
+    # α.3 — re-ingest AKB when docs OR target_url changed. The
+    # write_chunk helper deduplicates so re-saves on unchanged
+    # documents are cheap. Best-effort (non-fatal on AKB errors).
+    if docs_changed or payload.target_url is not None:
+        try:
+            from app.services.akb_ingest import (  # noqa: PLC0415
+                ingest_plan_documents_to_akb,
+            )
+            ingest_plan_documents_to_akb(db, plan)
+        except Exception as e:
+            logger.warning(
+                "AKB ingest on plan update failed (non-fatal): %s", e,
+            )
+
     return _to_plan_detail(db, plan)
+
+
+@router.post("/{plan_id}/scout")
+def scout_app(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """β.1 — "Scout this app". Walks the plan's target URL 2-3 levels
+    deep and writes recon notes to AKB so subsequent runs have a
+    mental model of the app.
+
+    Returns a summary the UI renders. Synchronous for v1 — recon
+    typically completes in 30-60s. If we move to background-task
+    later, add a polling endpoint.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    target_url = (plan.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "Plan has no target_url; can't scout an empty URL.",
+        )
+
+    from app.agents.recon import run_recon  # noqa: PLC0415
+    from app.executor.browser import browser_session  # noqa: PLC0415
+    from app.executor.pacing import get_speed_config  # noqa: PLC0415
+    from app.llm.cost_tracker import (  # noqa: PLC0415
+        begin_run as _begin_cost,
+        end_run as _end_cost,
+    )
+    from app.models.agent_run import AgentRun  # noqa: PLC0415
+
+    try:
+        from app.llm.router import build_tier_pair  # noqa: PLC0415
+
+        provider, cheap_provider = build_tier_pair(db)
+    except Exception as e:
+        logger.info(
+            "recon: LLM unavailable, walking text-only: %s", e,
+        )
+        provider = None
+        cheap_provider = None
+
+    # Create a kind=recon AgentRun row so scout activity surfaces in
+    # the Runs list with its own cost breakdown, same as a regular
+    # execute run. Model names are snapshotted so cost-tracking
+    # stays correct after the user changes models.
+    run_row = AgentRun(
+        project_id=project_id,
+        plan_id=plan.id,
+        kind="recon",
+        status="running",
+        input_json={
+            "target_url": target_url,
+            "max_pages": 8,
+        },
+        output_summary_json={},
+        started_at=datetime.now(timezone.utc),
+        strong_model_snapshot=getattr(provider, "model", None),
+        cheap_model_snapshot=(
+            getattr(cheap_provider, "model", None)
+            if cheap_provider is not None
+            else None
+        ),
+    )
+    db.add(run_row)
+    db.commit()
+    db.refresh(run_row)
+
+    _begin_cost(run_id=run_row.id)
+    config = get_speed_config(None)
+    try:
+        with browser_session(headless=True, speed_config=config) as bs:
+            page = bs.context.new_page()
+            try:
+                result = run_recon(
+                    page,
+                    db,
+                    target_url=target_url,
+                    provider=provider,
+                    cheap_provider=cheap_provider,
+                    max_pages=8,
+                )
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+    finally:
+        # Persist cost counters + flush per-call logs to llm_call_logs
+        # (handled inside end_run when db is supplied). Run status
+        # flips regardless of success / failure.
+        counters = _end_cost(db=db)
+        if counters is not None:
+            run_row.strong_input_tokens = counters.strong_input
+            run_row.strong_output_tokens = counters.strong_output
+            run_row.cheap_input_tokens = counters.cheap_input
+            run_row.cheap_output_tokens = counters.cheap_output
+            run_row.strong_cached_input_tokens = counters.strong_cached_input
+            run_row.cheap_cached_input_tokens = counters.cheap_cached_input
+
+    run_row.status = (
+        "failed" if (
+            "result" not in locals()
+            or getattr(result, "error_message", None)
+        ) else "completed"
+    )
+    run_row.completed_at = datetime.now(timezone.utc)
+    res_obj = locals().get("result")
+    run_row.output_summary_json = {
+        "target_url": target_url,
+        "pages_visited": (
+            res_obj.pages_visited if res_obj is not None else 0
+        ),
+        "auth_surface": (
+            res_obj.auth_surface if res_obj is not None else None
+        ),
+        "vision_calls": (
+            res_obj.vision_calls if res_obj is not None else 0
+        ),
+    }
+    db.commit()
+
+    return {
+        "run_id": run_row.id,
+        "target_url": result.target_url,
+        "pages_visited": result.pages_visited,
+        "pages": result.pages,
+        "auth_surface": result.auth_surface,
+        "primary_nav_items": result.primary_nav_items,
+        "notes": result.notes,
+        "error_message": result.error_message,
+        "vision_calls": result.vision_calls,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "strong_model": run_row.strong_model_snapshot,
+        "cheap_model": run_row.cheap_model_snapshot,
+        "strong_input_tokens": run_row.strong_input_tokens,
+        "strong_output_tokens": run_row.strong_output_tokens,
+        "cheap_input_tokens": run_row.cheap_input_tokens,
+        "cheap_output_tokens": run_row.cheap_output_tokens,
+    }
 
 
 @router.delete("/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)

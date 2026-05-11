@@ -69,6 +69,27 @@ class Goal:
     success_criteria: list[str] = field(default_factory=list)
     sub_goals: list[SubGoal] = field(default_factory=list)
     hints: list[StepHint] = field(default_factory=list)
+    # Production-α.4 — richer goal shape. All four are list[str] of
+    # short conditions / signals; empty lists fall through to the
+    # legacy "infer from description" behavior.
+    #
+    # preconditions: state that must hold BEFORE the agent acts
+    #   (e.g. "cart contains at least one item", "user is logged in").
+    #   Asserted against WorldState at submodule start; mismatch
+    #   fires an auto-dispute with kind=precondition_failed.
+    # postconditions: state that must hold AFTER for the goal to
+    #   count as passed (e.g. "cart shows zero items", "URL
+    #   contains '/checkout'"). Used to update WorldState.
+    # evidence_signals: observable cues that prove the post-
+    #   conditions met. The agent's verify is N-of-M — claim done
+    #   when ≥ threshold of signals match. Bounded.
+    # alternative_paths: human-readable hints about other ways to
+    #   reach the postconditions (used as prompt context when the
+    #   primary flow is blocked).
+    preconditions: list[str] = field(default_factory=list)
+    postconditions: list[str] = field(default_factory=list)
+    evidence_signals: list[str] = field(default_factory=list)
+    alternative_paths: list[str] = field(default_factory=list)
     # Telemetry for the cost meter
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -100,6 +121,10 @@ class Goal:
                 }
                 for h in self.hints
             ],
+            "preconditions": list(self.preconditions),
+            "postconditions": list(self.postconditions),
+            "evidence_signals": list(self.evidence_signals),
+            "alternative_paths": list(self.alternative_paths),
         }
 
 
@@ -121,8 +146,31 @@ GOAL_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
         },
+        # Production-α.4 — pre/post + signals. All four required by
+        # OpenAI strict mode; empty array means "no specific
+        # conditions for this submodule, infer from description".
+        "preconditions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "postconditions": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "evidence_signals": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "alternative_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
     },
-    "required": ["description", "success_criteria", "sub_goals"],
+    "required": [
+        "description", "success_criteria", "sub_goals",
+        "preconditions", "postconditions", "evidence_signals",
+        "alternative_paths",
+    ],
     "additionalProperties": False,
 }
 
@@ -133,7 +181,7 @@ You'll see a submodule (one test case) and the literal steps inside it.
 Your job: rewrite this as a goal-oriented mission a human tester could
 execute even if some of the steps are slightly wrong or out of date.
 
-Output THREE things:
+Output SEVEN things:
 
 1. description: ONE sentence, present tense, written from the user's
    perspective. Example: "User searches for a product and adds it to
@@ -145,30 +193,47 @@ Output THREE things:
    - "Cart icon shows count >= 1"
    - "URL contains '/cart' or '/checkout'"
    - "A confirmation toast or banner appears"
-   - "The product name is visible inside the cart drawer"
-
-   AVOID: criteria that just restate the action ("clicked the button").
-   PREFER: criteria that describe the OUTCOME ("the page now shows X").
+   AVOID criteria that just restate the action ("clicked the button").
+   PREFER criteria that describe the OUTCOME.
 
 3. sub_goals: 2-5 ORDERED page-level outcomes the agent will work
    through sequentially. Each is a verb-first sentence describing ONE
-   discrete advance toward the goal — the kind of milestone you'd put
-   on a checklist while testing manually.
+   discrete advance toward the goal.
 
-   Good example for "User adds a product to cart":
-   - "Find a product on the catalog or search"
-   - "Open the product detail page"
-   - "Click the Add to Cart button"
-   - "Verify the cart shows the product"
+4. preconditions: 0-3 short factual statements about state the
+   submodule REQUIRES before it can run. The agent asserts these
+   against world state at submodule start; mismatch flags the test
+   case as having a precondition failure (the prior submodule was
+   supposed to set this up). Examples:
+   - "cart contains at least one item"
+   - "user is logged in as a customer"
+   - "the URL is on the cart page"
+   Empty array when the submodule is self-contained.
 
-   Bad examples (avoid):
-   - "Click submit" (too low-level — that's an action, not a sub-goal)
-   - "Test the cart" (too vague — what specifically?)
-   - "Search for a product, click it, add to cart" (combine multiple
-     sub-goals into one — split them)
+5. postconditions: 0-3 short factual statements about state that
+   MUST hold for the goal to count as passed. Examples:
+   - "cart contains zero items"
+   - "URL contains '/checkout' or '/payment'"
+   - "checkout flow has begun"
+   Used to update world state when the agent claims completion.
 
-   For trivial goals that don't decompose meaningfully (e.g., "verify
-   the homepage loads"), return an empty array [].
+6. evidence_signals: 2-5 SHORT observable cues the agent verifies
+   to prove the postconditions. Multiple signals = multi-evidence
+   voting (the agent claims pass when ≥ majority match — robust
+   against single-token mismatches). Examples:
+   - "Subtotal text is visible"
+   - "Cart icon badge shows ≥ 1"
+   - "Product name visible in cart list"
+   - "Checkout button is enabled"
+   These should be DISTINCT signals (different parts of the page),
+   not synonyms of each other.
+
+7. alternative_paths: 0-3 free-text hints describing other ways
+   to reach the goal when the primary flow is blocked. Examples:
+   - "Use the cart icon in the header instead of footer link"
+   - "Mini-cart dropdown also has a checkout button"
+   - "Empty cart hides 'Proceed to checkout' — re-add items first"
+   Empty array when there's no obvious alternative.
 
 Output JSON only. No commentary.
 """
@@ -238,6 +303,8 @@ def extract_goal(
     )
 
     try:
+        import time as _goal_time  # noqa: PLC0415
+        _goal_t0 = _goal_time.monotonic()
         result = provider.chat_structured(
             messages=[
                 ChatMessage(role="system", content=GOAL_SYSTEM_PROMPT),
@@ -248,6 +315,24 @@ def extract_goal(
             temperature=0.2,
             max_output_tokens=512,
         )
+        # Cost: goal extraction is strong-only (correctness-critical).
+        # Role + model + duration surface in the call-log drill-in.
+        try:
+            from app.llm.cost_tracker import record_call  # noqa: PLC0415
+
+            record_call(
+                "strong", result.input_tokens, result.output_tokens,
+                role="goal_extract",
+                model=getattr(provider, "model", None),
+                cached_input_tokens=getattr(
+                    result, "cached_input_tokens", None,
+                ),
+                duration_ms=int(
+                    (_goal_time.monotonic() - _goal_t0) * 1000,
+                ),
+            )
+        except Exception:
+            pass
     except Exception as e:
         raise RuntimeError(
             f"Goal extraction failed for submodule "
@@ -292,6 +377,29 @@ def extract_goal(
             ),
         )
 
+    # α.4 — pre/post + signals + alt-paths. Extracted from the LLM
+    # output OR (preferred) lifted directly from the TC node when
+    # the test author authored them explicitly. TC node values
+    # WIN over LLM output — the human's spec is authoritative.
+    def _str_list(key: str) -> list[str]:
+        raw = parsed.get(key) or []
+        return [
+            str(x).strip()
+            for x in raw
+            if isinstance(x, str) and x.strip()
+        ]
+
+    pre = list(submodule.preconditions or []) or _str_list("preconditions")
+    post = list(submodule.postconditions or []) or _str_list("postconditions")
+    signals = (
+        list(submodule.evidence_signals or [])
+        or _str_list("evidence_signals")
+    )
+    alts = (
+        list(submodule.alternative_paths or [])
+        or _str_list("alternative_paths")
+    )
+
     return Goal(
         submodule_id=submodule.id,
         submodule_title=submodule.title or "",
@@ -300,6 +408,10 @@ def extract_goal(
         success_criteria=success_criteria,
         sub_goals=sub_goals,
         hints=hints,
+        preconditions=pre,
+        postconditions=post,
+        evidence_signals=signals,
+        alternative_paths=alts,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )

@@ -126,6 +126,16 @@ class ReportStepRead(BaseModel):
     # dict carries ``{verdict, reasoning, confidence,
     # visible_evidence}``.
     semantic_verify: dict | None = None
+    # Production-α — AKB chunks recalled at submodule start (turn 1).
+    # Each entry: ``{kind, content, confidence, tags, relevance}``.
+    akb_recall: list[dict] = []
+    # Plan-scoped WorldState snapshot at the moment this submodule
+    # finished. None for legacy / non-agentic runs.
+    world_state_snapshot: dict | None = None
+    # Signal-voting trace: which of the goal's evidence_signals
+    # matched at completion time. Shape:
+    # ``{matched: int, total: int, traces: [{signal, matched, via}]}``.
+    signal_voting: dict | None = None
 
 
 class ReportSubmoduleRead(BaseModel):

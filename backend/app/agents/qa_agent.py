@@ -311,6 +311,30 @@ META TOOLS (terminate the loop):
   itself is wrong, not just a poor selector hint".
 
 RULES:
+- KNOWN ABOUT THIS APP: when present, this block contains BRD
+  excerpts, scout-walk notes, pattern rules, and prior dispute
+  outcomes the system has learned. Read it FIRST — it tells you
+  what's expected, where things live, and known gotchas. Higher-
+  confidence chunks are more reliable.
+- GOAL CONTRACT: when present, this block carries:
+    * Preconditions — state that must hold BEFORE you act. If a
+      precondition is marked NOT MET, the test case's assumed
+      starting state is wrong: call ``flag_test_case_issue`` with
+      ``issue_kind=precondition_failed`` and explain. Do NOT try
+      to set up the precondition yourself; that's a different
+      submodule's job.
+    * Postconditions — state that must hold AFTER for the goal
+      to count as passed. The agent loop applies these to
+      WorldState on success.
+    * Evidence signals — observable cues that prove the post-
+      conditions. Treat them as a checklist; you don't need to
+      verify all of them, just enough to be CONFIDENT (≥ majority).
+      Use ``verify`` with SHORT concrete tokens for each signal.
+    * Alternative paths — when the obvious flow is blocked, try
+      these.
+- WORLD STATE: the run's plan-scoped memory. Don't restate it; use
+  it to skip work the previous submodule already did (e.g., don't
+  re-login when ``logged_in_as`` is set).
 - target_hint: a Playwright-resolvable hint. CSS selector, "text 'Sign In'",
   or "role=button[name='Sign In']". Prefer stable hints (data-testid,
   text, role) over fragile ones (nth-child).
@@ -1258,6 +1282,89 @@ _VALID_KEYS: frozenset[str] = frozenset({
 })
 
 
+def _evaluate_evidence_signals(
+    page,
+    signals: list[str],
+) -> tuple[int, int, list[dict[str, Any]]]:
+    """α.7 — multi-evidence signal voting for verify.
+
+    Tries each signal in two passes:
+    1. Treat as a Playwright-resolvable target (selectors, text
+       markers, role lookups) — call the existing resolver.
+    2. Fall back to substring match against ``body.inner_text()``.
+
+    Returns ``(matched, total, per_signal_traces)``. The orchestrator
+    converts this into a verify outcome: pass when matched ≥
+    majority (ceil(total/2)); inconclusive when 1 ≤ matched <
+    majority; fail when 0 match.
+
+    Single-signal legacy verifies skip this helper entirely — the
+    classic literal substring check still runs in actions.py.
+    """
+    traces: list[dict[str, Any]] = []
+    matched = 0
+    if not signals:
+        return 0, 0, traces
+
+    body_text_cache: str | None = None
+
+    def _body_text() -> str:
+        nonlocal body_text_cache
+        if body_text_cache is None:
+            try:
+                body_text_cache = page.locator("body").inner_text(
+                    timeout=4_000,
+                )
+            except Exception:
+                body_text_cache = ""
+        return body_text_cache
+
+    for sig in signals:
+        s = (sig or "").strip()
+        if not s:
+            continue
+        match_via = ""
+        ok = False
+        # Try as a Playwright-resolvable hint first.
+        try:
+            from app.executor.selectors import resolve  # noqa: PLC0415
+
+            try:
+                resolve(page, s, timeout_ms=1_500)
+                ok = True
+                match_via = "resolver"
+            except Exception:
+                ok = False
+        except Exception:
+            pass
+        # Fall back to substring match against body text.
+        if not ok:
+            txt = _body_text().lower()
+            # Strip quotes the LLM may have added around signal phrases.
+            stripped = s.strip("\"' ")
+            # Treat as natural-language signal: look for key tokens.
+            # First try the literal phrase, then individual words >3 chars.
+            if stripped and stripped.lower() in txt:
+                ok = True
+                match_via = "substring"
+            else:
+                tokens = [
+                    t for t in stripped.lower().split()
+                    if len(t) > 3
+                ]
+                if tokens and all(t in txt for t in tokens):
+                    ok = True
+                    match_via = "tokens"
+        if ok:
+            matched += 1
+        traces.append({
+            "signal": s[:120],
+            "matched": ok,
+            "via": match_via or "none",
+        })
+    return matched, len([s for s in signals if s and s.strip()]), traces
+
+
 def _do_press_key(
     page, args: dict[str, Any],
 ) -> tuple[str, str, str | None]:
@@ -1329,6 +1436,105 @@ def _do_go_back(page) -> tuple[str, str, str | None]:
             "history empty",
         )
     return "ok", f"navigated back to {page.url}", None
+
+
+def _persist_module_bundle(
+    db: "Session",
+    pairs: list[tuple[Any, dict[str, Any]]],
+    *,
+    plan_target_url: str,
+    run_id: int,
+    agent_model: str | None,
+) -> None:
+    """γ.2 — write a cross-submodule frozen-flow bundle.
+
+    Walks the (submodule, per-submodule-frozen-path) pairs and groups
+    them by parent module (TcNode.parent_id). For each module that has
+    ALL of its child submodules passing in this contiguous streak, we
+    write a single ``frozen_path`` to the MODULE node containing the
+    concatenated step list. Replay's plan-level dispatcher prefers the
+    module bundle when present (one continuous walk vs. submodule-by-
+    submodule re-orchestration).
+
+    Submodules whose parent isn't fully covered fall through to the
+    existing per-submodule ``frozen_path`` — the bundle is additive,
+    never destructive.
+    """
+    if not pairs:
+        return
+    from app.models.tc_node import TcNode  # noqa: PLC0415
+
+    # Group by parent_id — same module = same bundle.
+    by_parent: dict[int, list[tuple[Any, dict[str, Any]]]] = {}
+    for sm, frozen in pairs:
+        parent_id = getattr(sm, "parent_id", None)
+        if parent_id is None:
+            continue
+        by_parent.setdefault(parent_id, []).append((sm, frozen))
+
+    for parent_id, group in by_parent.items():
+        parent = db.get(TcNode, parent_id)
+        if parent is None:
+            continue
+        # Did THIS run cover every direct child submodule of the
+        # module? If not, don't claim the module is fully frozen —
+        # leave per-submodule freezes in place.
+        children = list(parent.children or [])
+        sub_children = [
+            c for c in children
+            if (c.kind or "").lower() == "submodule"
+        ]
+        covered_ids = {sm.id for sm, _ in group}
+        if not sub_children or not all(
+            c.id in covered_ids for c in sub_children
+        ):
+            logger.debug(
+                "module bundle skipped for parent %s: %d/%d covered",
+                parent_id, len(covered_ids), len(sub_children),
+            )
+            continue
+
+        # Concatenate steps in submodule-ordinal order.
+        ordered = sorted(
+            group,
+            key=lambda t: getattr(t[0], "ordinal", 0),
+        )
+        bundle_steps: list[dict[str, Any]] = []
+        for sm, frozen in ordered:
+            steps = (frozen or {}).get("steps") or []
+            for s in steps:
+                if isinstance(s, dict):
+                    s2 = dict(s)
+                    s2["_from_submodule_id"] = sm.id
+                    bundle_steps.append(s2)
+        if not bundle_steps:
+            continue
+        bundle = {
+            "kind": "module_bundle",
+            "steps": bundle_steps,
+            "submodule_ids": [sm.id for sm, _ in ordered],
+            "agent_model": agent_model,
+            "source_run_id": run_id,
+            "target_url": plan_target_url,
+        }
+        try:
+            parent.frozen_path = bundle
+            db.commit()
+            logger.info(
+                "Module bundle frozen on parent %s (%d steps from "
+                "%d submodules) from run %s",
+                parent_id, len(bundle_steps),
+                len(ordered), run_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "module bundle persist failed for parent %s: %s",
+                parent_id, e,
+            )
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
 
 def _vision_only_dispatch(
@@ -2094,6 +2300,13 @@ def run_agent_for_goal(
     # where DOM resolution can't reach (heavy canvas, sealed shadow
     # DOM, etc.).
     agent_strategy: str = "hybrid",
+    # Production-α.5/6 — plan-scoped WorldState + target_url for
+    # AKB lookup. WorldState is mutated in place; the orchestrator
+    # persists it across submodule boundaries. AKB context is read
+    # ONCE at submodule start and rendered into the prompt block
+    # so the agent has business / app knowledge available.
+    world_state: dict[str, Any] | None = None,
+    db: "Session | None" = None,
 ) -> AgentSubmoduleResult:
     """Drive ONE submodule to completion via the observe-think-act loop.
 
@@ -2114,6 +2327,81 @@ def run_agent_for_goal(
     total_output = 0
     llm_calls = 0
     vision_calls = 0
+
+    # α.5 — local WorldState alias. Default to empty dict when caller
+    # didn't supply one (legacy / single-submodule-test usage).
+    if world_state is None:
+        world_state = {}
+
+    # α.6 — query AKB for chunks relevant to this submodule's goal.
+    # Best-effort: AKB is empty on a fresh app or when ingestion
+    # was skipped. The block ends up in ``akb_block`` for the prompt.
+    #
+    # β.2 — pattern-pack autoload. If the AKB has zero pattern_rule
+    # chunks for this target, we run the pack detector once. Cheap
+    # (URL/DOM heuristics + dedup'd writes); skipped on subsequent
+    # submodules because the second query sees the rules are
+    # already there.
+    akb_chunks: list[Any] = []
+    if db is not None:
+        try:
+            from app.services.akb import query_akb  # noqa: PLC0415
+
+            # β.2 — try pack autoload via URL hint first; the DOM-
+            # signature path runs after the page is loaded (in the
+            # turn-1 query below). One call → idempotent — re-runs
+            # are no-ops thanks to AKB write-chunk dedup.
+            try:
+                from app.agents.patterns import (  # noqa: PLC0415
+                    autoload_pack,
+                )
+                autoload_pack(db, target_url=plan_target_url, page=page)
+            except Exception as e:
+                logger.debug(
+                    "pattern pack autoload skipped: %s", e,
+                )
+
+            query_text = (
+                f"{goal.description}\n"
+                + " | ".join(goal.success_criteria[:5])
+            )
+            akb_chunks = query_akb(
+                db,
+                target_url=plan_target_url,
+                query=query_text,
+                k=6,
+            )
+            if akb_chunks:
+                _emit(emit_event, "akb_recall", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "count": len(akb_chunks),
+                    "kinds": sorted({c.kind for c in akb_chunks}),
+                })
+        except Exception as e:
+            logger.debug("AKB query skipped: %s", e)
+            akb_chunks = []
+
+    # α.5 — assert preconditions. When the goal carries explicit
+    # preconditions and the WorldState shows them violated, the
+    # agent is informed in its prompt; the deterministic checker
+    # ALSO produces a list of unsatisfied preconditions surfaced
+    # in the live feed. The agent is encouraged (via system prompt)
+    # to flag_test_case_issue with kind=precondition_failed when
+    # the violation is structural (e.g., cart empty for a "remove
+    # items" submodule).
+    from app.services.world_state import (  # noqa: PLC0415
+        check_preconditions, format_for_prompt as _ws_format,
+    )
+    pre_ok, unmet_preconditions = check_preconditions(
+        world_state, goal.preconditions,
+    )
+    if not pre_ok:
+        _emit(emit_event, "preconditions_unmet", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "unmet": unmet_preconditions[:5],
+        })
     # Track previous observation so we can give the agent an explicit
     # "what changed" diff each turn — by far the biggest cause of the
     # "agent stalls clicking the same button" pattern is the agent not
@@ -2373,6 +2661,64 @@ def run_agent_for_goal(
             if graph_text else ""
         )
 
+        # α.5/6 — WorldState + AKB + preconditions/postconditions/signals
+        # blocks. Built once per turn so the agent always sees its
+        # plan-level state, app knowledge, and goal contract.
+        ws_text = _ws_format(world_state)
+        ws_block = (
+            f"\nWORLD STATE (carried across submodules in this run; "
+            f"use to assert preconditions and update on success):\n"
+            f"{ws_text}\n"
+            if ws_text else ""
+        )
+
+        akb_block = ""
+        if akb_chunks and turn_idx == 1:
+            # Show AKB ONLY on turn 1 — it's submodule-level context,
+            # not per-turn. Subsequent turns use page memory + graph.
+            akb_lines: list[str] = [
+                "\nKNOWN ABOUT THIS APP (retrieved from BRD / scout / "
+                "patterns / past disputes):",
+            ]
+            for c in akb_chunks[:6]:
+                tag_str = (
+                    f" [{', '.join(c.tags)}]" if c.tags else ""
+                )
+                akb_lines.append(
+                    f"  - ({c.kind}{tag_str}, conf={c.confidence:.2f}) "
+                    f"{c.content[:400]}"
+                )
+            akb_block = "\n".join(akb_lines) + "\n"
+
+        contract_block = ""
+        if goal.preconditions or goal.postconditions or goal.evidence_signals:
+            contract_lines: list[str] = ["\nGOAL CONTRACT:"]
+            if goal.preconditions:
+                contract_lines.append("  Preconditions (must hold BEFORE acting):")
+                for p in goal.preconditions:
+                    marker = ""
+                    if p in unmet_preconditions:
+                        marker = "  ⚠ NOT MET — consider flag_test_case_issue(precondition_failed)"
+                    contract_lines.append(f"    - {p}{marker}")
+            if goal.postconditions:
+                contract_lines.append("  Postconditions (must hold AFTER for goal to pass):")
+                for p in goal.postconditions:
+                    contract_lines.append(f"    - {p}")
+            if goal.evidence_signals:
+                contract_lines.append(
+                    "  Evidence signals (verify N-of-M to confirm; "
+                    "majority match = goal achieved):",
+                )
+                for s in goal.evidence_signals:
+                    contract_lines.append(f"    - {s}")
+            if goal.alternative_paths:
+                contract_lines.append(
+                    "  Alternative paths (when primary flow blocked):",
+                )
+                for ap in goal.alternative_paths:
+                    contract_lines.append(f"    - {ap}")
+            contract_block = "\n".join(contract_lines) + "\n"
+
         # If the agent has already memorized THIS URL, send a TRIMMED
         # observation (just URL + title + element_count) — the memory
         # note + the diff block (which names any new/removed elements)
@@ -2406,6 +2752,9 @@ def run_agent_for_goal(
             f"The browser was already navigated here at run-start; you "
             f"should normally NOT need to navigate again unless the goal "
             f"itself requires going elsewhere.\n"
+            f"{akb_block}"     # α.6 — app knowledge (turn 1 only)
+            f"{contract_block}" # α.4 — pre/post/signals/alt-paths
+            f"{ws_block}"      # α.5 — WorldState across submodules
             f"{vision_note}"
             f"{diff_block}"
             f"{on_track_block}"
@@ -2423,6 +2772,8 @@ def run_agent_for_goal(
                 content=user_prompt,
                 image=pending_screenshot if attach_screenshot else None,
             )
+            import time as _planner_time  # noqa: PLC0415
+            _planner_t0 = _planner_time.monotonic()
             llm_result = provider.chat_structured(
                 messages=[
                     ChatMessage(role="system", content=SYSTEM_PROMPT),
@@ -2438,6 +2789,30 @@ def run_agent_for_goal(
                 # tail-latency / cost ceiling vs the prior 1024.
                 max_output_tokens=512,
             )
+            # Cost: planner call goes direct to the strong provider
+            # (bypasses the tier router because the planner is
+            # always strong-only). Record manually with role +
+            # model + duration so the drill-in view shows one
+            # ``planner`` row per turn.
+            try:
+                from app.llm.cost_tracker import (  # noqa: PLC0415
+                    record_call,
+                )
+                record_call(
+                    "strong",
+                    llm_result.input_tokens,
+                    llm_result.output_tokens,
+                    role="planner",
+                    model=getattr(provider, "model", None),
+                    cached_input_tokens=getattr(
+                        llm_result, "cached_input_tokens", None,
+                    ),
+                    duration_ms=int(
+                        (_planner_time.monotonic() - _planner_t0) * 1000,
+                    ),
+                )
+            except Exception:
+                pass
             if attach_screenshot:
                 vision_calls += 1
             # Consume the screenshot — only attached once per failure.
@@ -2574,8 +2949,48 @@ def run_agent_for_goal(
 
         # ── Meta tool branch: terminating decisions ───────────────
         if tool == "mark_goal_complete":
+            # α.7 — signal voting. When evidence_signals were
+            # authored on the goal, score them at completion time
+            # against the live page. ``verified`` becomes True when
+            # ≥ majority match. This subsumes the older "any
+            # successful verify in turn_log" rule for goals with an
+            # explicit signal list — proper evidence beats a
+            # historical verify that may be stale.
+            signal_match_count = 0
+            signal_total = 0
+            signal_traces: list[dict[str, Any]] = []
+            if goal.evidence_signals:
+                try:
+                    (
+                        signal_match_count,
+                        signal_total,
+                        signal_traces,
+                    ) = _evaluate_evidence_signals(
+                        page, list(goal.evidence_signals),
+                    )
+                    _emit(emit_event, "signal_voting", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "matched": signal_match_count,
+                        "total": signal_total,
+                        "traces": signal_traces,
+                    })
+                except Exception as e:
+                    logger.debug("signal voting skipped: %s", e)
+
             # Soft-guard #1: did the agent actually verify anything?
-            verified = any(
+            # Two paths qualify:
+            #  - ANY ok verify/extract_text in the turn log (legacy)
+            #  - signal-voting majority (new, when signals were
+            #    authored on the goal)
+            majority = (
+                (signal_total + 1) // 2 if signal_total else 0
+            )
+            signal_majority_met = (
+                signal_total > 0
+                and signal_match_count >= max(1, majority)
+            )
+            verified = signal_majority_met or any(
                 t.tool in ("verify", "extract_text") and t.status == "ok"
                 for t in turn_log
             )
@@ -3806,6 +4221,61 @@ def run_qa_agent_for_plan(
             # follow-up checkout flow that bounces through it.
             plan_page_memory: dict[str, dict[str, Any]] = {}
 
+            # γ.2 — cross-submodule frozen-flow bundle. We collect
+            # the (submodule, frozen) pairs as submodules pass + bundle
+            # them onto the parent MODULE node at run end. Future
+            # replays can walk the parent's bundle in one shot rather
+            # than re-orchestrating across submodules. Only filled
+            # when the run keeps stringing together passes; any
+            # blocked / failed / disputed submodule resets the streak.
+            bundle_pairs: list[tuple[Any, dict[str, Any]]] = []
+
+            # α.5 — Plan-scoped WorldState. Carried across submodules
+            # so submodule N can assert preconditions set up by
+            # submodule N-1 (cart_count, logged_in_as, etc.). Loaded
+            # from the run row (None for legacy / fresh runs); saved
+            # back at every submodule boundary.
+            from app.models.agent_run import AgentRun  # noqa: PLC0415
+            from app.services.world_state import (  # noqa: PLC0415
+                load_world_state, save_world_state,
+            )
+            run_row = db.get(AgentRun, run_id)
+            world_state: dict[str, Any] = (
+                load_world_state(run_row) if run_row else {}
+            )
+
+            # ── Cost tracking — open the run context + snapshot ───
+            # model names so the cost service can resolve pricing
+            # against the model used AT RUN TIME (changing the LLM
+            # config later doesn't silently re-cost historical runs
+            # with the new model's name). The cost service still
+            # applies the LATEST pricing — re-costing a run at
+            # today's $/M is the more useful question for tracking
+            # model price changes over time.
+            #
+            # ``run_id`` is passed in so end_run can flush the per-
+            # call buffer into ``llm_call_logs`` with the right FK.
+            from app.llm.cost_tracker import (  # noqa: PLC0415
+                begin_run as _begin_cost,
+            )
+            _begin_cost(run_id=run_id)
+            if run_row is not None:
+                try:
+                    run_row.strong_model_snapshot = getattr(
+                        provider, "model", None,
+                    )
+                    run_row.cheap_model_snapshot = (
+                        getattr(cheap_provider, "model", None)
+                        if cheap_provider is not None
+                        else None
+                    )
+                    db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
             for idx, ((submodule, steps), row) in enumerate(zip(groups, rows)):
                 if is_cancelled and is_cancelled():
                     cancelled = True
@@ -3866,6 +4336,18 @@ def run_qa_agent_for_plan(
                     "goal": goal.to_dict(),
                 }
                 db.commit()
+
+                # Cost tracking: tell the per-call buffer which step
+                # the upcoming calls belong to, so the drill-in view
+                # can group "all calls on submodule N" cleanly.
+                try:
+                    from app.llm.cost_tracker import (  # noqa: PLC0415
+                        set_current_step,
+                    )
+                    set_current_step(row.id)
+                except Exception:
+                    pass
+
                 _emit(emit_event, "step_started", {
                     "step_id": row.id,
                     "tc_node_id": row.tc_node_id,
@@ -3890,7 +4372,14 @@ def run_qa_agent_for_plan(
                     page_memory=plan_page_memory,
                     cheap_provider=cheap_provider,
                     agent_strategy=agent_strategy,
+                    world_state=world_state,
+                    db=db,
                 )
+
+                # α.5 — persist WorldState after every submodule so
+                # the next one sees the latest cart/login/url state.
+                if run_row is not None:
+                    save_world_state(db, run_row, world_state)
 
                 total_input_tokens += result.input_tokens
                 total_output_tokens += result.output_tokens
@@ -3983,6 +4472,34 @@ def run_qa_agent_for_plan(
                     and vision_verdict in (None, "pass")
                     and not manual_intervention_in_run
                 )
+
+                # α.5 — apply postconditions to WorldState on success
+                # so the NEXT submodule's preconditions can match. Done
+                # before freeze + before save_world_state above (which
+                # runs in the per-submodule loop tail).
+                if result.status == "passed":
+                    try:
+                        from app.services.world_state import (  # noqa: PLC0415
+                            apply_postconditions,
+                        )
+                        last_url = ""
+                        if result.turn_log:
+                            last_url = (
+                                result.turn_log[-1].page_url or ""
+                            )
+                        apply_postconditions(
+                            world_state,
+                            list(goal.postconditions or []),
+                            current_url=last_url,
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "WorldState postcondition apply skipped: %s", e,
+                        )
+
+                # γ.2 — frozen-path summary into AKB so future runs
+                # querying "how do I do X on this app" see the proven
+                # working flow (text only — no selectors).
                 if should_freeze:
                     frozen = _build_frozen_path(
                         run_id=run_id,
@@ -4011,6 +4528,49 @@ def run_qa_agent_for_plan(
                                 submodule.id, len(frozen["steps"]),
                                 run_id,
                             )
+                            # γ.2 — append to the cross-submodule
+                            # bundle. The parent module gets a
+                            # ``frozen_path`` whose ``steps`` is the
+                            # CONCATENATION of every consecutive
+                            # passing submodule's steps. Replay can
+                            # walk the parent in one shot, OR fall
+                            # through to per-submodule frozen paths
+                            # when only some submodules under the
+                            # module have passed cleanly.
+                            bundle_pairs.append((submodule, frozen))
+                            # γ.2 — write a text summary of the frozen
+                            # flow to AKB so future RUNS asking the
+                            # AKB "how do I X on this app" find it.
+                            try:
+                                from app.services.akb_ingest import (  # noqa: PLC0415
+                                    ingest_frozen_path_summary,
+                                )
+                                ingest_frozen_path_summary(
+                                    db,
+                                    target_url=plan.target_url or "",
+                                    submodule_title=(
+                                        submodule.title or ""
+                                    ),
+                                    frozen_path=frozen,
+                                    source_run_id=run_id,
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "AKB frozen-summary write skipped: %s",
+                                    e,
+                                )
+                else:
+                    # Non-passing OR disputed submodule — reset the
+                    # bundle streak. We only freeze CONTIGUOUS passing
+                    # sequences as a bundle.
+                    if bundle_pairs:
+                        _persist_module_bundle(
+                            db, bundle_pairs,
+                            plan_target_url=plan.target_url or "",
+                            run_id=run_id,
+                            agent_model=getattr(provider, "model", None),
+                        )
+                        bundle_pairs = []
 
                 _emit(emit_event, "step_completed", {
                     "step_id": row.id,
@@ -4030,6 +4590,52 @@ def run_qa_agent_for_plan(
     except BrowserNotInstalledError:
         raise
     finally:
+        # γ.2 — flush any in-flight cross-submodule bundle. The streak
+        # might have ended on the last submodule (no "else" branch
+        # fires after the loop exits cleanly). Persist whatever
+        # contiguous passing streak survived to here.
+        try:
+            if bundle_pairs:
+                _persist_module_bundle(
+                    db, bundle_pairs,
+                    plan_target_url=plan.target_url or "",
+                    run_id=run_id,
+                    agent_model=getattr(provider, "model", None),
+                )
+        except Exception as e:
+            logger.debug(
+                "module bundle final flush skipped: %s", e,
+            )
+
+        # ── Cost tracking — close the context + persist counters ──
+        # to the AgentRun row + flush the per-call buffer to
+        # ``llm_call_logs`` (end_run handles the call-log insert
+        # internally when db is supplied). Best-effort; failure
+        # here leaves the aggregate tokens (on output_summary_json)
+        # still visible in the report.
+        try:
+            from app.llm.cost_tracker import (  # noqa: PLC0415
+                end_run as _end_cost,
+            )
+            counters = _end_cost(db=db)
+            if counters is not None and run_row is not None:
+                run_row.strong_input_tokens = counters.strong_input
+                run_row.strong_output_tokens = counters.strong_output
+                run_row.cheap_input_tokens = counters.cheap_input
+                run_row.cheap_output_tokens = counters.cheap_output
+                run_row.strong_cached_input_tokens = (
+                    counters.strong_cached_input
+                )
+                run_row.cheap_cached_input_tokens = (
+                    counters.cheap_cached_input
+                )
+                db.commit()
+        except Exception as e:
+            logger.debug("cost counters persist skipped: %s", e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
         if cancelled:
             now = _utcnow()
             for row in rows:

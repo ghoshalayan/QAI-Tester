@@ -57,6 +57,17 @@ export interface Settings {
    * are transformed at the API boundary to a deterministic 80-90%
    * pass-rate distribution. Real data is untouched. */
   ai_mode: boolean;
+  /** Cost tracking — USD per million tokens. null = not configured
+   * (the cost surface shows ``$—`` for that tier/direction). */
+  strong_input_price_per_m: number | null;
+  strong_output_price_per_m: number | null;
+  cheap_input_price_per_m: number | null;
+  cheap_output_price_per_m: number | null;
+  /** Cached-input rate. null → cost service falls back to the
+   * regular input rate (over-bills the cached portion slightly,
+   * never under-bills). Set to ~50% of regular input for OpenAI. */
+  strong_cached_input_price_per_m: number | null;
+  cheap_cached_input_price_per_m: number | null;
   updated_at: string | null;
 }
 
@@ -68,6 +79,96 @@ export interface SettingsWrite {
   api_key?: string;
   base_url?: string;
   ai_mode?: boolean;
+  /** Cost — USD per million tokens. Send 0 to clear; >0 to set. */
+  strong_input_price_per_m?: number;
+  strong_output_price_per_m?: number;
+  cheap_input_price_per_m?: number;
+  cheap_output_price_per_m?: number;
+  strong_cached_input_price_per_m?: number;
+  cheap_cached_input_price_per_m?: number;
+}
+
+/** One line in the cost breakdown — tier × direction.
+ * ``input_cached`` is the prompt-cached subset, billed at the
+ * cached rate (typically ~50% of regular input for OpenAI). */
+export interface CostLine {
+  tier: "strong" | "cheap";
+  direction: "input" | "input_cached" | "output";
+  tokens: number;
+  price_per_m: number | null;
+  cost_usd: number | null;
+}
+
+/** Per-run breakdown returned by /settings/cost/runs/{run_id}. */
+export interface RunCost {
+  run_id: number;
+  kind: string;
+  status?: string;
+  project_id?: number;
+  plan_id?: number | null;
+  strong_model: string | null;
+  cheap_model: string | null;
+  estimated_from_aggregate: boolean;
+  lines: CostLine[];
+  total_cost_usd: number | null;
+  created_at?: string | null;
+}
+
+/** Aggregate roll-up across runs for the Cost Logs dashboard. */
+export interface AggregateCost {
+  run_count: number;
+  total_strong_input_tokens: number;
+  total_strong_output_tokens: number;
+  total_cheap_input_tokens: number;
+  total_cheap_output_tokens: number;
+  /** Cached portions — sum of input_cached tokens across all runs.
+   * Helps the user gauge "how much of my input is being cached". */
+  total_strong_cached_input_tokens: number;
+  total_cheap_cached_input_tokens: number;
+  total_cost_usd: number | null;
+  by_kind: Record<string, number>;
+}
+
+/** Per-LLM-call row returned by the drill-in endpoint. */
+export interface CallLogEntry {
+  id: number;
+  ordinal: number;
+  step_id: number | null;
+  step_title: string | null;
+  role: string;
+  tier: "strong" | "cheap";
+  model: string | null;
+  /** Total prompt tokens (regular + cached combined). */
+  input_tokens: number;
+  output_tokens: number;
+  /** Cached subset of input_tokens — billed at the cached rate. */
+  cached_input_tokens: number;
+  /** Regular = input_tokens - cached_input_tokens (server-computed
+   * so the UI doesn't have to). */
+  regular_input_tokens: number;
+  /** Regular-input cost (regular_input_tokens × regular rate). */
+  input_cost_usd: number | null;
+  /** Cached-input cost (cached_input_tokens × cached rate). */
+  cached_input_cost_usd: number | null;
+  output_cost_usd: number | null;
+  total_cost_usd: number | null;
+  escalated: boolean;
+  duration_ms: number | null;
+  created_at: string | null;
+}
+
+/** Response shape from GET /cost/runs/{run_id}/calls. */
+export interface RunCallLog {
+  run_id: number;
+  kind: string;
+  strong_model: string | null;
+  cheap_model: string | null;
+  call_count: number;
+  calls: CallLogEntry[];
+  sum_input_cost_usd: number | null;
+  sum_cached_input_cost_usd: number | null;
+  sum_output_cost_usd: number | null;
+  sum_total_cost_usd: number | null;
 }
 
 export interface TestConnectionResult {
@@ -322,6 +423,24 @@ export interface AgentRunRead {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  /** Cost tracking — per-tier token counters + model snapshots
+   * (migration 0017). Always present; pre-feature runs have
+   * counters at 0 and the cost service treats their aggregate as
+   * strong-tier. */
+  strong_input_tokens: number;
+  strong_output_tokens: number;
+  cheap_input_tokens: number;
+  cheap_output_tokens: number;
+  /** Cached portions of the input totals above (SUBSET, not
+   * additive). Always present; 0 on legacy / pre-feature runs. */
+  strong_cached_input_tokens: number;
+  cheap_cached_input_tokens: number;
+  strong_model_snapshot: string | null;
+  cheap_model_snapshot: string | null;
+  /** Computed at read time against current AppSettings pricing.
+   * null = pricing not configured for any tier-direction that
+   * has tokens, OR the run did no LLM activity. */
+  total_cost_usd: number | null;
 }
 
 export interface BrdToFrdRunRequest {
@@ -399,6 +518,20 @@ export interface InterventionPayload {
   /** Phase 4 — paired second value (e.g. password when text_value
    * is the username). */
   text_value_secondary?: string | null;
+}
+
+/** β.1 — Scout this app result. Returned by ``api.scoutApp``. */
+export interface ScoutResult {
+  target_url: string;
+  pages_visited: number;
+  pages: { url: string; title: string; primary_cta: string[] }[];
+  auth_surface: string | null;
+  primary_nav_items: string[];
+  notes: string[];
+  error_message: string | null;
+  vision_calls: number;
+  input_tokens: number;
+  output_tokens: number;
 }
 
 /** Phase 4 — open typed prompt fetched via GET /intervention/open. */
@@ -520,6 +653,22 @@ export interface ReportStepRead {
     reasoning: string | null;
     confidence: number | null;
     visible_evidence: string | null;
+  } | null;
+  /** Production-α — AKB chunks recalled at submodule start. */
+  akb_recall: {
+    kind: string;
+    content: string;
+    confidence: number;
+    tags: string[];
+    relevance: number;
+  }[];
+  /** Plan-scoped WorldState snapshot at submodule end. */
+  world_state_snapshot: Record<string, unknown> | null;
+  /** Signal-voting trace: which evidence_signals matched. */
+  signal_voting: {
+    matched: number;
+    total: number;
+    traces: { signal: string; matched: boolean; via: string }[];
   } | null;
 }
 
@@ -829,6 +978,51 @@ export const api = {
       body: JSON.stringify(data ?? {}),
     }),
 
+  // ── Cost (Cost Logs dashboard + Cost card on report) ──────────
+  /** Per-run cost breakdown for one run (Cost card on report). */
+  getRunCost: (runId: number) =>
+    apiFetch<RunCost>(`/api/settings/cost/runs/${runId}`),
+  /** Recent runs with per-tier breakdown for the Cost Logs table.
+   * ``project_id`` / ``plan_id`` filter; ``limit`` defaults 200. */
+  listRunCosts: (params?: {
+    project_id?: number;
+    plan_id?: number;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.project_id !== undefined)
+      qs.set("project_id", String(params.project_id));
+    if (params?.plan_id !== undefined)
+      qs.set("plan_id", String(params.plan_id));
+    if (params?.limit !== undefined)
+      qs.set("limit", String(params.limit));
+    const q = qs.toString();
+    return apiFetch<{ runs: RunCost[] }>(
+      `/api/settings/cost/runs${q ? `?${q}` : ""}`,
+    );
+  },
+  /** Per-LLM-call telemetry for one run — drill-in view. */
+  listRunCallLogs: (runId: number) =>
+    apiFetch<RunCallLog>(`/api/settings/cost/runs/${runId}/calls`),
+  /** Aggregated cost roll-up matching the same filters. */
+  aggregateCost: (params?: {
+    project_id?: number;
+    plan_id?: number;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.project_id !== undefined)
+      qs.set("project_id", String(params.project_id));
+    if (params?.plan_id !== undefined)
+      qs.set("plan_id", String(params.plan_id));
+    if (params?.limit !== undefined)
+      qs.set("limit", String(params.limit));
+    const q = qs.toString();
+    return apiFetch<AggregateCost>(
+      `/api/settings/cost/aggregate${q ? `?${q}` : ""}`,
+    );
+  },
+
   // Projects
   listProjects: () => apiFetch<Project[]>("/api/projects"),
   getProject: (id: number) => apiFetch<Project>(`/api/projects/${id}`),
@@ -939,6 +1133,38 @@ export const api = {
     apiFetch<void>(`/api/projects/${projectId}/plans/${planId}`, {
       method: "DELETE",
     }),
+
+  /** β.1 — Scout this app: walk the plan's target_url + write
+   * recon notes to AKB. Synchronous; ~30-60s per call. */
+  scoutApp: (projectId: number, planId: number) =>
+    apiFetch<ScoutResult>(
+      `/api/projects/${projectId}/plans/${planId}/scout`,
+      { method: "POST" },
+    ),
+
+  /** γ.1 — Resolve a runtime test-case dispute. Action accept /
+   * reject / edit; optional user_note; optional apply_to_test_case
+   * to annotate the TC node's description. Writes a high-confidence
+   * dispute_outcome chunk to AKB so future runs benefit. */
+  resolveDispute: (
+    projectId: number,
+    runId: number,
+    stepId: number,
+    payload: {
+      action: "accept" | "reject" | "edit";
+      user_note?: string;
+      apply_to_test_case?: boolean;
+    },
+  ) =>
+    apiFetch<{
+      action: string;
+      akb_chunk_id: number | null;
+      target_url: string;
+      applied_to_tc: boolean;
+    }>(
+      `/api/projects/${projectId}/agent-runs/${runId}/disputes/${stepId}/resolve`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
 
   createCredential: (
     projectId: number,

@@ -103,6 +103,42 @@ class TcNode(Base):
     # agent-run; replay falls back to agentic for them.
     frozen_path: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # ── Production-α: goal preconditions / postconditions / signals ─
+    # Richer goal shape so the agent can reason about WHEN it's done
+    # rather than relying on narrative interpretation. All four are
+    # ``list[str]`` of short conditions; NULL = legacy run that
+    # predates this column (agent infers from goal description).
+    #
+    # preconditions       : state that must hold BEFORE the agent
+    #                       acts. Asserted against WorldState at
+    #                       submodule start; mismatch → auto-dispute
+    #                       with kind=precondition_failed.
+    # postconditions      : state that must hold AFTER for the goal
+    #                       to count as passed. Used to update
+    #                       WorldState on success.
+    # evidence_signals    : observable signals that prove the post-
+    #                       conditions met (e.g. "Subtotal text"
+    #                       AND "cart icon badge ≥ 1"). The agent's
+    #                       verify is N-of-M — claim done when ≥
+    #                       threshold of signals match.
+    # alternative_paths   : human-readable hints about other ways
+    #                       to reach the postconditions when the
+    #                       primary flow is blocked (e.g. "use the
+    #                       cart icon in header instead of the
+    #                       Cart link in footer").
+    preconditions: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True,
+    )
+    postconditions: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True,
+    )
+    evidence_signals: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True,
+    )
+    alternative_paths: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True,
+    )
+
     # ── Selection + status ────────────────────────────────────────
     selectable_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True,

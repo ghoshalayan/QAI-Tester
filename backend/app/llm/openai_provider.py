@@ -34,6 +34,32 @@ from app.llm.base import ChatMessage, ChatResult, LLMProvider, TestConnectionRes
 logger = logging.getLogger(__name__)
 
 
+def _extract_cached_tokens(usage: Any) -> int | None:
+    """Pull OpenAI's automatic-cache hit count off the usage block.
+
+    OpenAI surfaces this as ``usage.prompt_tokens_details.cached_tokens``
+    (≥ 1024-token prompts hit cache automatically at ~50% the input
+    rate). Returns ``None`` when the field is absent, which happens on:
+      - older models that didn't cache
+      - OpenAI-compatible servers (Ollama / vLLM / etc.) that don't
+        forward this field
+      - prompts below the cache threshold
+    The cost service treats None as 0 cached.
+    """
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return None
+    val = getattr(details, "cached_tokens", None)
+    if val is None and isinstance(details, dict):
+        val = details.get("cached_tokens")
+    try:
+        return int(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 # Vision-capable model families. Native OpenAI keeps adding new ones; we
 # pattern-match conservatively rather than hard-code a list. Compat
 # providers usually opt-in by exposing a vision-capable model name —
@@ -190,6 +216,7 @@ class OpenAIProvider(LLMProvider):
             model=self.model,
             input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
             output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            cached_input_tokens=_extract_cached_tokens(usage),
             raw=response,
         )
 
@@ -260,6 +287,7 @@ class OpenAIProvider(LLMProvider):
             model=self.model,
             input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
             output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            cached_input_tokens=_extract_cached_tokens(usage),
             parsed=parsed,
             raw=response,
         )
@@ -349,6 +377,7 @@ class OpenAIProvider(LLMProvider):
                     output_tokens=(
                         getattr(usage, "completion_tokens", None) if usage else None
                     ),
+                    cached_input_tokens=_extract_cached_tokens(usage),
                     parsed=parsed,
                     raw=response,
                 )

@@ -184,3 +184,22 @@ class AgentRunRead(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # Cost tracking (migration 0017). Per-tier token columns
+    # populated by the agent loop's cost context. Pre-feature runs
+    # have all four at 0; the cost service treats those as
+    # strong-tier aggregate.
+    strong_input_tokens: int = 0
+    strong_output_tokens: int = 0
+    cheap_input_tokens: int = 0
+    cheap_output_tokens: int = 0
+    # Migration 0019 — cached portions of input (SUBSET of the
+    # input totals above, not additive). 0 on legacy runs.
+    strong_cached_input_tokens: int = 0
+    cheap_cached_input_tokens: int = 0
+    strong_model_snapshot: str | None = None
+    cheap_model_snapshot: str | None = None
+    # ``total_cost_usd`` is computed at read time by the runs router
+    # (it joins the per-tier tokens against current AppSettings
+    # pricing). NULL on the schema means "no pricing configured"
+    # OR "no LLM activity on this run" — UI distinguishes.
+    total_cost_usd: float | None = None

@@ -91,6 +91,31 @@ def _require_run(
     return run
 
 
+def _annotate_costs(db: Session, runs: list[AgentRun]) -> None:
+    """Stamp ``total_cost_usd`` on each in-memory run instance so the
+    AgentRunRead serializer picks it up via ``from_attributes``.
+
+    Cheap: one settings lookup (cached inside compute_run_cost) per
+    call × O(1) math per run. Pricing changes re-cost historical
+    runs at the new rate, matching the "what would these have cost
+    at today's prices?" mental model.
+    """
+    if not runs:
+        return
+    from app.services.cost import compute_run_cost  # noqa: PLC0415
+
+    for r in runs:
+        try:
+            rc = compute_run_cost(db, r)
+            # SQLAlchemy lets us set arbitrary attributes on the
+            # instance for serialization purposes — Pydantic's
+            # ``from_attributes`` picks ``total_cost_usd`` off the
+            # in-memory object even though it's not a column.
+            r.total_cost_usd = rc.total_cost_usd  # type: ignore[attr-defined]
+        except Exception:
+            r.total_cost_usd = None  # type: ignore[attr-defined]
+
+
 # ── Start endpoints (one per agent kind; literal routes) ──────────
 
 
@@ -411,6 +436,10 @@ def list_runs(
                 r.output_summary_json = apply_to_output_summary(
                     r.output_summary_json, run_id=r.id,
                 )
+    # Decorate each run with computed total_cost_usd so the runs list
+    # gets the $ column without a second round-trip per row. Cheap
+    # (one settings lookup for the whole list × O(1) math per run).
+    _annotate_costs(db, runs)
     return runs
 
 
@@ -426,6 +455,7 @@ def get_run(
         run.output_summary_json = apply_to_output_summary(
             run.output_summary_json, run_id=run.id,
         )
+    _annotate_costs(db, [run])
     return run
 
 
@@ -663,6 +693,43 @@ def get_open_intervention_prompt(
     if prompt is None:
         return {"open": False}
     return {"open": True, **prompt}
+
+
+@router.post("/{run_id}/disputes/{step_id}/resolve")
+def resolve_step_dispute(
+    project_id: int,
+    run_id: int,
+    step_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    """γ.1 — resolve a test-case dispute the agent flagged at runtime.
+
+    Body: ``{action: "accept"|"reject"|"edit", user_note?: str,
+    apply_to_test_case?: bool}``. Writes a ``dispute_outcome`` chunk
+    to AKB so future runs see the rule, and optionally annotates
+    the TC node's description.
+    """
+    _require_run(db, project_id, run_id)
+    action = str(payload.get("action") or "").strip()
+    user_note = str(payload.get("user_note") or "").strip()
+    apply_to_tc = bool(payload.get("apply_to_test_case", False))
+
+    from app.services.dispute_resolver import (  # noqa: PLC0415
+        resolve_dispute,
+    )
+    try:
+        return resolve_dispute(
+            db,
+            project_id=project_id,
+            run_id=run_id,
+            step_id=step_id,
+            action=action,
+            user_note=user_note,
+            apply_to_test_case=apply_to_tc,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/{run_id}/steps", response_model=list[ExecutionStepRead])

@@ -30,6 +30,15 @@ class ChatResult:
     model: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Cached portion of ``input_tokens`` (SUBSET — not added on top).
+    # OpenAI populates this from ``response.usage.prompt_tokens_details
+    # .cached_tokens``; Gemini from ``usage_metadata
+    # .cached_content_token_count``. Cost service derives
+    # ``regular_input = input_tokens - cached_input_tokens`` and
+    # applies the cached rate to the cached portion. ``None`` means
+    # "provider didn't report cached usage" — treated as 0 by the
+    # cost service (no cache hit assumed).
+    cached_input_tokens: int | None = None
     # Set by ``chat_structured()`` — the parsed JSON payload matching the schema.
     # ``None`` for free-form ``chat()`` calls.
     parsed: Any = None

@@ -24,9 +24,11 @@ from app.db import Base  # noqa: E402
 # Add new model modules to the tuple below as they're created.
 from app.models import (  # noqa: E402
     agent_run,
+    app_knowledge,
     app_settings,
     document,
     execution_step,
+    llm_call_log,
     project,
     requirement,
     tc_node,
@@ -35,9 +37,11 @@ from app.models import (  # noqa: E402
 
 _REGISTERED_MODELS = (
     agent_run,
+    app_knowledge,
     app_settings,
     document,
     execution_step,
+    llm_call_log,
     project,
     requirement,
     tc_node,

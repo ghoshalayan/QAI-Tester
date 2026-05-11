@@ -28,6 +28,19 @@ class AppSettingsRead(BaseModel):
     # pass-rate distribution. Real data is untouched. User-facing
     # label everywhere is "AI Mode".
     ai_mode: bool = False
+    # Cost tracking — USD per million tokens. NULL = "not configured"
+    # (the cost surface renders ``$—`` for that tier/direction).
+    strong_input_price_per_m: float | None = None
+    strong_output_price_per_m: float | None = None
+    cheap_input_price_per_m: float | None = None
+    cheap_output_price_per_m: float | None = None
+    # Migration 0019 — cached-input rate (applied to prompt tokens
+    # the provider reported as cache hits). Typical OpenAI: ~50%
+    # of regular input. Typical Gemini cached_content: ~25%.
+    # NULL → cost service falls back to the regular input rate
+    # (safe over-bill default).
+    strong_cached_input_price_per_m: float | None = None
+    cheap_cached_input_price_per_m: float | None = None
     updated_at: datetime | None = None
 
 
@@ -41,6 +54,30 @@ class AppSettingsWrite(BaseModel):
     api_key: str | None = Field(default=None, max_length=512)
     base_url: str | None = Field(default=None, max_length=512)
     ai_mode: bool | None = None
+    # Cost tracking — USD per million tokens. Float >= 0 (negative
+    # rejected by Field constraint). ``None`` means "don't update";
+    # send ``0`` to clear a previously-set rate, or any positive
+    # float to set/replace.
+    strong_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    strong_output_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    cheap_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    cheap_output_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    # Migration 0019 — cached-input rates. Same "None = preserve,
+    # 0 = clear" semantics as the regular rates.
+    strong_cached_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    cheap_cached_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
 
 
 class TestConnectionResponse(BaseModel):

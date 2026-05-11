@@ -88,6 +88,12 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
     smart_pick: dict | None = None
     # Phase 9 — semantic verify escalation result.
     semantic_verify: dict | None = None
+    # Production-α — AKB chunks recalled at submodule start, world-
+    # state snapshot, and signal-voting trace. Lifted from
+    # ``details_json`` so the report renders them inline.
+    akb_recall: list[dict] = []
+    world_state_snapshot: dict | None = None
+    signal_voting: dict | None = None
 
     if isinstance(details, dict) and details.get("mode") == "agentic":
         mode = "agentic"
@@ -166,6 +172,31 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
                 }
                 break
 
+        # α — AKB recall, WorldState snapshot, signal voting traces.
+        # All three live on the agent_log's first / last turn search_log
+        # OR at the top-level details. WorldState lives on the run row
+        # (not per-step), but the per-step report row includes a copy
+        # for context.
+        for t in agent_log:
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and isinstance(
+                sl.get("akb_recall"), list,
+            ):
+                akb_recall = list(sl.get("akb_recall") or [])
+                break
+        for t in reversed(agent_log):
+            sl = t.get("search_log") if isinstance(t, dict) else None
+            if isinstance(sl, dict) and isinstance(
+                sl.get("signal_voting"), dict,
+            ):
+                signal_voting = sl.get("signal_voting")
+                break
+        # WorldState snapshot — lifted from details if the agent
+        # captured one, else None.
+        ws_raw = details.get("world_state") if isinstance(details, dict) else None
+        if isinstance(ws_raw, dict):
+            world_state_snapshot = ws_raw
+
         # Phase 9 — lift the most recent semantic-verify escalation.
         for t in reversed(agent_log):
             sl = t.get("search_log") if isinstance(t, dict) else None
@@ -209,6 +240,9 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         test_case_dispute=test_case_dispute,
         smart_pick=smart_pick,
         semantic_verify=semantic_verify,
+        akb_recall=akb_recall,
+        world_state_snapshot=world_state_snapshot,
+        signal_voting=signal_voting,
     )
 
 
