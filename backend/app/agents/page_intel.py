@@ -2204,3 +2204,277 @@ def classify_popup(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
+
+
+# ── Auth field detection (login / OTP / captcha screen intent) ─────
+#
+# The auth flow needs to know WHERE to type each credential without
+# relying on DOM resolution. This helper does ONE vision call against
+# the live screenshot and returns per-field pixel coordinates plus
+# error-message detection — so the orchestrator can:
+#   1. click-type the email at (x1, y1)
+#   2. click-type the password at (x2, y2)
+#   3. click submit at (x3, y3)
+#   4. on retry: see the "Please enter a valid email" error and
+#      know which field needs re-typing
+#
+# Critical: ``screenshot_bytes`` MUST be captured at full viewport
+# resolution (downscale=False). Returned coords are in that space
+# and are dispatched directly to ``page.mouse.click(x, y)``.
+
+
+@dataclass
+class AuthFieldsDetection:
+    """Per-field coordinates + error state on an auth screen."""
+
+    # Screen kind — drives the auth flow's branching.
+    kind: Literal[
+        "login", "otp", "captcha", "passkey",
+        "success", "unknown",
+    ]
+    # Field coords (pixel center). 0/0 when not visible.
+    username_x: int = 0
+    username_y: int = 0
+    password_x: int = 0
+    password_y: int = 0
+    otp_x: int = 0
+    otp_y: int = 0
+    submit_x: int = 0
+    submit_y: int = 0
+    # Per-field visibility hints — caller checks these before
+    # dispatching a click (avoids clicking 0,0 when a field is absent).
+    username_visible: bool = False
+    password_visible: bool = False
+    otp_visible: bool = False
+    submit_visible: bool = False
+    # Error message currently displayed under the form, if any
+    # (e.g. "Please enter a valid email address"). Empty when none.
+    error_text: str = ""
+    # Which field the error applies to ("username" | "password" |
+    # "otp" | "" when ambiguous / not field-specific).
+    error_field: str = ""
+    reasoning: str = ""
+    confidence: float = 0.0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+AUTH_FIELDS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": [
+                "login", "otp", "captcha", "passkey",
+                "success", "unknown",
+            ],
+        },
+        "username_x": {"type": "integer"},
+        "username_y": {"type": "integer"},
+        "password_x": {"type": "integer"},
+        "password_y": {"type": "integer"},
+        "otp_x": {"type": "integer"},
+        "otp_y": {"type": "integer"},
+        "submit_x": {"type": "integer"},
+        "submit_y": {"type": "integer"},
+        "username_visible": {"type": "boolean"},
+        "password_visible": {"type": "boolean"},
+        "otp_visible": {"type": "boolean"},
+        "submit_visible": {"type": "boolean"},
+        "error_text": {"type": "string"},
+        "error_field": {
+            "type": "string",
+            "enum": ["", "username", "password", "otp"],
+        },
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": [
+        "kind",
+        "username_x", "username_y",
+        "password_x", "password_y",
+        "otp_x", "otp_y",
+        "submit_x", "submit_y",
+        "username_visible", "password_visible",
+        "otp_visible", "submit_visible",
+        "error_text", "error_field",
+        "reasoning", "confidence",
+    ],
+    "additionalProperties": False,
+}
+
+
+AUTH_FIELDS_SYSTEM_PROMPT = """You analyze a login / OTP / captcha screen and return pixel coordinates for each visible field so a QA agent can fill the form via mouse + keyboard.
+
+Classify the screen kind FIRST:
+- "login"   : email/username + password fields visible (with or
+              without other fields like "remember me")
+- "otp"     : a one-time-code field (6-digit, "OTP", "verification
+              code", "authenticator"). Email/password may or may
+              not be present too.
+- "captcha" : a CAPTCHA challenge blocks the form (reCAPTCHA, hCaptcha,
+              Cloudflare Turnstile). Requires human attention.
+- "passkey" : a passkey / FIDO2 / WebAuthn prompt
+- "success" : the post-login page (dashboard / account home —
+              login already happened)
+- "unknown" : screen doesn't fit any of the above
+
+Then return PIXEL COORDINATES (full viewport space) for the center
+of each VISIBLE interactive element:
+- ``username_x``, ``username_y``  — the email / username INPUT field
+- ``password_x``, ``password_y``  — the password INPUT field
+- ``otp_x``, ``otp_y``            — the OTP / verification code field
+- ``submit_x``, ``submit_y``      — the primary submit button (Login /
+                                    Sign In / Continue / Verify)
+
+Set the matching ``*_visible`` boolean to ``true`` when the field
+is rendered AND ready for input (not greyed out, not hidden behind
+a tab). Set it to ``false`` AND coords to 0,0 when the field isn't
+present on the current screen.
+
+Click TARGETS:
+- Input fields: aim for the input's CENTER (NOT the label above
+  it; clicking the label sometimes only focuses, sometimes does
+  nothing depending on the framework).
+- Submit button: aim for the button's center.
+- Coords MUST be POSITIVE integers in the screenshot's pixel space.
+
+Error detection:
+- If you see an inline error message (red text under a field, an
+  alert banner, etc.), copy it VERBATIM into ``error_text`` (trim
+  to ~200 chars).
+- Set ``error_field`` to which input it's about:
+    "username" — "Please enter a valid email", "Email is required",
+    "password" — "Password must be 8 characters", "Wrong password",
+    "otp"      — "Invalid code", "Code expired",
+    ""         — error is generic / cross-field / you can't tell
+- Empty ``error_text`` when no error is visible.
+
+Confidence: 0.9+ when fields are unambiguously located. <0.7 when
+you're guessing on at least one coord — the caller will fall back
+to HITL on low confidence.
+
+Output JSON only.
+"""
+
+
+def detect_auth_fields(
+    provider: LLMProvider,
+    page: Page,
+    *,
+    screenshot_bytes: bytes | None = None,
+    cheap_provider: LLMProvider | None = None,
+    on_escalate: Any = None,
+) -> AuthFieldsDetection:
+    """Vision LLM call: locate auth fields + read errors.
+
+    ``screenshot_bytes`` MUST be captured with ``downscale=False``;
+    returned coords are dispatched directly to ``page.mouse.click``
+    so they have to be in real viewport pixel space.
+
+    Routed through ``LLMRole.COORD_PROPOSER`` (strong-only, no
+    cheap-tier escalation) because pixel-coord accuracy matters
+    more than the cache discount on cheap-tier calls.
+    """
+    if not getattr(provider, "supports_vision", False):
+        raise RuntimeError(
+            "detect_auth_fields requires a vision-capable provider; "
+            f"{type(provider).__name__} reports supports_vision=False",
+        )
+
+    if screenshot_bytes is not None:
+        screenshot = screenshot_bytes
+    else:
+        try:
+            # Coord-bearing helper → MUST stay at original viewport size.
+            screenshot = capture_screenshot_for_vision(
+                page, downscale=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to capture screenshot for auth fields: "
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+    user_prompt = (
+        f"PAGE URL: {_safe_url(page)}\n\n"
+        "Look at the screenshot. Classify the auth screen and return "
+        "coordinates for every visible field + any error message."
+    )
+
+    messages = [
+        ChatMessage(
+            role="system", content=AUTH_FIELDS_SYSTEM_PROMPT,
+        ),
+        ChatMessage(
+            role="user", content=user_prompt, image=screenshot,
+        ),
+    ]
+    try:
+        from app.llm.router import (  # noqa: PLC0415
+            LLMRole, call_for_role,
+        )
+
+        def _validate(parsed: Any) -> bool:
+            if not isinstance(parsed, dict):
+                return False
+            return parsed.get("kind") in (
+                "login", "otp", "captcha", "passkey",
+                "success", "unknown",
+            )
+
+        tiered = call_for_role(
+            strong=provider,
+            cheap=cheap_provider,
+            role=LLMRole.COORD_PROPOSER,
+            messages=messages,
+            schema=AUTH_FIELDS_SCHEMA,
+            schema_name="auth_fields",
+            temperature=0.1,
+            max_output_tokens=512,
+            validate=_validate,
+            on_escalate=on_escalate,
+        )
+        result = tiered.chat
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM call failed for auth field detection: "
+            f"{type(e).__name__}: {str(e)[:300]}",
+        ) from e
+
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"auth fields returned unexpected shape: "
+            f"{type(parsed).__name__}",
+        )
+
+    kind = parsed.get("kind") or "unknown"
+
+    def _int(key: str) -> int:
+        try:
+            return max(0, int(parsed.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return AuthFieldsDetection(
+        kind=kind,  # type: ignore[arg-type]
+        username_x=_int("username_x"),
+        username_y=_int("username_y"),
+        password_x=_int("password_x"),
+        password_y=_int("password_y"),
+        otp_x=_int("otp_x"),
+        otp_y=_int("otp_y"),
+        submit_x=_int("submit_x"),
+        submit_y=_int("submit_y"),
+        username_visible=bool(parsed.get("username_visible", False)),
+        password_visible=bool(parsed.get("password_visible", False)),
+        otp_visible=bool(parsed.get("otp_visible", False)),
+        submit_visible=bool(parsed.get("submit_visible", False)),
+        error_text=str(parsed.get("error_text", ""))[:200],
+        error_field=str(parsed.get("error_field", "")),
+        reasoning=str(parsed.get("reasoning", "")),
+        confidence=float(parsed.get("confidence", 0.0)),
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )

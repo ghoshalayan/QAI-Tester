@@ -715,6 +715,11 @@ class AgentSubmoduleResult:
     vision_calls: int = 0
     duration_ms: int = 0
     final_screenshot: str | None = None
+    # True when the auth-flow pre-run rescued a credentials / OTP /
+    # captcha / passkey screen using a human-typed value. The freeze
+    # gate must skip such runs even when ``turn_log`` itself contains
+    # no flagged turn — the secret was typed BEFORE any agent turn ran.
+    manual_intervention_used: bool = False
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -722,6 +727,50 @@ class AgentSubmoduleResult:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Cheap heuristics that catch the common login/auth screen patterns
+# without paying for a VL call. Used as the gate before invoking
+# ``auth_flow.run_auth_loop`` — once inside, the loop's own VL
+# classifier is the source of truth, so a false-positive here just
+# costs one extra detect_auth_fields call (auth_loop returns quickly
+# with kind="success"/"unknown" + low confidence and we fall through).
+_LOGIN_URL_HINTS: tuple[str, ...] = (
+    "login", "signin", "sign-in", "sign_in",
+    "auth", "authenticate", "session",
+    "logon", "log-on", "log_on", "log-in", "log_in",
+    "/oauth", "/sso", "/saml",
+)
+
+
+def _looks_like_login_page(page: Any) -> bool:
+    """Cheap pre-check: does this page LOOK like a login/auth screen?
+
+    True when EITHER:
+    - URL contains a login-ish substring (``/login``, ``/signin``,
+      ``/oauth``, ``/sso``, etc.), OR
+    - The DOM exposes at least one ``input[type=password]`` —
+      strongest single signal, works across SPA shells / sealed
+      shadow DOM where the URL is generic.
+
+    Failures (page closed, eval throws) return False — auth flow
+    is skipped and the agent's main loop takes over.
+    """
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if any(h in url for h in _LOGIN_URL_HINTS):
+        return True
+    try:
+        has_password = page.evaluate(
+            "() => !!document.querySelector('input[type=\"password\"]')",
+        )
+        if bool(has_password):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _json_safe(value: Any) -> Any:
@@ -1616,6 +1665,15 @@ def _vision_only_dispatch(
         elif tool == "type":
             value = str(args.get("value") or "")
             page.mouse.click(coords.x, coords.y)
+            # Clear any pre-existing value FIRST so a retry replaces
+            # rather than stacks (Select-All + Delete). Without this,
+            # typing into an already-filled field positions the new
+            # text at the cursor and produces garbled "abcabc"
+            # interleaved strings on validation-error retries.
+            from app.executor.actions import (  # noqa: PLC0415
+                clear_focused_field,
+            )
+            clear_focused_field(page)
             try:
                 page.keyboard.type(value, delay=20)
             except Exception:
@@ -2307,6 +2365,16 @@ def run_agent_for_goal(
     # so the agent has business / app knowledge available.
     world_state: dict[str, Any] | None = None,
     db: "Session | None" = None,
+    # Auth-flow plumbing — when these are wired AND the page looks like
+    # a login screen at submodule start, ``run_auth_loop`` runs once
+    # before the agent's main turn loop. ``plan`` carries the vault
+    # credentials; ``open_typed_prompt`` opens the HITL popup when the
+    # vault misses or the OTP needs human entry; ``request_intervention``
+    # blocks until the popup answers. All four are optional — the agent
+    # falls back to its own ``ask_human`` tool when they're missing.
+    plan: "TestPlan | None" = None,
+    open_typed_prompt: Callable[..., None] | None = None,
+    request_intervention: Callable[[int], dict | None] | None = None,
 ) -> AgentSubmoduleResult:
     """Drive ONE submodule to completion via the observe-think-act loop.
 
@@ -2465,6 +2533,93 @@ def run_agent_for_goal(
     )
     final_narration = ""
     final_error: str | None = None
+
+    # ── Auth-flow pre-run ─────────────────────────────────────────────
+    # Before the main observe-think-act loop, if the page looks like a
+    # login / OTP / captcha screen AND we have the HITL channel + a
+    # plan (for vault credentials), let the dedicated auth orchestrator
+    # drive the page to a logged-in state. This bypasses the agent's
+    # DOM-first ladder for the entire auth surface — coord-typing only,
+    # clear-before-type, error-driven retry, OTP via TOTP-or-HITL.
+    #
+    # Skipped on subsequent submodules (the page is already logged in,
+    # detect_auth_fields returns kind="success" or "unknown" with low
+    # confidence in <1 iteration, so this stays cheap even when called
+    # speculatively). When skipped or unsuccessful, the agent's main
+    # loop takes over — auth-flow failure is non-fatal.
+    auth_used_manual_intervention = False
+    if (
+        plan is not None
+        and request_intervention is not None
+        and open_typed_prompt is not None
+        and _looks_like_login_page(page)
+    ):
+        try:
+            from app.agents.auth_flow import (  # noqa: PLC0415
+                run_auth_loop,
+            )
+            auth_result = run_auth_loop(
+                page,
+                plan=plan,
+                provider=provider,
+                cheap_provider=cheap_provider,
+                submodule_run_id=submodule_run_id,
+                submodule_step_id=submodule_step_id,
+                emit_event=emit_event,
+                on_escalate=_emit_escalation,
+                open_typed_prompt=open_typed_prompt,
+                request_intervention=request_intervention,
+                is_cancelled=is_cancelled,
+            )
+            # Fold auth-flow LLM cost into the submodule's totals so
+            # the cost meter and per-step drilldown stay accurate.
+            if auth_result.input_tokens:
+                total_input += auth_result.input_tokens
+            if auth_result.output_tokens:
+                total_output += auth_result.output_tokens
+            if auth_result.vision_calls:
+                vision_calls += auth_result.vision_calls
+                llm_calls += auth_result.vision_calls
+            if auth_result.manual_intervention_used:
+                auth_used_manual_intervention = True
+            _emit(emit_event, "auth_flow_completed", {
+                "run_id": submodule_run_id,
+                "step_id": submodule_step_id,
+                "status": auth_result.status,
+                "iterations": auth_result.iterations,
+                "screens_seen": auth_result.screens_seen,
+                "manual_intervention_used": (
+                    auth_result.manual_intervention_used
+                ),
+                "error_message": auth_result.error_message,
+            })
+            if auth_result.status == "cancelled":
+                halt_reason = "cancelled"
+                final_status = "blocked"
+                final_narration = "Cancelled during auth flow"
+                # Fall through to return below (turn loop won't run
+                # because turn_idx never gets bound; jump via early
+                # return).
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                return AgentSubmoduleResult(
+                    submodule_id=goal.submodule_id,
+                    status=final_status,
+                    halt_reason=halt_reason,
+                    turn_log=turn_log,
+                    final_narration=final_narration,
+                    error_message=auth_result.error_message,
+                    input_tokens=total_input,
+                    output_tokens=total_output,
+                    llm_calls=llm_calls,
+                    vision_calls=vision_calls,
+                    duration_ms=duration_ms,
+                    manual_intervention_used=auth_used_manual_intervention,
+                )
+        except Exception as e:
+            logger.warning(
+                "auth_flow pre-run failed (%s); falling back to main "
+                "agent loop", e,
+            )
 
     for turn_idx in range(1, max_turns + 1):
         # ── Cancellation check ─────────────────────────────────────
@@ -3741,7 +3896,9 @@ def run_agent_for_goal(
                                 page.mouse.click(coords.x, coords.y)
                                 # If this was meant to be a 'type'
                                 # action, send the value to the
-                                # newly-focused element.
+                                # newly-focused element. Clear first
+                                # so a retry replaces instead of
+                                # stacking onto a prior value.
                                 if tool == "type" and args.get("value"):
                                     typed_value = str(args.get("value", ""))
                                     delay = (
@@ -3749,6 +3906,10 @@ def run_agent_for_goal(
                                         if hasattr(speed_config, "type_delay_ms")
                                         else 0
                                     )
+                                    from app.executor.actions import (  # noqa: PLC0415
+                                        clear_focused_field,
+                                    )
+                                    clear_focused_field(page)
                                     if delay > 0:
                                         page.keyboard.type(
                                             typed_value, delay=delay,
@@ -3954,6 +4115,7 @@ def run_agent_for_goal(
         llm_calls=llm_calls,
         vision_calls=vision_calls,
         duration_ms=duration_ms,
+        manual_intervention_used=auth_used_manual_intervention,
     )
 
 
@@ -4055,7 +4217,15 @@ def run_qa_agent_for_plan(
     is_cancelled: Callable[[], bool] | None = None,
     is_paused: Callable[[], bool] | None = None,  # noqa: ARG001
     wait_for_resume: Callable[[], bool] | None = None,  # noqa: ARG001
-    wait_for_intervention: Callable[[int], dict | None] | None = None,  # noqa: ARG001
+    # Phase 4-α — HITL channel for the auth-flow orchestrator.
+    # ``wait_for_intervention`` blocks until the user submits a
+    # response; ``open_typed_prompt`` records the prompt's shape
+    # (credentials / OTP / manual-solve) for the live presenter to
+    # render. When wired, ``run_agent_for_goal`` invokes
+    # ``auth_flow.run_auth_loop`` on login-looking pages before its
+    # main turn loop runs.
+    wait_for_intervention: Callable[[int], dict | None] | None = None,
+    open_typed_prompt: Callable[..., None] | None = None,
     max_turns_per_goal: int = 30,
     max_wallclock_s_per_goal: int = 300,
     # Phase 1 — provider tiering. When the caller hasn't supplied
@@ -4374,6 +4544,9 @@ def run_qa_agent_for_plan(
                     agent_strategy=agent_strategy,
                     world_state=world_state,
                     db=db,
+                    plan=plan,
+                    open_typed_prompt=open_typed_prompt,
+                    request_intervention=wait_for_intervention,
                 )
 
                 # α.5 — persist WorldState after every submodule so
@@ -4466,6 +4639,8 @@ def run_qa_agent_for_plan(
                 manual_intervention_in_run = any(
                     getattr(t, "manual_intervention_used", False)
                     for t in result.turn_log
+                ) or bool(
+                    getattr(result, "manual_intervention_used", False)
                 )
                 should_freeze = (
                     result.status == "passed"

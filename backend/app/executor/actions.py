@@ -72,6 +72,35 @@ _WAIT_MAX_MS = 30_000
 _VERIFY_BODY_TIMEOUT_MS = 5_000
 
 
+def clear_focused_field(page: "Page") -> None:
+    """Clear whatever input field currently has focus.
+
+    Used by every coord-typing path (auth flow, vision-only dispatch,
+    coord-click rescue) BEFORE typing so a retry doesn't stack a new
+    value onto the previous one. The DOM ``_do_type`` already clears
+    via ``locator.fill('')``, but coord-typing skips the Playwright
+    locator entirely — we have to do it via keyboard.
+
+    Approach: Select-All → Delete. Cross-platform: Playwright maps
+    ``Control+A`` to ``Meta+A`` on macOS automatically. Safer than
+    triple-click (which sometimes only selects one word on certain
+    React-controlled inputs).
+
+    Best-effort — failures are swallowed because clearing is a
+    courtesy step; the subsequent type still works if the field
+    was empty to begin with.
+    """
+    try:
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Delete")
+    except Exception:
+        try:
+            page.keyboard.press("Meta+A")
+            page.keyboard.press("Backspace")
+        except Exception:
+            pass
+
+
 @dataclass
 class ActionContext:
     """Per-step context the dispatcher needs.

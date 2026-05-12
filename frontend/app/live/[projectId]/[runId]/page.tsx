@@ -932,6 +932,77 @@ function EventRow({ event }: { event: LiveEvent }) {
     );
   }
 
+  // Phase 4-α — auth-flow orchestrator events. Emitted by
+  // ``auth_flow.run_auth_loop`` as it classifies each auth screen,
+  // types into username/password/otp fields, and submits. Lets the
+  // user see the credential handler working in real time instead of
+  // staring at an opaque "agent · type" stream.
+  if (type === "auth_screen_classified") {
+    const kind = (data.kind as string | undefined) ?? "?";
+    const conf =
+      typeof data.confidence === "number"
+        ? `${Math.round(data.confidence * 100)}%`
+        : undefined;
+    const errText =
+      typeof data.error_text === "string" && data.error_text
+        ? data.error_text
+        : undefined;
+    const iter =
+      typeof data.iteration === "number" ? `iter ${data.iteration} · ` : "";
+    const colorClass =
+      kind === "success"
+        ? "text-emerald-500"
+        : kind === "captcha" || kind === "passkey"
+          ? "text-amber-500"
+          : kind === "login" || kind === "otp"
+            ? "text-purple-500"
+            : "text-muted-foreground";
+    return (
+      <Row
+        icon={<Bot className={cn("size-3.5", colorClass)} />}
+        label={`auth · ${iter}${kind}`}
+        title={errText}
+        sublabel={conf ? `confidence ${conf}` : undefined}
+      />
+    );
+  }
+  if (type === "auth_field_typed") {
+    const field = (data.field as string | undefined) ?? "field";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`auth · typed ${field}`}
+      />
+    );
+  }
+  if (type === "auth_submitted") {
+    const via = (data.via as string | undefined) ?? "submit";
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label={`auth · submitted (${via})`}
+      />
+    );
+  }
+  if (type === "auth_flow_completed") {
+    const status = (data.status as string | undefined) ?? "?";
+    const screens = Array.isArray(data.screens_seen)
+      ? (data.screens_seen as string[]).join(" → ")
+      : undefined;
+    const manual = data.manual_intervention_used === true;
+    const Icon = status === "ok" ? CheckCircle2 : AlertTriangle;
+    const colorClass =
+      status === "ok" ? "text-emerald-500" : "text-amber-500";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={`auth · flow ${status}${manual ? " · used HITL" : ""}`}
+        title={screens}
+        sublabel={data.error_message as string | undefined}
+      />
+    );
+  }
+
   // Phase 14 — smart candidate selection
   if (type === "smart_pick_started") {
     const matches =

@@ -766,6 +766,13 @@ def execute_run(run_id: int) -> None:
                     is_paused=lambda: _is_paused(run.id),
                     wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
                     wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
+                    open_typed_prompt=(
+                        lambda *, run_id, step_id, kind, question, fields=None:
+                        open_typed_prompt(
+                            run_id, step_id,
+                            kind=kind, question=question, fields=fields,
+                        )
+                    ),
                 )
             elif mode == "replay":
                 # Phase E: deterministic walk of frozen paths.
