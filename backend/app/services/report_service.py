@@ -108,6 +108,12 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
             if isinstance(sg, list):
                 # Raw dicts; Pydantic coerces via ReportSubGoal(**dict).
                 sub_goals = [s for s in sg if isinstance(s, dict)]
+        # Phase A — VL-derived runtime sub-goals override the BRD-time
+        # ones when present. Runtime sub-goals carry reason +
+        # replan_iteration which the legacy text-derived ones don't.
+        runtime_sg = details.get("sub_goals")
+        if isinstance(runtime_sg, list) and runtime_sg:
+            sub_goals = [s for s in runtime_sg if isinstance(s, dict)]
         log = details.get("agent_log") or []
         if isinstance(log, list):
             # Preserve the raw dicts; Pydantic coerces them on the

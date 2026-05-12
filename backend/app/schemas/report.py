@@ -42,18 +42,27 @@ class ReportAgentTurn(BaseModel):
 
 
 class ReportSubGoal(BaseModel):
-    """One ordered sub-goal the agent worked through (Phase A1).
+    """One ordered sub-goal the agent worked through.
 
-    Lifted from ``details_json["goal"]["sub_goals"]`` so the report
-    can render the sub-goal checklist with each item's final status —
-    pending / in_progress / done / failed / skipped — and the turn at
-    which the agent closed it.
+    Phase A1 (legacy): sourced from ``details_json["goal"]["sub_goals"]`` —
+    BRD-time text-derived hints.
+    Phase A2 (current): sourced from ``details_json["sub_goals"]`` —
+    VL-derived runtime sub-goals with reason + replan iteration.
+    The report endpoint prefers (A2) when present, falls back to (A1).
     """
 
     id: str
     description: str
     status: str = "pending"
     completed_at_turn: int | None = None
+    # Phase A — populated for VL-derived runtime sub-goals; absent
+    # on the legacy BRD-time ones (model_config allows missing).
+    success_criterion: str | None = None
+    reason: str | None = None
+    replan_iteration: int = 0
+    started_at_turn: int | None = None
+    ended_at_turn: int | None = None
+    max_turns: int | None = None
 
 
 AgentStatus = Literal[

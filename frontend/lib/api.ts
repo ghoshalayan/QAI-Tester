@@ -57,6 +57,12 @@ export interface Settings {
    * are transformed at the API boundary to a deterministic 80-90%
    * pass-rate distribution. Real data is untouched. */
   ai_mode: boolean;
+  /** Phase A — Set-of-Mark annotation on VL screenshots. When true
+   * (default), screenshots sent to VL helpers get colored bounding
+   * boxes + numbered labels drawn before upload. The VL refers to
+   * "box 5" instead of inventing pixel coords — ~10-15% targeting
+   * accuracy improvement in published benchmarks. */
+  som_enabled_default: boolean;
   /** Cost tracking — USD per million tokens. null = not configured
    * (the cost surface shows ``$—`` for that tier/direction). */
   strong_input_price_per_m: number | null;
@@ -79,6 +85,7 @@ export interface SettingsWrite {
   api_key?: string;
   base_url?: string;
   ai_mode?: boolean;
+  som_enabled_default?: boolean;
   /** Cost — USD per million tokens. Send 0 to clear; >0 to set. */
   strong_input_price_per_m?: number;
   strong_output_price_per_m?: number;
@@ -346,6 +353,9 @@ export interface PlanCreate {
   status?: PlanStatus;
   linked_document_ids?: number[];
   credentials?: CredentialCreate[];
+  /** Phase A — replan budget per submodule. Range 0-5; default 2.
+   * 0 disables sub-goal replanning entirely. */
+  max_replans_per_submodule?: number;
 }
 
 export interface PlanUpdate {
@@ -356,6 +366,7 @@ export interface PlanUpdate {
   status?: PlanStatus;
   /** When present, replaces the entire set of linked docs. */
   linked_document_ids?: number[];
+  max_replans_per_submodule?: number;
 }
 
 export interface PlanReadCompact {
@@ -381,6 +392,8 @@ export interface PlanReadDetail {
   status: PlanStatus;
   credentials: CredentialRead[];
   linked_documents: LinkedDocSummary[];
+  /** Phase A — replan budget per submodule. Default 2; range 0-5. */
+  max_replans_per_submodule: number;
   created_at: string;
   updated_at: string;
 }
@@ -580,6 +593,14 @@ export interface ReportSubGoal {
   description: string;
   status: ReportSubGoalStatus;
   completed_at_turn: number | null;
+  /** Phase A — populated for VL-derived runtime sub-goals; absent on
+   * legacy BRD-time ones. */
+  success_criterion?: string | null;
+  reason?: string | null;
+  replan_iteration?: number;
+  started_at_turn?: number | null;
+  ended_at_turn?: number | null;
+  max_turns?: number | null;
 }
 
 export interface ReportStepRead {

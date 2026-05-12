@@ -720,6 +720,16 @@ class AgentSubmoduleResult:
     # gate must skip such runs even when ``turn_log`` itself contains
     # no flagged turn — the secret was typed BEFORE any agent turn ran.
     manual_intervention_used: bool = False
+    # Phase A — VL-derived sub-goals (RuntimeSubGoal.to_dict()) folded
+    # into ``details_json["sub_goals"]`` so the report renders a
+    # per-sub-goal pass/fail/skip timeline under each submodule row.
+    # Empty when decomposition was disabled or failed (legacy behavior).
+    sub_goals: list[dict[str, Any]] = field(default_factory=list)
+    # Phase A — number of replan iterations the submodule used. 0 =
+    # first decomposition stuck through to the end (good); higher =
+    # the agent had to re-decompose after sub-goal failures. Capped
+    # by ``plan.max_replans_per_submodule``.
+    replans_used: int = 0
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -2375,6 +2385,14 @@ def run_agent_for_goal(
     plan: "TestPlan | None" = None,
     open_typed_prompt: Callable[..., None] | None = None,
     request_intervention: Callable[[int], dict | None] | None = None,
+    # Phase A — vision-driven sub-goal layer. When ``plan`` is given,
+    # we call ``decompose_goal`` once at submodule start using the
+    # current screen, replacing the BRD-time text-derived sub-goals
+    # with VL-derived ones anchored to actual UI. Replan budget comes
+    # from ``plan.max_replans_per_submodule`` (default 2).
+    # ``som_enabled`` toggles Set-of-Mark annotation on screenshots
+    # sent to ALL helper VL calls; defaults from ``app_settings``.
+    som_enabled: bool = True,
 ) -> AgentSubmoduleResult:
     """Drive ONE submodule to completion via the observe-think-act loop.
 
@@ -2621,6 +2639,125 @@ def run_agent_for_goal(
                 "agent loop", e,
             )
 
+    # ── Phase A: vision-driven sub-goal decomposition ────────────────
+    # Replace the BRD-time text-derived sub-goals on ``goal.sub_goals``
+    # with VL-derived ones anchored to the ACTUAL UI. The agent's
+    # existing planner already consumes ``goal.sub_goals`` and the
+    # tool schema has ``current_sub_goal_id`` / ``sub_goal_completed_id``
+    # fields — so we don't need to change the inner loop. We just swap
+    # the list and track the runtime metadata (replan iteration,
+    # failure reason) in a parallel ``runtime_sub_goals`` list that
+    # gets persisted into ``details_json``.
+    from app.agents.goal import SubGoal as _StaticSubGoal  # noqa: PLC0415
+    from app.agents.sub_goals import (  # noqa: PLC0415
+        RuntimeSubGoal, decompose_goal, replan_sub_goals,
+    )
+    runtime_sub_goals: list[RuntimeSubGoal] = []
+    replans_used = 0
+    max_replans = 2
+    if plan is not None:
+        try:
+            max_replans = int(
+                getattr(plan, "max_replans_per_submodule", 2),
+            )
+        except (TypeError, ValueError):
+            max_replans = 2
+    max_replans = max(0, min(5, max_replans))
+
+    if plan is not None:
+        # Capture the screen now so the decomposer sees what the agent
+        # will see on turn 1. Single VL call; cost is logged into the
+        # submodule's totals like any other helper call.
+        try:
+            from app.agents.page_intel import (  # noqa: PLC0415
+                capture_screenshot_for_vision,
+            )
+            decomp_shot = capture_screenshot_for_vision(page)
+        except Exception as e:
+            logger.debug("decomposer screenshot capture failed: %s", e)
+            decomp_shot = None
+
+        akb_text = ""
+        try:
+            akb_text = "\n".join(
+                f"- {getattr(c, 'text', '')[:240]}" for c in akb_chunks[:5]
+            )
+        except Exception:
+            akb_text = ""
+
+        decomp = decompose_goal(
+            provider,
+            goal_description=goal.description,
+            goal_success_criteria=list(goal.success_criteria or []),
+            screenshot_bytes=decomp_shot,
+            akb_block=akb_text,
+            cheap_provider=cheap_provider,
+            on_escalate=_emit_escalation,
+        )
+        if decomp.input_tokens:
+            total_input += decomp.input_tokens
+        if decomp.output_tokens:
+            total_output += decomp.output_tokens
+        if decomp.sub_goals:
+            runtime_sub_goals = decomp.sub_goals
+            # Mirror into the static SubGoal shape the existing planner
+            # / on-track / freeze code expects.
+            goal.sub_goals = [
+                _StaticSubGoal(
+                    id=rsg.id,
+                    description=rsg.description,
+                    status="pending",
+                    completed_at_turn=None,
+                )
+                for rsg in runtime_sub_goals
+            ]
+            _emit(emit_event, "sub_goals_decomposed", {
+                "run_id": submodule_run_id,
+                "step_id": submodule_step_id,
+                "count": len(runtime_sub_goals),
+                "sub_goals": [
+                    {"id": rsg.id, "description": rsg.description[:200]}
+                    for rsg in runtime_sub_goals
+                ],
+            })
+        elif decomp.error_message:
+            logger.info(
+                "sub-goal decomposition skipped: %s — falling back to "
+                "BRD-time sub-goals", decomp.error_message,
+            )
+
+    def _mirror_runtime_status() -> None:
+        """Copy goal.sub_goals[].status into runtime_sub_goals[] and
+        emit transition events for any newly completed / failed /
+        skipped sub-goal since the last call."""
+        for i, sg in enumerate(goal.sub_goals or []):
+            if i >= len(runtime_sub_goals):
+                continue
+            rsg = runtime_sub_goals[i]
+            new_status = sg.status
+            if rsg.status == new_status:
+                continue
+            old = rsg.status
+            rsg.status = new_status  # type: ignore[assignment]
+            if new_status == "in_progress":
+                rsg.started_at_turn = sg.completed_at_turn or 0
+                _emit(emit_event, "sub_goal_started", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "id": rsg.id,
+                    "description": rsg.description[:200],
+                })
+            elif new_status in ("done", "failed", "skipped"):
+                rsg.ended_at_turn = sg.completed_at_turn
+                _emit(emit_event, f"sub_goal_{new_status}", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "id": rsg.id,
+                    "description": rsg.description[:200],
+                    "reason": rsg.reason,
+                    "from_status": old,
+                })
+
     for turn_idx in range(1, max_turns + 1):
         # ── Cancellation check ─────────────────────────────────────
         if is_cancelled and is_cancelled():
@@ -2660,12 +2797,109 @@ def run_agent_for_goal(
             and len(set(obs_hashes)) == 1
             and turn_idx > stall_threshold
         ):
-            halt_reason = "stall"
-            final_status = "inconclusive"
-            final_narration = (
-                f"Page unchanged for {stall_threshold} consecutive turns"
-            )
-            break
+            # Phase A — before giving up on stall, try replanning the
+            # remaining sub-goals from the current screen. Bounded by
+            # ``max_replans`` from the plan. The next observation hash
+            # also gets reset (the replan resets the cooldown).
+            replanned = False
+            if (
+                runtime_sub_goals
+                and plan is not None
+                and replans_used < max_replans
+            ):
+                # Find the current sub-goal (first non-done / non-skipped)
+                cur_idx = next(
+                    (i for i, rsg in enumerate(runtime_sub_goals)
+                     if rsg.status not in ("done", "skipped")),
+                    None,
+                )
+                if cur_idx is not None:
+                    failed_rsg = runtime_sub_goals[cur_idx]
+                    failed_rsg.status = "failed"
+                    failed_rsg.reason = (
+                        f"page unchanged for {stall_threshold} turns"
+                    )
+                    failed_rsg.ended_at_turn = turn_idx
+                    _emit(emit_event, "sub_goal_failed", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "id": failed_rsg.id,
+                        "description": failed_rsg.description[:200],
+                        "reason": failed_rsg.reason,
+                    })
+                    try:
+                        from app.agents.page_intel import (  # noqa: PLC0415
+                            capture_screenshot_for_vision as _cap,
+                        )
+                        replan_shot = _cap(page)
+                    except Exception:
+                        replan_shot = None
+
+                    _emit(emit_event, "sub_goal_replan_started", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "iteration": replans_used + 1,
+                        "max_replans": max_replans,
+                        "after_sub_goal": failed_rsg.id,
+                    })
+                    rp = replan_sub_goals(
+                        provider,
+                        goal_description=goal.description,
+                        completed_sub_goals=[
+                            rsg for rsg in runtime_sub_goals[:cur_idx]
+                            if rsg.status == "done"
+                        ],
+                        failed_sub_goal=failed_rsg,
+                        failure_reason=failed_rsg.reason,
+                        screenshot_bytes=replan_shot,
+                        cheap_provider=cheap_provider,
+                        on_escalate=_emit_escalation,
+                        replan_iteration=replans_used + 1,
+                    )
+                    if rp.input_tokens:
+                        total_input += rp.input_tokens
+                    if rp.output_tokens:
+                        total_output += rp.output_tokens
+                    if rp.sub_goals:
+                        replans_used += 1
+                        # Keep the completed ones, replace the rest.
+                        keep = runtime_sub_goals[:cur_idx]
+                        # Renumber the new ones so ids are unique within
+                        # the submodule (sg<N>r<i>).
+                        new_runtime: list[RuntimeSubGoal] = []
+                        for j, new_sg in enumerate(rp.sub_goals, start=1):
+                            new_sg.id = f"sg{cur_idx + j}r{replans_used}"
+                            new_runtime.append(new_sg)
+                        runtime_sub_goals = keep + new_runtime
+                        goal.sub_goals = [
+                            _StaticSubGoal(
+                                id=rsg.id,
+                                description=rsg.description,
+                                status=rsg.status if rsg.status == "done" else "pending",
+                                completed_at_turn=rsg.ended_at_turn,
+                            )
+                            for rsg in runtime_sub_goals
+                        ]
+                        obs_hashes.clear()
+                        replanned = True
+                        _emit(emit_event, "sub_goals_decomposed", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "count": len(new_runtime),
+                            "replan_iteration": replans_used,
+                            "sub_goals": [
+                                {"id": rsg.id, "description": rsg.description[:200]}
+                                for rsg in new_runtime
+                            ],
+                        })
+
+            if not replanned:
+                halt_reason = "stall"
+                final_status = "inconclusive"
+                final_narration = (
+                    f"Page unchanged for {stall_threshold} consecutive turns"
+                )
+                break
 
         # ── Think (LLM call) ───────────────────────────────────────
         # Vision-on-demand: if the previous turn failed AND the provider
@@ -4096,11 +4330,32 @@ def run_agent_for_goal(
         # last "settled" page state, not a transient mid-action one.
         prev_observation = observation
 
+        # Phase A — mirror sub-goal status from the planner-managed
+        # static list onto the runtime list (carries reason + replan
+        # iteration + audit metadata). Emits sub_goal_started /
+        # sub_goal_done / sub_goal_failed / sub_goal_skipped events
+        # for any transition this turn produced.
+        _mirror_runtime_status()
+
     else:
         # for-else: loop ran to max_turns without a break
         halt_reason = "max_turns"
         final_status = "inconclusive"
         final_narration = f"Hit max_turns={max_turns} without resolution"
+
+    # Final sub-goal status mirror (catches transitions on the
+    # halt-causing turn).
+    _mirror_runtime_status()
+
+    # Mark any still-pending sub-goal as skipped with the halt reason
+    # so the report timeline doesn't show ambiguous "pending" rows.
+    for rsg in runtime_sub_goals:
+        if rsg.status in ("pending", "in_progress"):
+            rsg.status = "skipped"
+            rsg.reason = (
+                f"submodule halted before this sub-goal "
+                f"({halt_reason})"
+            )
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     return AgentSubmoduleResult(
@@ -4116,6 +4371,8 @@ def run_agent_for_goal(
         vision_calls=vision_calls,
         duration_ms=duration_ms,
         manual_intervention_used=auth_used_manual_intervention,
+        sub_goals=[rsg.to_dict() for rsg in runtime_sub_goals],
+        replans_used=replans_used,
     )
 
 
@@ -4258,6 +4515,22 @@ def run_qa_agent_for_plan(
 
     t0 = time.monotonic()
     speed_config = get_speed_config(speed)
+
+    # Phase A — read SoM toggle from app_settings. NULL/missing row
+    # (fresh DB, no settings yet) → default True so the SoM benefit
+    # is on out-of-the-box without forcing the user into Settings first.
+    som_enabled_default = True
+    try:
+        from app.models.app_settings import AppSettings  # noqa: PLC0415
+        _settings_row = db.query(AppSettings).filter(
+            AppSettings.id == 1,
+        ).first()
+        if _settings_row is not None:
+            som_enabled_default = bool(
+                getattr(_settings_row, "som_enabled_default", True),
+            )
+    except Exception:
+        pass
 
     plan = db.get(TestPlan, plan_id)
     if not plan:
@@ -4547,6 +4820,7 @@ def run_qa_agent_for_plan(
                     plan=plan,
                     open_typed_prompt=open_typed_prompt,
                     request_intervention=wait_for_intervention,
+                    som_enabled=som_enabled_default,
                 )
 
                 # α.5 — persist WorldState after every submodule so
@@ -4602,6 +4876,11 @@ def run_qa_agent_for_plan(
                     "llm_calls": result.llm_calls,
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
+                    # Phase A — VL-derived sub-goal timeline.
+                    "sub_goals": list(getattr(result, "sub_goals", []) or []),
+                    "replans_used": int(
+                        getattr(result, "replans_used", 0) or 0
+                    ),
                 })
                 counts[result.status] = counts.get(result.status, 0) + 1
                 db.commit()

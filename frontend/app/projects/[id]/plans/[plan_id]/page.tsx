@@ -66,6 +66,7 @@ export default function PlanEditorPage() {
   const [description, setDescription] = useState("");
   const [scope, setScope] = useState<string[]>([]);
   const [linkedDocIds, setLinkedDocIds] = useState<number[]>([]);
+  const [maxReplans, setMaxReplans] = useState<number>(2);
 
   // Hydrate when the plan loads (or after a fresh re-fetch)
   useEffect(() => {
@@ -76,6 +77,11 @@ export default function PlanEditorPage() {
     setDescription(plan.description ?? "");
     setScope(plan.scope);
     setLinkedDocIds(plan.linked_documents.map((d) => d.document_id));
+    setMaxReplans(
+      typeof plan.max_replans_per_submodule === "number"
+        ? plan.max_replans_per_submodule
+        : 2,
+    );
   }, [plan]);
 
   // ── Save mutation (basic fields + scope + linked docs together) ──
@@ -88,6 +94,7 @@ export default function PlanEditorPage() {
         description: description.trim(),
         scope,
         linked_document_ids: linkedDocIds,
+        max_replans_per_submodule: maxReplans,
       }),
     onSuccess: () => {
       toast.success("Plan saved");
@@ -276,6 +283,32 @@ export default function PlanEditorPage() {
               scope={scope}
               onChange={setScope}
             />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="plan-max-replans">
+              Max replans per submodule
+            </Label>
+            <Input
+              id="plan-max-replans"
+              type="number"
+              min={0}
+              max={5}
+              value={maxReplans}
+              onChange={(e) => {
+                const v = Number.parseInt(e.target.value, 10);
+                if (Number.isFinite(v)) {
+                  setMaxReplans(Math.max(0, Math.min(5, v)));
+                }
+              }}
+              className="max-w-[8rem]"
+            />
+            <p className="text-xs text-muted-foreground">
+              When a sub-goal stalls, the vision planner gets up to this
+              many attempts to re-decompose from the current screen
+              before HITL is offered. Default <strong>2</strong>; range
+              0–5. Set to 0 to disable replanning for this plan.
+            </p>
           </div>
 
           <div className="flex justify-end pt-2">

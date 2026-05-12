@@ -94,6 +94,13 @@ class PlanCreate(BaseModel):
     status: PlanStatus = "draft"
     linked_document_ids: list[int] = Field(default_factory=list)
     credentials: list[CredentialCreate] = Field(default_factory=list)
+    # Phase A — sub-goal replan budget per submodule. 0 disables
+    # replanning entirely (sub-goal fails immediately → HITL); 1–5
+    # caps how many times the VL can re-decompose after a sub-goal
+    # stalls. Default 2 catches the common "tried wrong button →
+    # vision says try this one" pattern without burning budget on
+    # dead-end submodules.
+    max_replans_per_submodule: int = Field(default=2, ge=0, le=5)
 
 
 class PlanUpdate(BaseModel):
@@ -105,6 +112,9 @@ class PlanUpdate(BaseModel):
     scope: list[str] | None = None
     status: PlanStatus | None = None
     linked_document_ids: list[int] | None = None
+    max_replans_per_submodule: int | None = Field(
+        default=None, ge=0, le=5,
+    )
 
 
 class PlanReadCompact(BaseModel):
@@ -134,6 +144,7 @@ class PlanReadDetail(BaseModel):
     status: PlanStatus
     credentials: list[CredentialRead]
     linked_documents: list[LinkedDocSummary]
+    max_replans_per_submodule: int = 2
     created_at: datetime
     updated_at: datetime
 

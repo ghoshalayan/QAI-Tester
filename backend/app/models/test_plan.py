@@ -70,6 +70,17 @@ class TestPlan(Base):
         String(16), nullable=False, default="draft",
     )
 
+    # Phase A — sub-goal replanning. Per-plan cap on how many times
+    # the agent can re-decompose after a sub-goal fails inside one
+    # submodule. 0 disables replanning (sub-goal fails immediately
+    # → HITL or test_case_disputed); the default 2 catches the
+    # common "tried wrong button → vision says try this one
+    # instead" pattern without burning budget on dead-end submodules.
+    # Range enforced by the API edit endpoint (0–5).
+    max_replans_per_submodule: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, server_default="2",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

@@ -626,6 +626,127 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+
+  // Phase A — vision-driven sub-goal decomposition events. The agent
+  // calls decompose_goal once per submodule (and once per replan)
+  // and the live feed shows what the VL planner came up with — gives
+  // the user a glimpse of the agent's mental model before any
+  // actions fire.
+  if (type === "sub_goals_decomposed") {
+    const count =
+      typeof data.count === "number" ? data.count : 0;
+    const replan = typeof data.replan_iteration === "number"
+      ? data.replan_iteration : 0;
+    const sgs = Array.isArray(data.sub_goals) ? data.sub_goals : [];
+    const preview = sgs
+      .slice(0, 3)
+      .map((sg: { description?: string }, i: number) =>
+        `${i + 1}. ${(sg.description ?? "").toString().slice(0, 80)}`,
+      )
+      .join("\n");
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label={
+          replan > 0
+            ? `sub-goals · replan ${replan} · ${count} new`
+            : `sub-goals · decomposed into ${count}`
+        }
+        title={preview}
+      />
+    );
+  }
+  if (type === "sub_goal_started") {
+    return (
+      <Row
+        icon={<CircleDashed className="size-3.5 text-purple-500" />}
+        label={`sub-goal start · ${data.id ?? "?"}`}
+        title={data.description as string | undefined}
+      />
+    );
+  }
+  if (type === "sub_goal_done") {
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`sub-goal done · ${data.id ?? "?"}`}
+        title={data.description as string | undefined}
+      />
+    );
+  }
+  if (type === "sub_goal_failed") {
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-red-500" />}
+        label={`sub-goal failed · ${data.id ?? "?"}`}
+        title={data.description as string | undefined}
+        sublabel={data.reason as string | undefined}
+      />
+    );
+  }
+  if (type === "sub_goal_skipped") {
+    return (
+      <Row
+        icon={<AlertTriangle className="size-3.5 text-amber-500" />}
+        label={`sub-goal skipped · ${data.id ?? "?"}`}
+        title={data.description as string | undefined}
+        sublabel={data.reason as string | undefined}
+      />
+    );
+  }
+  if (type === "sub_goal_replan_started") {
+    const iter = typeof data.iteration === "number" ? data.iteration : "?";
+    const max = typeof data.max_replans === "number" ? data.max_replans : "?";
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label={`replan ${iter}/${max}`}
+        title={
+          typeof data.after_sub_goal === "string"
+            ? `after sub-goal ${data.after_sub_goal} failed`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "hitl_overlay_opened") {
+    return (
+      <Row
+        icon={<AlertTriangle className="size-3.5 text-amber-500" />}
+        label="HITL overlay opened"
+        title={data.sub_goal as string | undefined}
+        sublabel="waiting for user guidance in the test browser"
+      />
+    );
+  }
+  if (type === "hitl_overlay_submitted") {
+    const status = (data.status as string | undefined) ?? "?";
+    const Icon =
+      status === "submitted"
+        ? CheckCircle2
+        : status === "idle_timeout"
+          ? AlertTriangle
+          : Circle;
+    const colorClass =
+      status === "submitted"
+        ? "text-emerald-500"
+        : status === "idle_timeout"
+          ? "text-amber-500"
+          : "text-muted-foreground";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={`HITL overlay · ${status}`}
+        title={
+          status === "submitted"
+            ? (data.text_preview as string | undefined)
+            : status === "idle_timeout"
+              ? "no response within 15s — auto-skipped"
+              : "user skipped"
+        }
+      />
+    );
+  }
   if (type === "coordinate_click_proposed") {
     const conf =
       typeof data.confidence === "number" ? data.confidence : 0;

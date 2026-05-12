@@ -158,6 +158,9 @@ def _to_plan_detail(
         status=plan.status,  # type: ignore[arg-type]
         credentials=[_to_credential_read(c) for c in plan.credentials],
         linked_documents=linked,
+        max_replans_per_submodule=int(
+            getattr(plan, "max_replans_per_submodule", 2),
+        ),
         created_at=plan.created_at,
         updated_at=plan.updated_at,
     )
@@ -281,6 +284,9 @@ def create_plan(
         description=payload.description,
         scope=list(payload.scope or []),
         status=payload.status,
+        max_replans_per_submodule=int(
+            payload.max_replans_per_submodule,
+        ),
     )
     db.add(plan)
     db.flush()  # populate plan.id
@@ -364,6 +370,10 @@ def update_plan(
         plan.scope = list(payload.scope)
     if payload.status is not None:
         plan.status = payload.status
+    if payload.max_replans_per_submodule is not None:
+        plan.max_replans_per_submodule = int(
+            payload.max_replans_per_submodule,
+        )
 
     docs_changed = payload.linked_document_ids is not None
     if docs_changed:

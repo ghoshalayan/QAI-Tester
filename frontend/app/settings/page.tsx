@@ -158,6 +158,25 @@ export default function SettingsPage() {
     },
   });
 
+  // Phase A — Set-of-Mark default toggle. Same backend treatment as
+  // AI Mode (flippable without re-supplying credentials).
+  const somToggleMutation = useMutation({
+    mutationFn: (next: boolean) =>
+      api.upsertSettings({ som_enabled_default: next }),
+    onSuccess: (resp) => {
+      toast.success(
+        resp.som_enabled_default
+          ? "Set-of-Mark annotation enabled"
+          : "Set-of-Mark annotation disabled",
+      );
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Couldn't update SoM setting", { description: msg });
+    },
+  });
+
   const canTest =
     !!model.trim() && (apiKey.trim() || apiKeyOnFile) && (!isCompat || baseUrl.trim());
   const canSave = canTest;
@@ -469,6 +488,90 @@ export default function SettingsPage() {
               {!settings?.is_configured && (
                 <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                   Configure an LLM provider above before enabling AI Mode.
+                </p>
+              )}
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ── Set-of-Mark annotation (Phase A) ───────────────────────── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Sparkles
+              className={cn(
+                "size-5",
+                settings?.som_enabled_default
+                  ? "text-primary"
+                  : "text-muted-foreground",
+              )}
+            />
+            Set-of-Mark annotation
+          </CardTitle>
+          <CardDescription>
+            When enabled (default), screenshots sent to vision-LLM
+            helpers (smart-pick, on-track, goal-verify, vision-search,
+            semantic-verify) get colored bounding boxes and numbered
+            labels drawn on interactive elements before upload. The
+            model can then refer to <em>&quot;box 5&quot;</em> instead
+            of inventing pixel coordinates — published benchmarks show
+            ~10–15% targeting accuracy improvement. Disable to send
+            raw screenshots (legacy behavior).
+          </CardDescription>
+        </CardHeader>
+
+        <CardContent>
+          <div className="flex items-start gap-3 rounded-md border p-3">
+            <button
+              type="button"
+              onClick={() =>
+                somToggleMutation.mutate(!settings?.som_enabled_default)
+              }
+              disabled={
+                somToggleMutation.isPending || !settings?.is_configured
+              }
+              className={cn(
+                "mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                settings?.som_enabled_default
+                  ? "border-primary/50 bg-primary"
+                  : "border-input bg-muted",
+                "disabled:cursor-not-allowed disabled:opacity-50",
+              )}
+              role="switch"
+              aria-checked={!!settings?.som_enabled_default}
+              aria-label="Toggle Set-of-Mark annotation"
+              title={
+                !settings?.is_configured
+                  ? "Configure an LLM provider first"
+                  : settings?.som_enabled_default
+                    ? "Disable SoM annotation"
+                    : "Enable SoM annotation"
+              }
+            >
+              <span
+                className={cn(
+                  "inline-block size-5 transform rounded-full bg-white shadow transition-transform",
+                  settings?.som_enabled_default
+                    ? "translate-x-5"
+                    : "translate-x-0.5",
+                )}
+              />
+            </button>
+            <div className="min-w-0 flex-1 text-sm">
+              <p className="font-medium">
+                {settings?.som_enabled_default
+                  ? "Set-of-Mark is on"
+                  : "Set-of-Mark is off"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {settings?.som_enabled_default
+                  ? "VL screenshots include colored bounding boxes + numbered labels."
+                  : "VL screenshots are sent raw — no annotation overlay."}
+              </p>
+              {!settings?.is_configured && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  Configure an LLM provider above before changing this.
                 </p>
               )}
             </div>

@@ -28,6 +28,10 @@ class AppSettingsRead(BaseModel):
     # pass-rate distribution. Real data is untouched. User-facing
     # label everywhere is "AI Mode".
     ai_mode: bool = False
+    # Phase A — Set-of-Mark annotation default for VL screenshots.
+    # When True (default), screenshots get colored bounding boxes +
+    # numbered labels drawn before being sent to the VL.
+    som_enabled_default: bool = True
     # Cost tracking — USD per million tokens. NULL = "not configured"
     # (the cost surface renders ``$—`` for that tier/direction).
     strong_input_price_per_m: float | None = None
@@ -54,6 +58,7 @@ class AppSettingsWrite(BaseModel):
     api_key: str | None = Field(default=None, max_length=512)
     base_url: str | None = Field(default=None, max_length=512)
     ai_mode: bool | None = None
+    som_enabled_default: bool | None = None
     # Cost tracking — USD per million tokens. Float >= 0 (negative
     # rejected by Field constraint). ``None`` means "don't update";
     # send ``0`` to clear a previously-set rate, or any positive

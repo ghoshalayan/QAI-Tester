@@ -894,38 +894,57 @@ function SubGoalChecklist({
         </span>
       </div>
       <ol className="space-y-0.5">
-        {subGoals.map((sg) => (
-          <li
-            key={sg.id}
-            className="flex items-baseline gap-1.5 text-[11px]"
-          >
-            <span
-              className={cn(
-                "shrink-0 font-mono",
-                SUB_GOAL_STATUS_TINT[sg.status] ?? "text-muted-foreground",
-              )}
+        {subGoals.map((sg) => {
+          const replanBadge =
+            typeof sg.replan_iteration === "number" &&
+            sg.replan_iteration > 0;
+          return (
+            <li
+              key={sg.id}
+              className="text-[11px]"
             >
-              {SUB_GOAL_STATUS_GLYPH[sg.status] ?? "?"}
-            </span>
-            <span className="font-mono text-[9px] text-muted-foreground">
-              [{sg.id}]
-            </span>
-            <span
-              className={cn(
-                "min-w-0 flex-1 break-words",
-                sg.status === "done" &&
-                  "text-muted-foreground line-through decoration-emerald-500/60",
+              <div className="flex items-baseline gap-1.5">
+                <span
+                  className={cn(
+                    "shrink-0 font-mono",
+                    SUB_GOAL_STATUS_TINT[sg.status] ??
+                      "text-muted-foreground",
+                  )}
+                >
+                  {SUB_GOAL_STATUS_GLYPH[sg.status] ?? "?"}
+                </span>
+                <span className="font-mono text-[9px] text-muted-foreground">
+                  [{sg.id}]
+                </span>
+                {replanBadge && (
+                  <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] font-medium text-amber-700 dark:text-amber-400">
+                    replan {sg.replan_iteration}
+                  </span>
+                )}
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 break-words",
+                    sg.status === "done" &&
+                      "text-muted-foreground line-through decoration-emerald-500/60",
+                  )}
+                >
+                  {sg.description}
+                </span>
+                {sg.completed_at_turn !== null && (
+                  <span className="shrink-0 text-[9px] text-muted-foreground">
+                    T{sg.completed_at_turn}
+                  </span>
+                )}
+              </div>
+              {sg.reason && (sg.status === "failed" || sg.status === "skipped") && (
+                <p className="ml-5 mt-0.5 text-[10px] italic text-muted-foreground">
+                  {sg.status === "failed" ? "failed: " : "skipped: "}
+                  {sg.reason}
+                </p>
               )}
-            >
-              {sg.description}
-            </span>
-            {sg.completed_at_turn !== null && (
-              <span className="shrink-0 text-[9px] text-muted-foreground">
-                T{sg.completed_at_turn}
-              </span>
-            )}
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ol>
     </div>
   );

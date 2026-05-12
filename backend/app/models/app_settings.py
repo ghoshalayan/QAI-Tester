@@ -93,6 +93,20 @@ class AppSettings(Base):
         Boolean, default=False, nullable=False, server_default="0",
     )
 
+    # Phase A — Set-of-Mark (SoM) annotation for VL screenshots.
+    # When True (default), screenshots attached to vision-on-failure,
+    # smart-pick, on-track, and goal-verify calls get colored
+    # bounding boxes + numbered labels drawn over interactive
+    # elements before being sent to the model. The VL then refers
+    # to "box 5" instead of inventing pixel coordinates — published
+    # benchmarks show ~10-15% targeting accuracy improvement.
+    # Cost: zero LLM cost (Pillow draw); +small latency per
+    # screenshot. Toggle off for cost-conscious runs or when the
+    # provider's VL handles raw screenshots well (Gemini 2.5).
+    som_enabled_default: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, server_default="1",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

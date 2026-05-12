@@ -31,6 +31,9 @@ def _to_read(row: AppSettings | None) -> AppSettingsRead:
         base_url=row.base_url,
         api_key_set=bool(row.api_key),
         ai_mode=bool(getattr(row, "ai_mode", False)),
+        som_enabled_default=bool(
+            getattr(row, "som_enabled_default", True),
+        ),
         strong_input_price_per_m=getattr(
             row, "strong_input_price_per_m", None,
         ),
@@ -93,6 +96,25 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
         and payload.cheap_output_price_per_m is None
         and payload.strong_cached_input_price_per_m is None
         and payload.cheap_cached_input_price_per_m is None
+        and payload.som_enabled_default is None
+    )
+    # Phase A — SoM toggle behaves like AI-Mode: flippable without
+    # re-supplying credentials (the toggle lives next to AI Mode in
+    # the Settings UI).
+    only_som_toggle = (
+        payload.som_enabled_default is not None
+        and payload.ai_mode is None
+        and payload.provider is None
+        and payload.model is None
+        and payload.cheap_model is None
+        and payload.api_key is None
+        and payload.base_url is None
+        and payload.strong_input_price_per_m is None
+        and payload.strong_output_price_per_m is None
+        and payload.cheap_input_price_per_m is None
+        and payload.cheap_output_price_per_m is None
+        and payload.strong_cached_input_price_per_m is None
+        and payload.cheap_cached_input_price_per_m is None
     )
     # Cost-only update: setting pricing without touching provider /
     # model / api_key — the Settings UI's "Cost Settings" tab uses
@@ -120,6 +142,11 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
                 400,
                 "Configure an LLM provider before enabling AI Mode.",
             )
+        if only_som_toggle:
+            raise HTTPException(
+                400,
+                "Configure an LLM provider before changing SoM annotation.",
+            )
         _validate_for_create(payload)
         # Phase 1 — cheap_model: must NOT equal model (would be a no-op
         # tier and adds DB ambiguity). Empty string = no tiering.
@@ -138,10 +165,16 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
             api_key=payload.api_key,
             base_url=payload.base_url if payload.provider == "openai_compat" else None,
             ai_mode=bool(payload.ai_mode) if payload.ai_mode is not None else False,
+            som_enabled_default=(
+                bool(payload.som_enabled_default)
+                if payload.som_enabled_default is not None else True
+            ),
         )
         db.add(row)
     elif only_ai_mode_toggle:
         row.ai_mode = bool(payload.ai_mode)
+    elif only_som_toggle:
+        row.som_enabled_default = bool(payload.som_enabled_default)
     elif only_pricing_update:
         # Cost-only flip — accept the rate fields without requiring
         # api_key / model re-entry. 0.0 explicitly clears a
@@ -215,6 +248,8 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
         row.base_url = new_base_url
         if payload.ai_mode is not None:
             row.ai_mode = bool(payload.ai_mode)
+        if payload.som_enabled_default is not None:
+            row.som_enabled_default = bool(payload.som_enabled_default)
         # Cost rates — same "None = preserve, 0 = clear" semantics as
         # the pricing-only branch above.
         if payload.strong_input_price_per_m is not None:
