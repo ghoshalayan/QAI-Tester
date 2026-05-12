@@ -374,19 +374,31 @@ export function RunProgressCard({
         )}
 
       {/* Completion summary */}
-      {run.status === "completed" && (
-        <div
-          className={cn(
-            "mt-3 rounded-md p-3 text-xs",
-            isExecute && (exFailed ?? 0) > 0
+      {run.status === "completed" && (() => {
+        // Tint by pass rate, not by "any failure present". A run where
+        // 6/7 cases passed is mostly-good — the user's mental model is
+        // "more than half worked" → green, "most broke" → red. The
+        // exact failure count still shows in the body; the chip color
+        // is just a glance signal.
+        const tot = exTotalSteps ?? 0;
+        const passPctCard = tot > 0
+          ? ((exPassed ?? 0) / tot) * 100
+          : 0;
+        const tintClass = !isExecute
+          // Non-execute runs (FRD-gen, TC-gen, recon) — always green
+          // when completed; they don't have pass/fail semantics.
+          ? "bg-green-500/5 text-green-700 dark:text-green-400"
+          : passPctCard >= 50
+            ? "bg-green-500/5 text-green-700 dark:text-green-400"
+            : (exFailed ?? 0) > 0
               ? "bg-red-500/5 text-red-700 dark:text-red-400"
-              // Inconclusive (but no real failures) → orange/amber tint;
-              // these are usually test-case wording problems, not bugs.
-              : isExecute && (exInconclusive ?? 0) > 0
+              // Inconclusive without failures (mostly test-case wording
+              // problems, not real bugs) — orange/amber tint.
+              : (exInconclusive ?? 0) > 0
                 ? "bg-orange-500/5 text-orange-700 dark:text-orange-400"
-                : "bg-green-500/5 text-green-700 dark:text-green-400",
-          )}
-        >
+                : "bg-green-500/5 text-green-700 dark:text-green-400";
+        return (
+        <div className={cn("mt-3 rounded-md p-3 text-xs", tintClass)}>
           {isExecute ? (
             <>
               {(exFailed ?? 0) === 0 &&
@@ -483,7 +495,8 @@ export function RunProgressCard({
             </>
           )}
         </div>
-      )}
+        );
+      })()}
 
       {/* Error / cancel summary */}
       {(run.status === "failed" || run.status === "cancelled") &&
