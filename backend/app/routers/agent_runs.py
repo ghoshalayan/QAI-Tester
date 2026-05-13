@@ -478,18 +478,68 @@ async def stream_run_events(
 
 @router.post("/{run_id}/cancel", response_model=AgentRunRead)
 def cancel_run(
-    project_id: int, run_id: int, db: Session = Depends(get_db),
+    project_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+    force: bool = False,
 ):
-    """Mark a run for cancellation. Idempotent on terminal runs."""
+    """Mark a run for cancellation. Idempotent on terminal runs.
+
+    ``force=False`` (default): cooperative cancel. Sets the flag; the
+    runner thread polls at safe checkpoints and exits cleanly. If the
+    thread is stuck inside an LLM call / browser wait / HITL block,
+    it can take a while for the cancel to materialise.
+
+    ``force=true``: STRICT STOP (Phase K.1). Writes
+    ``status='cancelled'`` to the DB immediately and emits the
+    cancelled event so the UI moves on. The orphan Python thread
+    may keep running for a beat (Python can't kill OS threads
+    safely) but the row is terminal from this instant — any DB
+    writes it attempts later target a terminal row and are no-ops.
+    """
     run = _require_run(db, project_id, run_id)
 
     if run.status in ("completed", "failed", "cancelled"):
         return run  # already terminal — no-op
 
+    if force:
+        from app.services.agent_run_service import force_cancel  # noqa: PLC0415
+
+        force_cancel(run.id, reason="user-requested strict stop")
+        db.refresh(run)
+        logger.warning(
+            "Run %s force-cancelled by user (was %s)",
+            run.id, run.status,
+        )
+        return run
+
     request_cancel(run.id)
     logger.info("Cancel requested for run %s (current status=%s)",
                 run.id, run.status)
     return run
+
+
+@router.post("/reap-orphans")
+def reap_orphans(
+    project_id: int,
+    stale_after_seconds: int = 60,
+    db: Session = Depends(get_db),  # noqa: ARG001 — kept for dep parity
+):
+    """Phase K.2 — manual orphan reaper trigger.
+
+    Finds runs stuck in (queued / running / paused) with no
+    completed_at older than ``stale_after_seconds`` and marks them
+    cancelled. Returns the list of reaped IDs.
+
+    Also runs automatically at FastAPI startup; this endpoint is the
+    operator's manual escape hatch when a run is hung but the server
+    hasn't restarted.
+    """
+    from app.services.agent_run_service import reap_orphaned_runs  # noqa: PLC0415
+
+    return reap_orphaned_runs(
+        stale_after_seconds=max(0, int(stale_after_seconds)),
+    )
 
 
 @router.delete(

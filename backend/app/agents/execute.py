@@ -55,6 +55,7 @@ from app.executor import (
     BrowserNotInstalledError,
     browser_session,
     execute_action,
+    SpeedConfig,
     get_speed_config,
     hide_narration,
     install_overlay,
@@ -319,12 +320,45 @@ def _execute_with_retry(
 
 def _take_screenshot(
     page, run_id: int, step_id: int,
+    *,
+    speed_config: SpeedConfig | None = None,
+    post_settle_ms: int = 800,
 ) -> str | None:
     """Capture a PNG; return the path relative to ``screenshots_dir``.
+
+    Phase L — settle-before-capture. Before firing the screenshot, wait
+    for the page to actually settle into its post-action state:
+
+      1. ``wait_for_load_state("domcontentloaded")``
+      2. ``wait_for_load_state("networkidle")``
+      3. an extra ``post_settle_ms`` for transition animations / toasts
+         / drawer-close transitions to render
+
+    Without this, the screenshot captures whatever the page looked like
+    at the EXACT instant the submodule's agent loop returned — which on
+    a slow tunnel can be mid-navigation. The previous submodule's drawer
+    is still visible; the new submodule's screen hasn't rendered. The
+    bug surfaces as "step_NNN.png" showing content that belongs to
+    submodule N-1.
 
     Returns None if the browser refused (e.g., target_closed after navigate
     error). We never let a screenshot failure cascade — it's diagnostic.
     """
+    # Settle pass — best-effort. Failures here just mean we capture
+    # earlier than ideal; we still get *a* screenshot.
+    if speed_config is not None:
+        try:
+            wait_for_settled(page, speed_config)
+        except Exception as e:
+            logger.debug(
+                "settle-before-screenshot non-fatal: %s", e,
+            )
+    if post_settle_ms > 0:
+        try:
+            page.wait_for_timeout(post_settle_ms)
+        except Exception:
+            pass
+
     rel_path = f"{run_id}/step_{step_id}.png"
     abs_path = settings.screenshots_dir / rel_path
     abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +370,48 @@ def _take_screenshot(
             "screenshot failed for run %s step %s: %s", run_id, step_id, e,
         )
         return None
+
+
+def _capture_screenshot_meta(page) -> dict[str, Any]:
+    """Phase L — snapshot URL + title + drawer-open flag at the moment
+    of evidence capture. Stamped onto ``execution_step.details_json``
+    so the report can detect "screenshot belongs to an earlier
+    submodule" by comparing URLs against the submodule's expected
+    destination.
+
+    All fields are best-effort; failures yield empty strings rather
+    than blocking the row write.
+    """
+    out: dict[str, Any] = {
+        "url": "",
+        "title": "",
+        "drawer_open": False,
+    }
+    try:
+        out["url"] = (page.url or "")[:500]
+    except Exception:
+        pass
+    try:
+        out["title"] = (page.title() or "")[:200]
+    except Exception:
+        pass
+    try:
+        # Reuse the same drawer-detection convention used by form_fill
+        # / scout — any visible <role=dialog> / Drawer / Modal class.
+        drawer_check_js = (
+            "(() => {const s=['[role=dialog]','[role=alertdialog]',"
+            "'.MuiDialog-paper','.MuiDrawer-paper','[class*=\"Drawer\"]',"
+            "'[class*=\"drawer\"]','[class*=\"Modal\"]','[class*=\"modal\"]']"
+            ".join(',');return [...document.querySelectorAll(s)]"
+            ".some(el => {const r=el.getBoundingClientRect();"
+            "if(r.width<100||r.height<100)return false;"
+            "const cs=getComputedStyle(el);"
+            "return cs.display!=='none'&&cs.visibility!=='hidden';});})()"
+        )
+        out["drawer_open"] = bool(page.evaluate(drawer_check_js))
+    except Exception:
+        pass
+    return out
 
 
 # ── AI improvisation (pre-execution) ──────────────────────────────
@@ -665,11 +741,18 @@ def execute_plan(
     headless: bool = False,
     speed: str | None = None,
     provider: LLMProvider | None = None,
+    cheap_provider: LLMProvider | None = None,
     ai_assist: bool = True,
     auto_adjust: bool = False,
     promote_fixes: bool = False,
     window_position: tuple[int, int] | None = None,
     window_size: tuple[int, int] | None = None,
+    # Phase H — preflight (Scout → Refine → Activate) before execution.
+    # "auto"  : run preflight when needed (no AppMap OR active version
+    #           isn't 'app_map_refined'); short-circuit otherwise.
+    # "force" : always run preflight (re-scout + re-refine).
+    # "skip"  : never run preflight (legacy / debugging path).
+    preflight: str = "auto",
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     is_paused: Callable[[], bool] | None = None,
@@ -727,6 +810,51 @@ def execute_plan(
         raise ValueError(f"Plan {plan_id} has no target_url — cannot navigate")
 
     project_id = plan.project_id
+
+    # Phase H — preflight pass (Scout → Refine → Activate). Runs BEFORE
+    # we load the TC tree so the live nodes we read below reflect the
+    # refined plan, not the BRD-derived baseline. Short-circuits when
+    # the plan is already pinned to an ``app_map_refined`` version and
+    # the AppMap is still present.
+    if preflight != "skip" and provider is not None:
+        from app.services.preflight import run_preflight  # noqa: PLC0415
+
+        _emit(emit_event, "phase", {
+            "phase": "preflight",
+            "message": (
+                "Validating test cases against the actual UI before "
+                "execution (scout + refine)"
+            ),
+        })
+        try:
+            pf = run_preflight(
+                db,
+                plan_id=plan_id,
+                provider=provider,
+                cheap_provider=cheap_provider,
+                force=(preflight == "force"),
+                headless=True,
+                emit_event=emit_event,
+                is_cancelled=is_cancelled,
+            )
+            if pf.status == "failed":
+                logger.warning(
+                    "preflight failed for plan %s: %s — proceeding "
+                    "with current TC tree as-is",
+                    plan_id, pf.error_message,
+                )
+        except Exception as e:
+            # Preflight is a quality boost, not a hard prerequisite.
+            # On exception, log and fall through to the legacy path
+            # so a broken refiner doesn't block an execute call.
+            logger.exception(
+                "preflight raised; continuing with live TC tree",
+            )
+            _emit(emit_event, "preflight_failed", {
+                "plan_id": plan_id,
+                "stage": "outer",
+                "error": str(e)[:200],
+            })
 
     _emit(emit_event, "phase", {
         "phase": "loading_steps",
@@ -1234,7 +1362,16 @@ def execute_plan(
                     phase=_PHASE_BY_STATUS.get(result_status, "did"),
                 )
 
-                screenshot_path = _take_screenshot(page, run_id, row.id)
+                # Phase L — settle-before-capture so the screenshot
+                # reflects the post-action state, not a mid-navigation
+                # frame. Slow tunnels (Cloudflare-tunnelled admin SPAs)
+                # used to capture the previous step's screen here.
+                screenshot_path = _take_screenshot(
+                    page, run_id, row.id,
+                    speed_config=speed_config,
+                    post_settle_ms=1200,
+                )
+                screenshot_meta = _capture_screenshot_meta(page)
 
                 row.status = result_status
                 row.completed_at = _utcnow()
@@ -1242,6 +1379,8 @@ def execute_plan(
                 row.narration = narration
                 row.error_message = error_msg
                 row.screenshot_path = screenshot_path
+                if isinstance(details, dict):
+                    details = {**details, "screenshot_meta": screenshot_meta}
                 row.details_json = details
                 counts[result_status] = counts.get(result_status, 0) + 1
                 db.commit()

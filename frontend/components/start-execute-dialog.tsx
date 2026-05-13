@@ -82,15 +82,26 @@ export function StartExecuteDialog({
   const [speed, setSpeed] = useState<Speed>("slow");
   const [autoAdjust, setAutoAdjust] = useState(false);
   const [promoteFixes, setPromoteFixes] = useState(false);
+  // Phase M — default to agentic + vision_only. The "Start" button
+  // works with just a plan picked; everything else lives behind an
+  // Advanced disclosure (closed by default) for power-user overrides.
   const [mode, setMode] = useState<"scripted" | "agentic" | "replay">(
-    "scripted",
+    "agentic",
   );
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   // Phase 6 — within agentic mode, choose hybrid (DOM-first ladder)
   // or vision_only (VL+coords for every click/type, computer-use
   // pattern). hybrid is faster + cheaper on most apps; vision_only
   // works on apps DOM resolution can't reach.
   const [agentStrategy, setAgentStrategy] = useState<"hybrid" | "vision_only">(
     "hybrid",
+  );
+  // Phase H — preflight selector. "auto" runs Scout + refine before
+  // the first submodule if the plan isn't already pinned to an
+  // app_map_refined version. "force" re-scouts + re-refines from
+  // scratch. "skip" disables preflight entirely (debugging only).
+  const [preflight, setPreflight] = useState<"auto" | "force" | "skip">(
+    "auto",
   );
 
   useEffect(() => {
@@ -100,8 +111,13 @@ export function StartExecuteDialog({
       setSpeed("slow");
       setAutoAdjust(false);
       setPromoteFixes(false);
-      setMode("scripted");
-      setAgentStrategy("hybrid");
+      // Phase M — sensible defaults match the recommended path:
+      // agentic + vision_only + preflight=auto. Power users open the
+      // "Advanced options" disclosure to override.
+      setMode("agentic");
+      setAgentStrategy("vision_only");
+      setPreflight("auto");
+      setAdvancedOpen(false);
     }
   }, [open, defaultPlanId]);
 
@@ -140,6 +156,7 @@ export function StartExecuteDialog({
         speed,
         mode,
         agent_strategy: agentStrategy,
+        preflight,
         auto_adjust: autoAdjust,
         promote_fixes: promoteFixes,
         window_x: browserGeom?.x,
@@ -256,99 +273,130 @@ export function StartExecuteDialog({
               <PlanSummary plan={selectedPlan} />
             )}
 
-            {/* Mode picker — "agentic" uses the goal-oriented QA loop
-                that reasons about the page each turn; "scripted" is the
-                rigid step-walker. Agentic is much smarter on flaky or
-                evolving pages but burns ~10× more LLM tokens. */}
-            <ModePicker value={mode} onChange={setMode} />
-
-            {/* Phase 6 — Agentic strategy sub-toggle. Visible only when
-                Agentic mode is selected. */}
-            {mode === "agentic" && (
-              <AgentStrategyPicker
-                value={agentStrategy}
-                onChange={setAgentStrategy}
-              />
-            )}
-
-            {/* Speed knob — slow is the default for heavy-data sites where
-                an over-eager click on a skeleton row beats the actual data.
-                Keep this prominent so it isn't accidentally skipped. */}
-            <SpeedPicker value={speed} onChange={setSpeed} />
-
-            <div className="flex items-start gap-3 rounded-md border p-3">
-              <button
-                type="button"
-                onClick={() => setHeadless(!headless)}
-                className={cn(
-                  "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-md border transition-colors",
-                  headless
-                    ? "border-input bg-muted text-muted-foreground"
-                    : "border-primary/40 bg-primary/10 text-primary",
-                )}
-                aria-pressed={!headless}
-                aria-label={
-                  headless
-                    ? "Switch to visible browser"
-                    : "Switch to headless browser"
-                }
-                title={
-                  headless
-                    ? "Headless: faster, no window"
-                    : "Headed: you can see the browser"
-                }
-              >
-                {headless ? (
-                  <EyeOff className="size-4" />
-                ) : (
-                  <Eye className="size-4" />
-                )}
-              </button>
-              <div className="min-w-0 flex-1 text-sm">
-                <p className="font-medium">
-                  {headless ? "Headless" : "Headed"} Chromium
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {headless
-                    ? "Faster, no visible window. Switch to headed if a step blocks for HITL (week 6)."
-                    : "A visible Chrome window opens; you can watch the run. Recommended for debugging."}
-                </p>
-              </div>
+            {/* Phase M — default-run summary. The recommended path is
+                agentic + vision-only + preflight=auto, set as the
+                defaults. The full pickers live under Advanced. */}
+            <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+              <p className="font-medium text-foreground">
+                Default: agentic · vision-only · auto preflight · slow
+              </p>
+              <p>
+                Just click <span className="font-medium">Start run</span>.
+                Open <span className="font-medium">Advanced options</span> below
+                only if you need to deviate.
+              </p>
             </div>
 
-            <ToggleRow
-              icon={Sparkles}
-              active={autoAdjust}
-              activeTone="amber"
-              onToggle={() => setAutoAdjust(!autoAdjust)}
-              ariaLabel={autoAdjust ? "Disable auto-adjust" : "Enable auto-adjust"}
-              title={autoAdjust ? "Auto-adjust on" : "Auto-adjust off"}
-              hint={
-                autoAdjust
-                  ? "AI fixes silently when it can. HITL only fires if both text and vision passes still fail. Faster, but skips your review."
-                  : "AI suggestions are proposed only — the HITL modal pre-fills with the suggestion and you approve / edit / reject. Recommended."
+            {/* Phase M — Advanced options accordion. Collapsed by
+                default; all the legacy pickers live here. */}
+            <details
+              open={advancedOpen}
+              onToggle={(e) =>
+                setAdvancedOpen((e.target as HTMLDetailsElement).open)
               }
-            />
+              className="rounded-md border"
+            >
+              <summary className="cursor-pointer select-none px-3 py-2 text-sm font-medium">
+                Advanced options
+              </summary>
+              <div className="space-y-4 border-t p-3">
+                <ModePicker value={mode} onChange={setMode} />
 
-            <ToggleRow
-              icon={GitCommit}
-              active={promoteFixes}
-              activeTone="emerald"
-              onToggle={() => setPromoteFixes(!promoteFixes)}
-              ariaLabel={
-                promoteFixes
-                  ? "Disable promote fixes"
-                  : "Enable promote fixes"
-              }
-              title={
-                promoteFixes ? "Promote fixes to test case" : "Don't promote fixes"
-              }
-              hint={
-                promoteFixes
-                  ? "When a fix produces a passing step (AI auto or HITL override), patch the source test case so the next run starts with it."
-                  : "Fixes apply only to this run. The source test case is left as-is."
-              }
-            />
+                {mode === "agentic" && (
+                  <AgentStrategyPicker
+                    value={agentStrategy}
+                    onChange={setAgentStrategy}
+                  />
+                )}
+
+                {mode === "agentic" && (
+                  <PreflightPicker
+                    value={preflight}
+                    onChange={setPreflight}
+                  />
+                )}
+
+                <SpeedPicker value={speed} onChange={setSpeed} />
+
+                <div className="flex items-start gap-3 rounded-md border p-3">
+                  <button
+                    type="button"
+                    onClick={() => setHeadless(!headless)}
+                    className={cn(
+                      "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-md border transition-colors",
+                      headless
+                        ? "border-input bg-muted text-muted-foreground"
+                        : "border-primary/40 bg-primary/10 text-primary",
+                    )}
+                    aria-pressed={!headless}
+                    aria-label={
+                      headless
+                        ? "Switch to visible browser"
+                        : "Switch to headless browser"
+                    }
+                    title={
+                      headless
+                        ? "Headless: faster, no window"
+                        : "Headed: you can see the browser"
+                    }
+                  >
+                    {headless ? (
+                      <EyeOff className="size-4" />
+                    ) : (
+                      <Eye className="size-4" />
+                    )}
+                  </button>
+                  <div className="min-w-0 flex-1 text-sm">
+                    <p className="font-medium">
+                      {headless ? "Headless" : "Headed"} Chromium
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {headless
+                        ? "Faster, no visible window. Switch to headed if a step blocks for HITL."
+                        : "A visible Chrome window opens; you can watch the run. Recommended."}
+                    </p>
+                  </div>
+                </div>
+
+                <ToggleRow
+                  icon={Sparkles}
+                  active={autoAdjust}
+                  activeTone="amber"
+                  onToggle={() => setAutoAdjust(!autoAdjust)}
+                  ariaLabel={
+                    autoAdjust ? "Disable auto-adjust" : "Enable auto-adjust"
+                  }
+                  title={autoAdjust ? "Auto-adjust on" : "Auto-adjust off"}
+                  hint={
+                    autoAdjust
+                      ? "AI fixes silently when it can. HITL only fires if both text and vision passes still fail."
+                      : "AI suggestions are proposed only — the HITL modal pre-fills with the suggestion and you approve / edit / reject. Recommended."
+                  }
+                />
+
+                <ToggleRow
+                  icon={GitCommit}
+                  active={promoteFixes}
+                  activeTone="emerald"
+                  onToggle={() => setPromoteFixes(!promoteFixes)}
+                  ariaLabel={
+                    promoteFixes
+                      ? "Disable promote fixes"
+                      : "Enable promote fixes"
+                  }
+                  title={
+                    promoteFixes
+                      ? "Promote fixes to test case"
+                      : "Don't promote fixes"
+                  }
+                  hint={
+                    promoteFixes
+                      ? "When a fix produces a passing step (AI auto or HITL override), patch the source test case so the next run starts with it."
+                      : "Fixes apply only to this run. The source test case is left as-is."
+                  }
+                />
+              </div>
+            </details>
           </div>
         )}
 
@@ -553,6 +601,71 @@ function AgentStrategyPicker({
             sealed-shadow-DOM apps.
           </span>
         </button>
+      </div>
+    </div>
+  );
+}
+
+
+function PreflightPicker({
+  value,
+  onChange,
+}: {
+  value: "auto" | "force" | "skip";
+  onChange: (next: "auto" | "force" | "skip") => void;
+}) {
+  const options: Array<{
+    key: "auto" | "force" | "skip";
+    label: string;
+    blurb: string;
+  }> = [
+    {
+      key: "auto",
+      label: "Auto",
+      blurb:
+        "Scout + refine the plan against the actual UI on first run; reuse cached refinement on subsequent runs.",
+    },
+    {
+      key: "force",
+      label: "Force re-scout",
+      blurb:
+        "Re-scout the app and re-refine the test cases from scratch. Use after UI changes or BRD edits.",
+    },
+    {
+      key: "skip",
+      label: "Skip",
+      blurb:
+        "Run with the live test-case tree as-is. Faster but the agent may misclick on labels that don't match the UI.",
+    },
+  ];
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">
+        Preflight (validate test cases against UI)
+      </label>
+      <div className="grid grid-cols-3 gap-2">
+        {options.map((opt) => (
+          <button
+            key={opt.key}
+            type="button"
+            onClick={() => onChange(opt.key)}
+            aria-pressed={value === opt.key}
+            className={cn(
+              "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+              value === opt.key
+                ? "border-primary/50 bg-primary/10 text-primary"
+                : "hover:border-input hover:bg-muted/50",
+            )}
+          >
+            <span className="flex items-center gap-1.5 text-sm font-medium">
+              <Sparkles className="size-4" />
+              {opt.label}
+            </span>
+            <span className="text-[11px] text-muted-foreground">
+              {opt.blurb}
+            </span>
+          </button>
+        ))}
       </div>
     </div>
   );

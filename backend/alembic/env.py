@@ -31,7 +31,9 @@ from app.models import (  # noqa: E402
     llm_call_log,
     project,
     requirement,
+    sub_flow_module,
     tc_node,
+    tc_version,
     test_plan,
 )
 
@@ -44,7 +46,9 @@ _REGISTERED_MODELS = (
     llm_call_log,
     project,
     requirement,
+    sub_flow_module,
     tc_node,
+    tc_version,
     test_plan,
 )
 

@@ -5,7 +5,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-AgentKind = Literal["brd_to_frd", "frd_to_tc", "execute", "reporter"]
+AgentKind = Literal[
+    "brd_to_frd", "frd_to_tc", "execute", "reporter", "recon",
+]
 AgentStatus = Literal[
     "queued", "running", "paused", "completed", "failed", "cancelled",
 ]

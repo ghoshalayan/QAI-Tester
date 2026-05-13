@@ -898,6 +898,23 @@ function SubGoalChecklist({
           const replanBadge =
             typeof sg.replan_iteration === "number" &&
             sg.replan_iteration > 0;
+          // Phase B — source badge: frozen vs. agentic vs. recovered.
+          const sourceLabel =
+            sg.source === "frozen"
+              ? `frozen${typeof sg.frozen_step_count === "number"
+                  ? ` · ${sg.frozen_step_count} steps`
+                  : ""}`
+              : sg.source === "frozen_then_agentic"
+                ? "frozen → recovered"
+                : sg.source === "agentic"
+                  ? "agentic"
+                  : null;
+          const sourceTint =
+            sg.source === "frozen"
+              ? "border-blue-500/40 bg-blue-500/10 text-blue-700 dark:text-blue-400"
+              : sg.source === "frozen_then_agentic"
+                ? "border-purple-500/40 bg-purple-500/10 text-purple-700 dark:text-purple-400"
+                : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400";
           return (
             <li
               key={sg.id}
@@ -916,6 +933,16 @@ function SubGoalChecklist({
                 <span className="font-mono text-[9px] text-muted-foreground">
                   [{sg.id}]
                 </span>
+                {sourceLabel && (
+                  <span
+                    className={cn(
+                      "shrink-0 rounded border px-1 text-[9px] font-medium",
+                      sourceTint,
+                    )}
+                  >
+                    {sourceLabel}
+                  </span>
+                )}
                 {replanBadge && (
                   <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] font-medium text-amber-700 dark:text-amber-400">
                     replan {sg.replan_iteration}

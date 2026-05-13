@@ -52,7 +52,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agents.brd_to_frd import AgentCancelled
-from app.agents.execute import ExecutionResult, _take_screenshot
+from app.agents.execute import (
+    ExecutionResult, _capture_screenshot_meta, _take_screenshot,
+)
 from app.agents.goal import Goal, extract_goal
 from app.config import settings
 from app.executor import (
@@ -104,6 +106,15 @@ ACTION_TOOLS: frozenset[str] = frozenset({
     # complex flows (graph-like navigation, return-to-search-results)
     # need without re-navigating to a remembered URL.
     "press_key", "go_back",
+    # Phase F — bundled form-fill meta-tool. Enumerates the visible
+    # form's fields, classifies each, fills with the appropriate
+    # per-widget strategy, observes inline aria-invalid validation
+    # errors, retries the offending fields, then clicks submit. The
+    # agent invokes this with ``form_fields`` (a string-encoded JSON
+    # array of {label, value, required}) + ``form_submit_label``
+    # (default "Save"). One turn replaces the 6-10 turns the agent
+    # would otherwise spend filling fields one at a time.
+    "fill_form",
 })
 META_TOOLS: frozenset[str] = frozenset({
     "mark_goal_complete", "mark_goal_failed", "ask_human",
@@ -202,6 +213,17 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         },
         "issue_evidence": {"type": "string"},
         "issue_suggested_fix": {"type": "string"},
+        # Phase F — fill_form payload. JSON-encoded array of
+        # ``{label, value, required, role_hint?}`` for the routine
+        # to fill in order. Empty string when tool != "fill_form".
+        # JSON string (not nested object) because OpenAI's strict
+        # mode doesn't allow arbitrary array shapes inside one
+        # property without bloating the top-level schema.
+        "form_fields": {"type": "string"},
+        # Submit button label the routine fuzzy-matches. Default
+        # "Save"; pass "Create" / "Submit" / "Confirm" / "" (no
+        # submit, just fill).
+        "form_submit_label": {"type": "string"},
     },
     "required": [
         "tool", "target_hint", "value", "url", "expected",
@@ -212,6 +234,7 @@ TOOL_CALL_SCHEMA: dict[str, Any] = {
         "key", "submit",
         "skip_sub_goal_id", "skip_sub_goal_reason",
         "issue_kind", "issue_evidence", "issue_suggested_fix",
+        "form_fields", "form_submit_label",
     ],
     "additionalProperties": False,
 }
@@ -274,6 +297,93 @@ ACTION TOOLS (mutate the page):
 - go_back(): browser back. Use for cascade flows like
   "search → product → back to results → another product" — cheaper
   than re-navigating to a remembered URL on heavy SPAs.
+- fill_form(form_fields, form_submit_label): bundled multi-field fill.
+  USE THIS instead of individual type/select/click calls whenever
+  a form has more than 2 fields to set. The routine enumerates the
+  open form/drawer/modal, classifies each input (textbox, textarea,
+  native_select, custom_combobox, checkbox, radio, date, file),
+  fills each with the right strategy, watches for inline
+  aria-invalid validation errors, retries the offending fields
+  (up to 2x with the same value), then clicks the submit button.
+  ``form_fields`` is a JSON STRING of an array:
+    [{"label": "First Name", "value": "Alice", "required": true},
+     {"label": "Email Address", "value": "alice@acme.com", "required": true},
+     {"label": "Phone Number", "value": "9999999999"},
+     {"label": "Send notifications", "value": "true",
+      "role_hint": "checkbox"},
+     {"label": "Role", "value": "QA Tester Role",
+      "role_hint": "custom_combobox"}]
+  ``form_submit_label`` is the submit button's visible text
+  ("Save" / "Create" / "Submit"); pass "" to fill only.
+  Labels are fuzzy-matched against placeholders / aria-label / the
+  wrapping <label>. Don't pass non-existent fields — they'll be
+  marked as miss in the result and surfaced as failures.
+
+  COMPOUND WIDGET role_hints (use these when the App Map flagged the
+  flow with [permission tree] or [paginated resource table]):
+
+  - role_hint="permission_tree": Treat the whole tree as ONE field.
+    ``value`` is one of: "all" / "none" / "only:A,B,C" /
+    "all_except:X,Y". Example for "grant all permissions":
+       {"label": "Permissions", "value": "all",
+        "role_hint": "permission_tree"}
+    The routine clicks Expand All if present, enumerates every leaf
+    checkbox, and toggles only the ones whose state differs from
+    desired. Do NOT emit one form_fields entry per leaf — the routine
+    handles atomicity.
+
+  CRITICAL — DO NOT click() permission-tree checkboxes one-by-one.
+  When you see a tree-shaped permission control (parent rows with
+  expand chevrons + child checkboxes), the ONLY correct tool is
+  fill_form with role_hint="permission_tree". Individual click()
+  calls on each checkbox will:
+    (a) burn 5-15 turns of LLM cost ticking checkboxes manually,
+    (b) usually run out of turns before reaching Save,
+    (c) leave most permissions unchecked, so Save fails validation
+        ("at least one permission required") and the role is never
+        created.
+  If you're tempted to click a permission checkbox, STOP and emit
+  a single fill_form turn with the whole tree as one field instead.
+
+  HARD RULE — fill_form MANDATE for create-flow drawers.
+  When the CURRENT SUB-GOAL description starts with "fill_form:"
+  OR mentions "fill the <X> drawer / form" OR you see an open
+  drawer with 3+ visible form fields on the page:
+  → The ONLY correct tool is fill_form.
+  → Bundle every visible required field into a SINGLE form_fields
+    array in ONE turn.
+  → Include permission_tree / paginated_resource_table fields in
+    the SAME fill_form call (as additional entries with their
+    role_hint set), not as separate sub-goals.
+  → Set form_submit_label to the visible Save / Create / Submit
+    button text so the routine clicks it after filling.
+  Sequential click() + type() + click() across multiple turns
+  costs 6-12 turns minimum, frequently runs out before Save, and
+  leaves the record un-persisted. ONE fill_form turn does it
+  atomically with validation-error retry.
+
+  ENTITY REUSE — read KNOWN STATE before inventing values.
+  Before you fill any combobox / dropdown / role-picker field,
+  scan the KNOWN STATE block above for "recently created entities"
+  of a matching kind. If KNOWN STATE shows
+  ``role='QA Auto Role-616023'`` and the form has a Role field,
+  the fill_form value for Role is EXACTLY ``'QA Auto Role-616023'``
+  — not a made-up name, not "the previously created role". Use
+  the verbatim identity string from KNOWN STATE.
+
+  - role_hint="paginated_resource_table": Treat the whole table as
+    ONE field. ``value`` is one of:
+      "all:read,update"      → tick column-master checkboxes (or
+                                walk rows if no masters) for every
+                                row across every page.
+      "specific:CH-0001:read,update;CH-0002:read"
+                              → tick only the named rows; pagination
+                                walked automatically.
+      "none"                  → untick everything currently visible.
+    Example for "grant read access on every chainage":
+       {"label": "Resource Access Control",
+        "value": "all:read",
+        "role_hint": "paginated_resource_table"}
 
 META TOOLS (terminate the loop):
 - mark_goal_complete(reasoning): the goal is verifiably achieved.
@@ -553,6 +663,149 @@ def _build_frozen_path(
     }
 
 
+def _build_frozen_path_segments(
+    *,
+    run_id: int,
+    goal: Goal,
+    turn_log: list[TurnRecord],
+    runtime_sub_goals: list[Any],
+    agent_model: str | None,
+) -> dict[str, Any] | None:
+    """Phase B Step 1/2 — build per-sub-goal frozen segments.
+
+    Same idea as :func:`_build_frozen_path` but the output groups
+    successful steps by which sub-goal each turn was working on.
+    Replay (Phase B Step 4) walks segment-by-segment: for any
+    sub-goal that has a segment with status="done", replay walks
+    the steps deterministically; sub-goals without a segment fall
+    through to the agentic loop with the goal narrowed to that
+    sub-goal.
+
+    Output shape::
+
+        {
+          "version": 2,
+          "frozen_at_run_id": ...,
+          "frozen_at": ...,
+          "agent_model": ...,
+          "goal_description": ...,
+          "success_criteria": [...],
+          "segments": [
+            {
+              "sub_goal_id": "sg1",
+              "description": "...",
+              "success_criterion": "...",
+              "max_turns": 6,
+              "steps": [...same shape as v1 steps...],
+              "status": "done",  # only "done" sub-goals are frozen
+            },
+            ...
+          ],
+        }
+
+    Returns None when no sub-goal has any frozen-worthy steps.
+    Sub-goals whose status was anything OTHER than "done" are
+    deliberately omitted — only proven flows get frozen.
+
+    Important: the FIRST non-done sub-goal in the list breaks the
+    chain. We DO emit later done sub-goals (so the report shows
+    the whole timeline), but replay treats them as "partial" and
+    falls through to agentic the moment it hits a gap. Sub-goals
+    from a replan (id contains "r1", "r2") are SKIPPED entirely —
+    those flows came from a hot-path correction and aren't a
+    deterministic replay candidate.
+    """
+    if not runtime_sub_goals:
+        return None
+
+    # Group turns by their declared current_sub_goal_id. Turns
+    # without one fall into the LAST in-progress sub-goal.
+    by_sg: dict[str, list[TurnRecord]] = {}
+    cur_sg_id: str | None = None
+    for t in turn_log:
+        declared = (t.args or {}).get("current_sub_goal_id") or ""
+        if declared and isinstance(declared, str):
+            cur_sg_id = declared
+        if cur_sg_id is None:
+            continue
+        if t.status != "ok":
+            continue
+        by_sg.setdefault(cur_sg_id, []).append(t)
+
+    segments: list[dict[str, Any]] = []
+    for rsg in runtime_sub_goals:
+        # Skip replanned sub-goals — id pattern "...r1", "...r2"
+        # marks the sub-goal as having been re-decomposed mid-run,
+        # which is incompatible with deterministic replay.
+        if "r" in rsg.id and rsg.id.split("r")[-1].isdigit():
+            continue
+        if rsg.status != "done":
+            continue
+        sg_turns = by_sg.get(rsg.id, [])
+        if not sg_turns:
+            continue
+        seg_steps: list[dict[str, Any]] = []
+        for t in sg_turns:
+            if t.tool not in (
+                "navigate", "click", "type", "select", "verify",
+                "wait", "scroll", "extract_text", "dismiss_modal",
+                "press_key", "go_back",
+            ):
+                continue
+            slim_args = {
+                k: v for k, v in (t.args or {}).items()
+                if v not in ("", 0, None, False)
+                and k not in (
+                    # Drop sub-goal-tracking fields from frozen
+                    # args — they're meta, not replay primitives.
+                    "current_sub_goal_id", "sub_goal_completed_id",
+                    "skip_sub_goal_id", "skip_sub_goal_reason",
+                    "issue_kind", "issue_evidence",
+                    "issue_suggested_fix", "page_memory_note",
+                    "reasoning", "confidence",
+                )
+            }
+            successful_selector: str | None = None
+            if "fuzzy matched" in (t.narration or "").lower():
+                import re as _re  # noqa: PLC0415
+                m = _re.search(
+                    r"fuzzy matched ['\"]([^'\"]+)['\"]",
+                    t.narration or "",
+                )
+                if m:
+                    successful_selector = m.group(1)
+            seg_steps.append({
+                "turn": t.turn,
+                "tool": t.tool,
+                "args": slim_args,
+                "successful_selector": successful_selector,
+                "page_url_after": t.page_url,
+            })
+        if not seg_steps:
+            continue
+        segments.append({
+            "sub_goal_id": rsg.id,
+            "description": rsg.description,
+            "success_criterion": rsg.success_criterion,
+            "max_turns": rsg.max_turns,
+            "steps": seg_steps,
+            "status": "done",
+        })
+
+    if not segments:
+        return None
+
+    return {
+        "version": 2,
+        "frozen_at_run_id": run_id,
+        "frozen_at": _utcnow().isoformat(),
+        "agent_model": agent_model,
+        "goal_description": goal.description,
+        "success_criteria": list(goal.success_criteria),
+        "segments": segments,
+    }
+
+
 def _categorize_divergence(
     *,
     final_status: str,
@@ -737,6 +990,140 @@ class AgentSubmoduleResult:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ── Phase C.3 — TcVersion → TcNode materialization ────────────────
+
+
+def _materialize_tcnodes_from_version(
+    db: "Session",
+    *,
+    plan_id: int,
+    version_id: int,
+) -> list[TcNode]:
+    """Build transient TcNode objects from a TcVersion's snapshot
+    tree so the rest of the agent (which walks ``TcNode.parent_id``)
+    keeps working without changes.
+
+    Rules:
+    - ``.id`` is set to ``original_tc_node_id`` when one exists (so
+      freeze paths + AKB recall hit the live row). For ``added``
+      snapshots with no live counterpart, ``.id`` is a synthetic
+      negative integer derived from the snapshot id so collisions
+      with real PKs are impossible.
+    - ``.parent_id`` is rewired to the parent's ``.id`` (which may
+      itself be original or synthetic). This keeps tree-walk code
+      intact.
+    - These objects are NOT added to the session and NOT persisted.
+      Mutating ``.frozen_path`` on a synthetic node is a no-op.
+    """
+    from app.models.tc_version import TcNodeSnapshot  # noqa: PLC0415
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    snaps = list(db.execute(
+        _select(TcNodeSnapshot)
+        .where(TcNodeSnapshot.tc_version_id == version_id)
+        .order_by(
+            TcNodeSnapshot.depth,
+            TcNodeSnapshot.parent_snapshot_id,
+            TcNodeSnapshot.ordinal,
+        ),
+    ).scalars())
+
+    snap_id_to_node_id: dict[int, int] = {}
+    out: list[TcNode] = []
+    for s in snaps:
+        # Choose a stable id for this snapshot's TcNode shadow.
+        if s.original_tc_node_id is not None:
+            node_id = int(s.original_tc_node_id)
+        else:
+            node_id = -int(s.id)  # synthetic, won't collide
+        snap_id_to_node_id[int(s.id)] = node_id
+
+        parent_node_id: int | None = None
+        if s.parent_snapshot_id is not None:
+            parent_node_id = snap_id_to_node_id.get(
+                int(s.parent_snapshot_id),
+            )
+
+        node = TcNode(
+            id=node_id,
+            project_id=0,  # unused at this layer
+            plan_id=plan_id,
+            parent_id=parent_node_id,
+            kind=s.kind,
+            ordinal=s.ordinal,
+            depth=s.depth,
+            path_cached=s.path_cached,
+            title=s.title,
+            description_md=s.description_md,
+            action_type=s.action_type,
+            target_hint=s.target_hint,
+            narrative=s.narrative,
+            expected=s.expected,
+            data_needs_json=s.data_needs_json,
+            selectable_default=s.selectable_default,
+            status="draft",
+            source_requirement_ids=[],
+        )
+        # ``frozen_path`` lives on the LIVE TcNode keyed by original
+        # id — load it lazily so replay / freeze still finds it for
+        # rows that have a live counterpart.
+        if s.original_tc_node_id is not None:
+            live = db.get(TcNode, int(s.original_tc_node_id))
+            if live is not None and live.frozen_path is not None:
+                node.frozen_path = live.frozen_path
+        out.append(node)
+    return out
+
+
+# ── Phase A.6 Step 4 — verify gate helper ─────────────────────────
+
+
+# Field names that mark a value as the entity's "identity" (the name
+# that should appear in the list after creation). When the agent
+# typed into one of these earlier in the submodule, the verify gate
+# uses that value as the needle for the "is the new row visible?"
+# check. Matched case-insensitively against the resolved target_hint.
+_IDENTITY_FIELD_HINTS: tuple[str, ...] = (
+    "name", "title", "label", "display", "first name",
+    "email", "username", "project", "role", "user", "id",
+)
+
+
+def _last_typed_entity_value(
+    turn_log: list["TurnRecord"],
+) -> str:
+    """Scan back through the submodule's turn log for the most recent
+    ``type`` action whose ``target_hint`` looks identity-like.
+
+    Returns the typed value, or ``""`` when nothing identity-shaped
+    was typed yet. Used by the verify-in-list gate (Step 4) to know
+    which name the agent SHOULD see in the list after creation.
+
+    Matches LATEST first so multi-field forms work: agent types
+    First Name, Last Name, Email — verify uses Email (last
+    identity-like field typed) which is typically the unique key.
+    """
+    for t in reversed(turn_log):
+        if t.tool != "type":
+            continue
+        value = (t.args.get("value") or "").strip()
+        if not value or len(value) < 2:
+            continue
+        hint = (t.args.get("target_hint") or "").lower()
+        if any(h in hint for h in _IDENTITY_FIELD_HINTS):
+            return value
+    # Fallback: the most recent typed value of >= 3 chars regardless
+    # of target. Many forms have only one obvious text input ("role
+    # name", "tag name") that doesn't match the heuristic list.
+    for t in reversed(turn_log):
+        if t.tool != "type":
+            continue
+        value = (t.args.get("value") or "").strip()
+        if len(value) >= 3:
+            return value
+    return ""
 
 
 # Cheap heuristics that catch the common login/auth screen patterns
@@ -1116,6 +1503,43 @@ _SUB_GOAL_ICON = {
     "failed": "✗",
     "skipped": "⊘",
 }
+
+
+def _format_failed_approaches_block(
+    failed_approaches: list[dict[str, str]],
+) -> str:
+    """Phase O.3 — render the recent failed-approach memory.
+
+    When the agent's prior attempts in THIS submodule have produced
+    actionable failures (click on a target that didn't resolve, type
+    into a field that wasn't accepted, fill_form with a validation
+    error), surface them so the planner explicitly does NOT retry the
+    same approach. Empty list → empty string so the prompt skips it.
+    """
+    if not failed_approaches:
+        return ""
+    lines: list[str] = [
+        "\nFAILED APPROACHES SO FAR (do NOT retry these; pick a "
+        "different target / value / tool):",
+    ]
+    for fa in failed_approaches[-6:]:
+        bits: list[str] = [
+            f"  - T{fa.get('turn', '?')}",
+            f"{fa.get('tool', '?')}",
+        ]
+        tgt = (fa.get('target') or '').strip()
+        if tgt:
+            bits.append(f"target={tgt!r}")
+        val = (fa.get('value') or '').strip()
+        if val:
+            bits.append(f"value={val!r}")
+        reason = (fa.get('reason') or '').strip()
+        line = " ".join(bits)
+        if reason:
+            line += f" → {reason[:120]}"
+        lines.append(line)
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _format_goal_for_prompt(goal: Goal, *, turn_idx: int = 1) -> str:
@@ -1737,6 +2161,12 @@ def _maybe_run_smart_pick(
     on_escalate: Any,
     submodule_run_id: int | None,
     submodule_step_id: int | None,
+    # Phase J.5 — DOM ambiguity threshold. Default 3 keeps the
+    # historical hybrid behavior. Vision-only callers pass 2 so the
+    # DOM-aware tie-breaker fires for 2-candidate cases too (where
+    # vision_only's pure-pixel proposal might pick the wrong one of
+    # two visually similar Save / Save-As buttons).
+    min_matches: int = 3,
 ) -> dict[str, Any] | None:
     """Phase 14 — smart candidate selection.
 
@@ -1779,9 +2209,13 @@ def _maybe_run_smart_pick(
         )
         return None
 
-    # Threshold: 3+ visible matches qualifies as ambiguous. 1-2
-    # matches → existing fuzzy / vision-search ladder is fine.
-    if match_count < 3:
+    # Threshold: ``min_matches`` (default 3) visible matches qualifies
+    # as ambiguous. Below that, the existing fuzzy / vision-search
+    # ladder is fine. Vision-only callers pass min_matches=2 (Phase
+    # J.5) so the DOM-grounded tie-breaker fires for 2-candidate
+    # cases too — that's exactly where pure-pixel vision_only mode
+    # tends to pick the wrong one of two similarly-styled buttons.
+    if match_count < min_matches:
         return None
 
     _emit(emit_event, "smart_pick_started", {
@@ -2206,6 +2640,1077 @@ def _vision_search_for_target(
     }
 
 
+# ── Diag.4 — inter-submodule state reset ─────────────────────────
+
+
+_RESET_DRAWER_JS = r"""
+() => {
+  // Dismiss any visible drawer / modal / dialog. Strategy:
+  //   1. Find every visible role=dialog / .MuiDrawer-paper /
+  //      heuristic-detected fixed-position drawer.
+  //   2. For each, click the most likely "close" affordance —
+  //      aria-label="Close", button with × / Close text, or
+  //      role=button positioned at the top-right corner.
+  //   3. As a fallback, hide the element so it can't intercept
+  //      subsequent clicks (last-resort; the DOM teardown happens
+  //      later when the agent navigates away).
+  const VISIBLE = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' &&
+           parseFloat(cs.opacity) > 0.05;
+  };
+  const drawerSel = [
+    '[role=dialog]', '[role=alertdialog]',
+    '[aria-modal="true"]',
+    '.MuiDialog-paper', '.MuiDrawer-paper', '.MuiModal-root',
+    '[class*="Drawer"]', '[class*="drawer"]',
+    '[class*="Modal"]', '[class*="modal"]',
+  ].join(',');
+  const drawers = [...document.querySelectorAll(drawerSel)]
+    .filter(VISIBLE)
+    .filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width >= 240 && r.height >= 240;
+    });
+  let closed = 0;
+  for (const dr of drawers) {
+    // Try a labelled Close button first.
+    const closeBtn =
+      dr.querySelector('[aria-label="Close"]') ||
+      dr.querySelector('[aria-label="close"]') ||
+      dr.querySelector('button[title="Close"]') ||
+      // × character inside a button
+      [...dr.querySelectorAll('button, [role=button]')].find(b => {
+        const t = (b.innerText || b.textContent || '').trim();
+        return t === '×' || t === 'X' || t === 'x' ||
+               t.toLowerCase() === 'close' ||
+               t.toLowerCase() === 'cancel';
+      });
+    if (closeBtn) {
+      try {
+        closeBtn.click();
+        closed += 1;
+        continue;
+      } catch (e) { /* fall through */ }
+    }
+    // Top-right icon button (no label, just an SVG / icon-class).
+    const dr_rect = dr.getBoundingClientRect();
+    const corner = [...dr.querySelectorAll('button, [role=button]')]
+      .filter(VISIBLE)
+      .find(b => {
+        const r = b.getBoundingClientRect();
+        return r.right >= dr_rect.right - 60
+            && r.top <= dr_rect.top + 60
+            && r.width <= 60 && r.height <= 60;
+      });
+    if (corner) {
+      try { corner.click(); closed += 1; continue; } catch (e) {}
+    }
+  }
+  return closed;
+};
+"""
+
+
+def _reset_inter_submodule_state(page) -> None:
+    """Diag.4 — clean the page between submodules.
+
+    Sequence:
+      1. Press Escape (closes most MUI / shadcn / AntD dialogs cheap).
+      2. Run a JS pass that finds every visible drawer and clicks
+         its Close affordance (aria-label="Close" / × / top-right
+         icon button).
+      3. Repeat Escape once more for stacked drawers.
+      4. Scroll the page to the top so the next observation starts
+         at a known baseline.
+
+    All steps are best-effort; failures are logged at DEBUG and never
+    raise. If a drawer refuses to close, the agent loop will see it
+    on the next observation and can plan around it (or fail cleanly
+    via the action-no-effect circuit-breaker).
+    """
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(120)
+    except Exception:
+        pass
+    try:
+        closed = page.evaluate(_RESET_DRAWER_JS)
+        if isinstance(closed, int) and closed > 0:
+            page.wait_for_timeout(180)
+    except Exception:
+        pass
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(80)
+    except Exception:
+        pass
+    try:
+        page.evaluate("window.scrollTo(0, 0)")
+    except Exception:
+        pass
+
+
+# ── Phase O.2 — pre-action existence check ────────────────────────
+
+
+_TARGET_PROBE_JS = r"""
+(needle) => {
+  // Cheap DOM probe: does any visible interactive element have a
+  // label / aria-label / placeholder / text content that contains
+  // ``needle`` (case-insensitive, first 60 chars)? Also returns the
+  // 8 closest-looking visible labels so the planner-feedback prompt
+  // can show the agent what IS on the page.
+  const want = (needle || '').trim().toLowerCase();
+  if (!want) return { exists: false, similar: [] };
+  const SEL = [
+    'button', '[role=button]', 'a[href]',
+    'input', 'textarea', 'select',
+    '[role=combobox]', '[role=listbox]', '[role=checkbox]',
+    '[role=radio]', '[role=textbox]', '[role=tab]',
+    '[role=menuitem]', '[role=heading]', '[role=link]',
+    '[role=switch]', '[role=row]',
+  ].join(',');
+  const VISIBLE = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' &&
+           parseFloat(cs.opacity) > 0.05;
+  };
+  const labelOf = (el) => {
+    let v = el.getAttribute('aria-label') ||
+            el.getAttribute('title') ||
+            el.getAttribute('placeholder') ||
+            el.getAttribute('name') || '';
+    if (!v) v = (el.innerText || el.textContent || '').trim();
+    return String(v || '').trim().slice(0, 120);
+  };
+  const labels = [];
+  let found = false;
+  for (const el of document.querySelectorAll(SEL)) {
+    if (!VISIBLE(el)) continue;
+    const lab = labelOf(el);
+    if (!lab) continue;
+    const ll = lab.toLowerCase();
+    if (ll === want || ll.includes(want) || want.includes(ll)) {
+      found = true;
+      // Keep scanning to populate similar; the agent can use it for
+      // adjacent label hints even on a match.
+    }
+    if (labels.length < 30 && !labels.includes(lab)) labels.push(lab);
+    if (found && labels.length >= 30) break;
+  }
+  // Pick the 8 labels with greatest token overlap to `want` for the
+  // "did you mean" hint when not found.
+  const tokens = (want.match(/\w+/g) || []);
+  function score(lab) {
+    const ll = lab.toLowerCase();
+    let s = 0;
+    for (const t of tokens) if (t && ll.includes(t)) s += 1;
+    return s;
+  }
+  const similar = labels
+    .map(l => [score(l), l])
+    .sort((a, b) => b[0] - a[0])
+    .slice(0, 8)
+    .map(x => x[1]);
+  return { exists: found, similar };
+};
+"""
+
+
+def _check_target_exists(
+    page,
+    target_hint: str,
+) -> tuple[bool, list[str]]:
+    """Phase O.2 — does the target_hint refer to anything visible on
+    the current page?
+
+    Heuristic, fast, no LLM. Returns ``(exists, similar)``:
+      - ``exists=True`` when at least one visible interactive element
+        has a label containing the target_hint (or vice versa).
+      - ``similar`` is the top-8 visible-element labels ranked by
+        token overlap with the target_hint, so the planner-feedback
+        prompt can show "you said 'Save'; visible options are
+        'Save User', 'Cancel', '+ Add New User', …".
+
+    Returns ``(True, [])`` for any target_hint that LOOKS like a CSS
+    or attribute selector (starts with '#', '.', '[', or contains
+    '>' / ':has(' / '/' / 'xpath=') — we don't try to fuzz-resolve
+    those; the DOM resolver downstream handles them.
+    """
+    hint = (target_hint or "").strip()
+    if not hint:
+        return (True, [])
+    # Skip selector-shaped hints.
+    if (
+        hint.startswith(("#", ".", "[", "(", ":", "/"))
+        or "xpath=" in hint
+        or " > " in hint
+        or "[role=" in hint
+    ):
+        return (True, [])
+    try:
+        raw = page.evaluate(_TARGET_PROBE_JS, hint[:120])
+    except Exception:
+        return (True, [])
+    if not isinstance(raw, dict):
+        return (True, [])
+    return (
+        bool(raw.get("exists")),
+        [str(s)[:120] for s in (raw.get("similar") or [])],
+    )
+
+
+# ── Phase O.1 — sub-goal verification gate ────────────────────────
+
+
+def _verify_subgoal_criterion(
+    page,
+    *,
+    criterion: str,
+    observation: dict[str, Any],
+) -> tuple[bool, str]:
+    """Phase O.1 — deterministic check that a sub-goal's
+    ``success_criterion`` is actually observable on the current page.
+
+    Returns ``(ok, reason)``. ``ok=True`` means the criterion's
+    deterministic signal matched; the runtime allows the sub-goal to
+    transition to ``done``. ``ok=False`` means the agent claimed
+    success but the page disagrees; the runtime should refuse the
+    close and surface a feedback signal so the next turn fixes it.
+
+    Strategy — only the patterns we can verify deterministically:
+
+      - URL match: ``"URL contains X"`` / ``"current URL is X"``
+        → compare against ``observation["url"]``.
+      - Visible text: any QUOTED token ("...") in the criterion must
+        appear in visible page text (case-insensitive).
+      - Drawer state: ``"drawer is visible"`` / ``"drawer is closed"``
+        → query DOM for an open drawer.
+      - Toast: ``"toast says X"`` → check the page for ``X`` text.
+
+    When NONE of the deterministic patterns match the criterion (e.g.
+    "permissions are selected appropriately"), we return ``(True,
+    "no deterministic signal")`` — the verification gate doesn't fire,
+    legacy behavior. The agent's own claim stands.
+    """
+    import re  # noqa: PLC0415
+
+    text = (criterion or "").strip()
+    if not text:
+        return (True, "empty criterion — gate skipped")
+    low = text.lower()
+
+    # URL match.
+    m = re.search(r"url(?:\s+contains)?\s+['\"]?([^'\"]+?)['\"]?(?:\s|$)", low)
+    if m and ("url" in low):
+        needle = m.group(1).strip().strip(".,;:!?")
+        cur_url = (observation.get("url") or "").lower()
+        if needle and needle not in cur_url:
+            return (
+                False,
+                f"URL {cur_url!r} does not contain {needle!r}",
+            )
+        return (True, f"URL contains {needle!r}")
+
+    # Drawer state.
+    if "drawer" in low or "modal" in low or "dialog" in low:
+        wants_open = (
+            "visible" in low or "open" in low or "appears" in low
+            or "shown" in low
+        )
+        wants_closed = (
+            "closed" in low or "dismissed" in low
+            or "disappears" in low or "hidden" in low
+        )
+        if wants_open or wants_closed:
+            try:
+                is_open = bool(page.evaluate(
+                    "(() => {const s=['[role=dialog]','[role=alertdialog]',"
+                    "'.MuiDialog-paper','.MuiDrawer-paper','[class*=\"Drawer\"]',"
+                    "'[class*=\"drawer\"]','[class*=\"Modal\"]','[class*=\"modal\"]']"
+                    ".join(',');return [...document.querySelectorAll(s)]"
+                    ".some(el => {const r=el.getBoundingClientRect();"
+                    "if(r.width<100||r.height<100)return false;"
+                    "const cs=getComputedStyle(el);"
+                    "return cs.display!=='none'&&cs.visibility!=='hidden';});})()",
+                ))
+            except Exception:
+                is_open = None
+            if is_open is None:
+                return (True, "drawer probe failed — gate skipped")
+            if wants_open and not is_open:
+                return (False, "criterion expects open drawer; none visible")
+            if wants_closed and is_open:
+                return (False, "criterion expects closed drawer; still open")
+            return (True, "drawer state matches criterion")
+
+    # Quoted-token presence — the criterion mentions specific text
+    # the page must show. Multiple quotes are OR (ANY must appear).
+    quoted = re.findall(r"['\"]([^'\"]{2,80})['\"]", text)
+    if quoted:
+        try:
+            visible_text = page.evaluate(
+                "() => (document.body && document.body.innerText) || ''",
+            )
+        except Exception:
+            visible_text = ""
+        visible_text = (visible_text or "").lower()
+        for q in quoted:
+            if q.strip().lower() in visible_text:
+                return (True, f"page contains {q!r}")
+        return (
+            False,
+            f"none of {quoted!r} found in visible page text",
+        )
+
+    # Toast / banner / alert (un-quoted form).
+    if "toast" in low or "snackbar" in low or "alert" in low:
+        try:
+            visible_text = page.evaluate(
+                "() => (document.body && document.body.innerText) || ''",
+            )
+        except Exception:
+            visible_text = ""
+        # Strip the trigger word and check the remainder.
+        tail = re.sub(
+            r"\b(toast|snackbar|alert|notification|banner)\s+(?:says|shows|reads|appears)?\s*",
+            "",
+            low,
+        ).strip().strip("'\".")
+        if tail and tail not in (visible_text or "").lower():
+            return (
+                False,
+                f"expected toast text {tail!r} not visible",
+            )
+        return (True, "toast keyword satisfied")
+
+    return (True, "no deterministic signal — gate skipped")
+
+
+# ── Phase N — HITL → direct action dispatch ──────────────────────
+
+
+_HITL_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tool": {
+            "type": "string",
+            "enum": [
+                "click", "type", "select", "scroll", "navigate",
+                "wait", "verify", "dismiss_modal", "extract_text",
+                "fill_form", "go_back",
+                "give_up",  # special: user input doesn't map to an action
+            ],
+        },
+        "target_hint": {"type": "string"},
+        "value": {"type": "string"},
+        "x": {"type": ["integer", "null"]},
+        "y": {"type": ["integer", "null"]},
+        "form_fields": {"type": "string"},
+        "form_submit_label": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "confidence": {
+            "type": "number", "minimum": 0.0, "maximum": 1.0,
+        },
+    },
+    "required": [
+        "tool", "target_hint", "value", "x", "y",
+        "form_fields", "form_submit_label",
+        "reasoning", "confidence",
+    ],
+    "additionalProperties": False,
+}
+
+
+_HITL_INTERPRETER_SYSTEM_PROMPT = (
+    "You are an action interpreter. The QA agent stalled. A HUMAN just "
+    "looked at the screen and gave instructions on how to proceed. Your "
+    "ONE job: translate the human's instruction into ONE tool call that "
+    "the agent runtime will execute IMMEDIATELY.\n\n"
+    "Inputs you receive:\n"
+    "  - The current page screenshot.\n"
+    "  - The human's typed instruction.\n"
+    "  - Optionally a second image showing the human's hand-drawn "
+    "marks on the screenshot (e.g. a box around the element to click). "
+    "When the drawing shows a clear bounding box, return tool=click "
+    "with x/y at the box's center.\n\n"
+    "RULES:\n"
+    "1. Map the instruction to EXACTLY ONE tool call. Never two.\n"
+    "2. Trust the human. If they say 'click Save', dispatch "
+    "click(target_hint=\"Save\"). Don't second-guess.\n"
+    "3. If the drawing shows a clear region, prefer click(x, y) at "
+    "the region's center over click(target_hint=...) — the drawing "
+    "is the most reliable signal.\n"
+    "4. For form-fill instructions ('fill First Name=Alice, "
+    "Last Name=Smith, then Save'), emit tool=fill_form with "
+    "form_fields as a JSON array string and form_submit_label set.\n"
+    "5. Use tool='give_up' ONLY when the instruction is purely "
+    "advisory ('be careful', 'note that this is a tricky page') and "
+    "doesn't name an actionable next step.\n"
+    "6. confidence: 0.9+ when the instruction names an exact element; "
+    "0.6-0.8 when interpretation is needed; <0.5 if the instruction "
+    "is vague.\n\n"
+    "Output STRICT JSON. Empty strings for unused fields. Use null "
+    "for x/y when not applicable."
+)
+
+
+def _hitl_rule_based_parser(text: str) -> dict[str, Any] | None:
+    """Phase R — deterministic, zero-LLM HITL parser.
+
+    Tried BEFORE the LLM interpreter so the emergency path doesn't
+    depend on a network round-trip. Covers the high-value patterns:
+
+      "click Save"           → click(target_hint="Save")
+      "click 800, 400"       → click at coords (800, 400)
+      "click at 800,400"     → click at coords (800, 400)
+      "type Alice"           → type with value="Alice" (target inferred
+                                by the runtime's last-focused-field
+                                heuristic)
+      "type 'Alice' into First Name"
+                             → type(target_hint="First Name",
+                                    value="Alice")
+      "scroll down"          → scroll(scroll_direction="down")
+      "skip"                 → give_up (lets the planner re-plan)
+      "save" / "submit"      → click(target_hint=word)
+
+    Returns ``None`` when no rule matches (LLM fallback fires).
+    """
+    import re  # noqa: PLC0415
+
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+
+    # click X, Y coords
+    m = re.match(
+        r"^click\s+(?:at\s+)?\(?\s*(\d{1,5})\s*,\s*(\d{1,5})\s*\)?",
+        low,
+    )
+    if m:
+        return {
+            "tool": "click",
+            "target_hint": "",
+            "value": "",
+            "x": int(m.group(1)),
+            "y": int(m.group(2)),
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: explicit coords",
+            "confidence": 1.0,
+        }
+
+    # type 'X' into Y
+    m = re.match(
+        r"^type\s+['\"]([^'\"]+)['\"]\s+(?:in(?:to)?|to)\s+(.+)$",
+        t, flags=re.IGNORECASE,
+    )
+    if m:
+        return {
+            "tool": "type",
+            "target_hint": m.group(2).strip(),
+            "value": m.group(1),
+            "x": None,
+            "y": None,
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: type quoted into target",
+            "confidence": 0.95,
+        }
+    m = re.match(
+        r"^type\s+(.+)$",
+        t, flags=re.IGNORECASE,
+    )
+    if m:
+        return {
+            "tool": "type",
+            "target_hint": "",
+            "value": m.group(1).strip(),
+            "x": None,
+            "y": None,
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: type value",
+            "confidence": 0.85,
+        }
+
+    # click X / press X
+    m = re.match(
+        r"^(?:click|press|tap)\s+(?:on\s+|the\s+)?(.+)$",
+        t, flags=re.IGNORECASE,
+    )
+    if m:
+        return {
+            "tool": "click",
+            "target_hint": m.group(1).strip().strip(".'\""),
+            "value": "",
+            "x": None,
+            "y": None,
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: click named target",
+            "confidence": 0.95,
+        }
+
+    # scroll
+    if low in ("scroll", "scroll down", "down", "page down"):
+        return {
+            "tool": "scroll",
+            "target_hint": "",
+            "value": "down",
+            "x": None,
+            "y": None,
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: scroll down",
+            "confidence": 0.9,
+        }
+    if low in ("scroll up", "up", "page up"):
+        return {
+            "tool": "scroll",
+            "target_hint": "",
+            "value": "up",
+            "x": None,
+            "y": None,
+            "form_fields": "",
+            "form_submit_label": "",
+            "reasoning": "HITL rule: scroll up",
+            "confidence": 0.9,
+        }
+
+    # single-word save / submit / cancel / etc → click that label
+    if re.match(r"^[a-z][a-z\-\s]{1,30}$", low):
+        if any(
+            kw == low or kw in low.split()
+            for kw in (
+                "save", "submit", "create", "confirm",
+                "apply", "next", "cancel", "back", "ok",
+            )
+        ):
+            return {
+                "tool": "click",
+                "target_hint": t,
+                "value": "",
+                "x": None,
+                "y": None,
+                "form_fields": "",
+                "form_submit_label": "",
+                "reasoning": "HITL rule: bare action word → click",
+                "confidence": 0.85,
+            }
+
+    return None
+
+
+def _interpret_hitl_as_action(
+    *,
+    pending_hitl: dict[str, Any],
+    screenshot: bytes | None,
+    provider: LLMProvider,
+    cheap_provider: LLMProvider | None,
+) -> dict[str, Any] | None:
+    """Phase N — translate a human's HITL submission into ONE tool call.
+
+    Returns a tool-call dict in the shape the agent's runtime expects
+    (``{tool, target_hint, value, ...}``). Returns ``None`` when:
+      - HITL text is empty AND no drawing is present
+      - The interpreter LLM call fails / produces tool='give_up'
+      - The result's confidence < 0.4 (too unsure to dispatch directly)
+
+    On failure, the caller falls back to the existing
+    "stash-in-page_memory + let planner handle it" path so HITL never
+    HARDS — worst case is parity with the old behavior.
+    """
+    from app.llm.base import ChatMessage  # noqa: PLC0415
+    import base64 as _b64  # noqa: PLC0415
+
+    text = (pending_hitl.get("text") or "").strip()
+    drawing_b64 = (pending_hitl.get("drawing_b64") or "").strip()
+    if not text and not drawing_b64:
+        return None
+
+    # Phase R — rule-based fast path. ZERO LLM call when the user's
+    # text matches a simple pattern (click X / type X / coords / save
+    # / scroll). Triggered BEFORE the LLM interpreter so the
+    # emergency path is instant even when OpenAI is slow / down.
+    # Skipped when the user attached a drawing — we want the LLM to
+    # see the drawing in that case.
+    if text and not drawing_b64:
+        rule_parsed = _hitl_rule_based_parser(text)
+        if rule_parsed is not None:
+            tool = str(rule_parsed.get("tool") or "")
+            return {
+                "tool": tool,
+                "target_hint": str(rule_parsed.get("target_hint") or ""),
+                "value": str(rule_parsed.get("value") or ""),
+                "reasoning": str(rule_parsed.get("reasoning") or "")[:400],
+                "confidence": float(rule_parsed.get("confidence", 0.9)),
+                "page_memory_note": "",
+                "current_sub_goal_id": (
+                    pending_hitl.get("sub_goal_id") or ""
+                ),
+                "sub_goal_completed_id": "",
+                "skip_sub_goal_id": "",
+                "skip_sub_goal_reason": "",
+                "issue_kind": "",
+                "issue_evidence": "",
+                "issue_suggested_fix": "",
+                "form_fields": str(rule_parsed.get("form_fields") or ""),
+                "form_submit_label": str(
+                    rule_parsed.get("form_submit_label") or "",
+                ),
+                "url": "",
+                "expected": "",
+                "duration_ms": 0,
+                "scroll_direction": str(
+                    rule_parsed.get("value") if tool == "scroll"
+                    else ""
+                ),
+                "scroll_amount": 0,
+                "question": "",
+                "key": "",
+                "submit": False,
+                "_hitl_coord_x": rule_parsed.get("x"),
+                "_hitl_coord_y": rule_parsed.get("y"),
+                "_via_hitl": True,
+                "_hitl_tokens_in": 0,
+                "_hitl_tokens_out": 0,
+            }
+
+    # Build messages: screenshot + optional drawing + the text.
+    parts: list[str] = []
+    if text:
+        parts.append(f"HUMAN INSTRUCTION:\n  \"{text}\"\n")
+    else:
+        parts.append(
+            "HUMAN INSTRUCTION: (no text — interpret the drawing "
+            "as the action target)\n"
+        )
+    parts.append(
+        "Translate this into ONE tool call the agent will execute "
+        "immediately. The agent is stalled and waiting for you to "
+        "decide.\n"
+    )
+    user_text = "".join(parts)
+
+    messages: list[ChatMessage] = [
+        ChatMessage(role="system", content=_HITL_INTERPRETER_SYSTEM_PROMPT),
+        ChatMessage(
+            role="user",
+            content=user_text,
+            image=screenshot,
+        ),
+    ]
+    # Optional second image — the user's drawing.
+    if drawing_b64:
+        try:
+            drawing_bytes = _b64.b64decode(drawing_b64)
+            messages.append(
+                ChatMessage(
+                    role="user",
+                    content="(The human's drawing on the screenshot — "
+                    "use any box / arrow to locate the target.)",
+                    image=drawing_bytes,
+                ),
+            )
+        except Exception:
+            pass
+
+    # Prefer cheap-tier; the interpretation is a small structured task.
+    interpreter = cheap_provider or provider
+    try:
+        result = interpreter.chat_structured(
+            messages=messages,
+            schema=_HITL_TOOL_SCHEMA,
+            schema_name="hitl_tool_call",
+            temperature=0.1,
+            max_output_tokens=400,
+        )
+    except Exception as e:
+        logger.warning("HITL interpreter LLM call failed: %s", e)
+        return None
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        return None
+    tool = str(parsed.get("tool") or "").strip()
+    if not tool or tool == "give_up":
+        return None
+    try:
+        conf = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    if conf < 0.4:
+        logger.info(
+            "HITL interpreter confidence %.2f < 0.4 — falling through "
+            "to planner with stashed guidance", conf,
+        )
+        return None
+
+    # Translate into the planner's tool-call shape.
+    out: dict[str, Any] = {
+        "tool": tool,
+        "target_hint": str(parsed.get("target_hint") or ""),
+        "value": str(parsed.get("value") or ""),
+        "reasoning": str(parsed.get("reasoning") or "")[:400],
+        "confidence": conf,
+        "page_memory_note": "",
+        "current_sub_goal_id": pending_hitl.get("sub_goal_id") or "",
+        "sub_goal_completed_id": "",
+        "skip_sub_goal_id": "",
+        "skip_sub_goal_reason": "",
+        "issue_kind": "",
+        "issue_evidence": "",
+        "issue_suggested_fix": "",
+        "form_fields": str(parsed.get("form_fields") or ""),
+        "form_submit_label": str(parsed.get("form_submit_label") or ""),
+        "url": "",
+        "expected": "",
+        "duration_ms": 0,
+        "scroll_direction": "",
+        "scroll_amount": 0,
+        "question": "",
+        "key": "",
+        "submit": False,
+        # Phase N marker — downstream dispatchers can prefer coord
+        # click when these are non-null (skips smart-pick + DOM
+        # resolution for the user's exact target).
+        "_hitl_coord_x": parsed.get("x"),
+        "_hitl_coord_y": parsed.get("y"),
+        "_via_hitl": True,
+        "_hitl_tokens_in": result.input_tokens or 0,
+        "_hitl_tokens_out": result.output_tokens or 0,
+    }
+    return out
+
+
+def _dispatch_fill_form(
+    page,
+    *,
+    args: dict[str, Any],
+    emit_event: Callable[[str, dict], None] | None = None,
+    submodule_run_id: int | None = None,
+    submodule_step_id: int | None = None,
+    turn_idx: int | None = None,
+) -> dict[str, Any]:
+    """Phase F — dispatch the bundled fill_form routine.
+
+    Parses ``args["form_fields"]`` (JSON string of field objects) +
+    ``args["form_submit_label"]``, invokes
+    :func:`form_fill.run_form_fill`, and translates the result into
+    the standard outcome dict the turn loop expects.
+
+    Failure modes:
+    - empty/invalid JSON in form_fields → status="failed" with a
+      clear narration ("malformed form_fields payload")
+    - all fields missed (no DOM match) → status="failed"
+    - submit returned validation errors → status="failed" so the
+      next-turn prompt sees the FORM SIGNAL and the agent can plan
+      a recovery (most likely a manual per-field type)
+    - filled + submit ok → status="ok"
+    """
+    import json as _json  # noqa: PLC0415
+    from app.executor.form_fill import (  # noqa: PLC0415
+        FormField, run_form_fill,
+    )
+
+    raw_fields = args.get("form_fields") or ""
+    raw_submit = args.get("form_submit_label")
+    submit_label = (
+        raw_submit if isinstance(raw_submit, str) else "Save"
+    )
+    try:
+        parsed = _json.loads(raw_fields) if raw_fields else []
+    except Exception as e:
+        return {
+            "status": "failed",
+            "narration": (
+                f"fill_form: malformed JSON in form_fields "
+                f"({type(e).__name__})"
+            ),
+            "error_message": (
+                "form_fields must be a JSON-encoded array of "
+                "{label, value, required?, role_hint?}"
+            ),
+            "extracted_text": "",
+            "details": {"fill_form": "parse_error"},
+        }
+    if not isinstance(parsed, list) or not parsed:
+        return {
+            "status": "failed",
+            "narration": "fill_form: form_fields is empty",
+            "error_message": "no fields to fill",
+            "extracted_text": "",
+            "details": {"fill_form": "empty"},
+        }
+
+    fields: list[FormField] = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label", "")).strip()
+        value = str(entry.get("value", ""))
+        if not label:
+            continue
+        role_hint = entry.get("role_hint")
+        fields.append(FormField(
+            label=label,
+            value=value,
+            required=bool(entry.get("required", False)),
+            role_hint=role_hint if isinstance(role_hint, str) and role_hint else None,  # type: ignore[arg-type]
+        ))
+    if not fields:
+        return {
+            "status": "failed",
+            "narration": "fill_form: no usable field entries",
+            "error_message": "all entries missing label",
+            "extracted_text": "",
+            "details": {"fill_form": "no_usable_entries"},
+        }
+
+    # Decorate the form_fill events with run/step/turn context so
+    # the live feed can scope them.
+    def _decorated_emit(t: str, d: dict) -> None:
+        if emit_event is None:
+            return
+        try:
+            payload = dict(d)
+            payload.setdefault("run_id", submodule_run_id)
+            payload.setdefault("step_id", submodule_step_id)
+            payload.setdefault("turn", turn_idx)
+            emit_event(t, payload)
+        except Exception:
+            pass
+
+    result = run_form_fill(
+        page,
+        fields=fields,
+        submit_label=submit_label,
+        emit_event=_decorated_emit,
+    )
+
+    filled = result.filled_count
+    misses = result.miss_count
+    total = len(result.fields)
+    seconds = result.total_seconds
+
+    # Status policy:
+    #   - any miss on a required field → failed
+    #   - submit validation_error → failed
+    #   - everything filled + submit ok / skipped → ok
+    required_miss = any(
+        o.status == "miss"
+        and any(
+            ff.label == o.label and ff.required for ff in fields
+        )
+        for o in result.fields
+    )
+    if result.submit_status == "validation_error":
+        status = "failed"
+    elif required_miss:
+        status = "failed"
+    elif result.submit_status in ("ok", "no_submit"):
+        status = "ok"
+    elif result.submit_status == "error":
+        status = "failed"
+    else:
+        status = "ok"
+
+    narration = (
+        f"fill_form: {filled}/{total} fields set"
+        + (f", {misses} missed" if misses else "")
+        + (
+            f"; submit={result.submit_status}"
+            f"{f' ({result.submit_message[:120]})' if result.submit_message else ''}"
+        )
+        + f" — {seconds}s"
+    )
+    error_message = None
+    if status == "failed":
+        bits: list[str] = []
+        if required_miss:
+            bits.append(
+                "required field(s) could not be filled: "
+                + ", ".join(
+                    o.label for o in result.fields
+                    if o.status == "miss"
+                )
+            )
+        if result.submit_status == "validation_error":
+            bits.append(
+                "validation errors on: "
+                + ", ".join(result.validation_fields[:6])
+            )
+        if result.submit_status == "error":
+            bits.append(f"submit error: {result.submit_message}")
+        error_message = " | ".join(bits) or "fill_form failed"
+
+    return {
+        "status": status,
+        "narration": narration,
+        "error_message": error_message,
+        "extracted_text": "",
+        "details": {
+            "fill_form": {
+                "total": total,
+                "filled": filled,
+                "miss": misses,
+                "submit_status": result.submit_status,
+                "validation_fields": result.validation_fields,
+                "seconds": seconds,
+                "fields": [
+                    {
+                        "label": o.label,
+                        "role": o.role,
+                        "status": o.status,
+                        "attempts": o.attempts,
+                        "error": o.error[:200] if o.error else "",
+                    }
+                    for o in result.fields
+                ],
+            },
+        },
+    }
+
+
+# Phase J.4 — entity-creation detector. Examines the goal text and
+# the fill_form payload to decide whether THIS submission produced
+# a new persistent entity (role, user, project, chainage, …) and,
+# if so, records it on WorldState so subsequent submodules can
+# REUSE it instead of re-creating.
+_ENTITY_KIND_HINTS: tuple[tuple[str, str], ...] = (
+    # Order matters — longer / more specific phrases first so
+    # "user role" doesn't match before "role".
+    ("chainage", "chainage"),
+    ("user", "user"),
+    ("role", "role"),
+    ("project", "project"),
+    ("client", "client"),
+    ("vendor", "vendor"),
+    ("organisation", "organisation"),
+    ("organization", "organisation"),
+    ("group", "group"),
+    ("team", "team"),
+    ("policy", "policy"),
+    ("permission", "permission"),
+    ("contract", "contract"),
+    ("template", "template"),
+    ("workflow", "workflow"),
+    ("schedule", "schedule"),
+    ("task", "task"),
+)
+
+_CREATE_VERB_HINTS: tuple[str, ...] = (
+    "create", "add", "register", "make", "new ", "+create",
+    "+ create", "+add", "+ add",
+)
+
+
+def _record_entity_from_fill_form(
+    *,
+    world_state: dict[str, Any] | None,
+    goal_text: str,
+    args: dict[str, Any],
+    page_url: str,
+) -> None:
+    """Post-fill_form hook: write to ``world_state.entities_created``
+    when the goal text indicates a create flow + we can identify the
+    entity from the submitted fields. Safe no-op when:
+      - ``world_state`` is None (legacy run)
+      - the goal text doesn't include a create verb
+      - no entity kind hint matches the goal
+      - the form_fields payload doesn't yield an identity
+    """
+    if not isinstance(world_state, dict):
+        return
+    text = (goal_text or "").lower()
+    if not any(v in text for v in _CREATE_VERB_HINTS):
+        return
+    kind: str | None = None
+    for needle, normalized in _ENTITY_KIND_HINTS:
+        if needle in text:
+            kind = normalized
+            break
+    if kind is None:
+        return
+
+    # Parse the form_fields payload (JSON string) and pick the most
+    # likely identity. Order of preference:
+    #   1. A field whose label matches "name" / "title" / "id" / "code"
+    #      (case-insensitive substring match).
+    #   2. The first non-empty textbox value.
+    import json as _json  # noqa: PLC0415
+
+    raw_fields = args.get("form_fields") or ""
+    try:
+        parsed = _json.loads(raw_fields) if raw_fields else []
+    except Exception:
+        return
+    if not isinstance(parsed, list) or not parsed:
+        return
+
+    identity: str | None = None
+    identity_label = ""
+    preferred_keys = ("name", "title", "identifier", "id", "code", "username")
+    for k in preferred_keys:
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("label", "")).strip()
+            val = str(entry.get("value", "")).strip()
+            if not label or not val:
+                continue
+            if k in label.lower():
+                identity = val
+                identity_label = label
+                break
+        if identity is not None:
+            break
+    if identity is None:
+        # Fallback: first non-empty textbox-style value (skip the
+        # compound-widget DSL values).
+        for entry in parsed:
+            if not isinstance(entry, dict):
+                continue
+            role_hint = str(entry.get("role_hint") or "")
+            if role_hint in (
+                "permission_tree", "paginated_resource_table",
+                "checkbox", "radio",
+            ):
+                continue
+            val = str(entry.get("value", "")).strip()
+            if val:
+                identity = val
+                identity_label = str(entry.get("label", "")).strip()
+                break
+    if not identity:
+        return
+
+    try:
+        from app.services.world_state import (  # noqa: PLC0415
+            record_entity_created,
+        )
+        record_entity_created(
+            world_state,
+            kind=kind,
+            identity=identity,
+            url=page_url,
+        )
+        logger.info(
+            "WorldState: recorded %s=%r (field=%r)",
+            kind, identity, identity_label,
+        )
+    except Exception as e:
+        logger.debug(
+            "record_entity_created failed: %s", e,
+        )
+
+
 def _execute_tool_call(
     page,
     tool: str,
@@ -2213,9 +3718,18 @@ def _execute_tool_call(
     *,
     plan_target_url: str,
     speed_config,
+    emit_event: Callable[[str, dict], None] | None = None,
+    submodule_run_id: int | None = None,
+    submodule_step_id: int | None = None,
+    turn_idx: int | None = None,
 ) -> dict[str, Any]:
     """Execute one action tool. Returns a dict with status / narration /
     error / extracted_text. Meta tools never come here.
+
+    ``emit_event`` + ``submodule_run_id`` / ``submodule_step_id`` are
+    optional; the bundled ``fill_form`` routine uses them to push
+    per-field progress events into the live feed. Other tool branches
+    don't need them.
     """
     if tool == "scroll":
         status, narration, error = _do_scroll(page, args)
@@ -2263,6 +3777,20 @@ def _execute_tool_call(
             "details": {},
         }
 
+    # Phase F — bundled fill_form. Intercepts BEFORE the generic
+    # dispatcher because it isn't a single primitive — it's an
+    # orchestrated routine with enumerate / per-widget fill /
+    # validation retry / submit.
+    if tool == "fill_form":
+        return _dispatch_fill_form(
+            page,
+            args=args,
+            emit_event=emit_event,
+            submodule_run_id=submodule_run_id,
+            submodule_step_id=submodule_step_id,
+            turn_idx=turn_idx,
+        )
+
     # Wrapped action tools — go through the existing dispatcher.
     # Map agent tool name to the dispatcher's action_type.
     action_type = tool  # one-to-one
@@ -2276,6 +3804,62 @@ def _execute_tool_call(
             highlight_target(page, target.locator, duration_ms=1500)
         except Exception:
             pass
+
+    # Phase A.6 Step 2 — pre-click drawer scroll. When the agent is
+    # about to click a submit-like button (Save / Create / Submit /
+    # Confirm), proactively scroll the active drawer to the bottom
+    # so the button is in view. No-op when no drawer exists. Cheap
+    # (one JS evaluate), eliminates the common "filled the form but
+    # never found Save because it was below the fold" failure mode.
+    if action_type == "click" and ctx.target_hint:
+        hint_lower = (ctx.target_hint or "").lower()
+        if any(s in hint_lower for s in (
+            "save", "create", "submit", "confirm", "update",
+            "add ", "add ", "publish", "apply",
+        )):
+            try:
+                from app.executor.actions import (  # noqa: PLC0415
+                    scroll_drawer_to_bottom,
+                )
+                scroll_drawer_to_bottom(page)
+            except Exception:
+                pass
+            # Phase A.6 Step 3 — empty-required-field safety net.
+            # Scan the visible form for [required] / [aria-required]
+            # fields that are still empty. If any → DON'T dispatch
+            # the submit; return an outcome that tells the agent
+            # which fields to fill. Catches "scout missed a field"
+            # AND "agent skipped a field" in one shot.
+            try:
+                from app.agents.form_signals import (  # noqa: PLC0415
+                    find_empty_required_fields,
+                )
+                missing = find_empty_required_fields(page)
+            except Exception:
+                missing = []
+            if missing:
+                missing_str = [
+                    f"{m.label} ({m.role})" for m in missing[:10]
+                ]
+                return {
+                    "status": "failed",
+                    "narration": (
+                        "Pre-submit check blocked the click: "
+                        f"{len(missing_str)} required field(s) still "
+                        "empty — " + ", ".join(missing_str[:6])
+                    ),
+                    "error_message": (
+                        "REQUIRED FIELDS EMPTY: "
+                        + ", ".join(missing_str)
+                        + " — fill these first, then resubmit. Do "
+                        "NOT mark the sub-goal done."
+                    ),
+                    "extracted_text": "",
+                    "details": {
+                        "pre_submit_check": "blocked",
+                        "missing_required": missing_str,
+                    },
+                }
 
     try:
         result = execute_action(page, action_type, ctx)
@@ -2393,6 +3977,13 @@ def run_agent_for_goal(
     # ``som_enabled`` toggles Set-of-Mark annotation on screenshots
     # sent to ALL helper VL calls; defaults from ``app_settings``.
     som_enabled: bool = True,
+    # Phase A.6 Step 6 — plan-wide submodule summary so the
+    # reconciliation pass (which runs ONCE after first-time scout)
+    # can compare the AppMap against EVERY submodule, not just the
+    # current one. List of ``{submodule_id, title, description}``.
+    # Passed in by ``run_qa_agent_for_plan``; None disables
+    # reconciliation.
+    plan_submodules_summary: list[dict[str, Any]] | None = None,
 ) -> AgentSubmoduleResult:
     """Drive ONE submodule to completion via the observe-think-act loop.
 
@@ -2566,6 +4157,61 @@ def run_agent_for_goal(
     # speculatively). When skipped or unsuccessful, the agent's main
     # loop takes over — auth-flow failure is non-fatal.
     auth_used_manual_intervention = False
+    # Phase F.1 — HITL defensive counters. ONE overlay per submodule;
+    # any further stall after the user already gave guidance halts
+    # the submodule cleanly with halt_reason="hitl_exhausted". Avoids
+    # the "user submits, page doesn't move, HITL re-opens, user
+    # confused, run looks frozen" loop.
+    hitl_attempts_this_submodule = 0
+    HITL_MAX_PER_SUBMODULE = 1
+    # Track how many turns since the last HITL submission. If 3
+    # consecutive post-HITL turns pick no-op tools (wait/verify/
+    # extract_text) with no page change, we halt with
+    # halt_reason="planner_no_op_after_hitl" rather than letting the
+    # operator think the run is frozen.
+    turns_since_hitl_consumed: int | None = None
+    POST_HITL_NOOP_WINDOW = 3
+    _POST_HITL_NOOP_TOOLS = frozenset({
+        "wait", "verify", "extract_text",
+    })
+    post_hitl_noop_streak = 0
+    # Phase I.1 — universal "action with no observable effect" guard.
+    # The existing post-HITL detector only catches passive tools
+    # (wait / verify / extract_text); it misses the worst freeze mode
+    # where the agent fires action tools (click / type / fill_form)
+    # whose status="ok" but the page hash didn't advance — e.g. the
+    # agent clicks the form title "Create Role" thinking it's the
+    # Save button, every turn, forever. Triggers a clean halt after
+    # ``ACTION_NO_EFFECT_THRESHOLD`` consecutive such turns.
+    ACTION_NO_EFFECT_THRESHOLD = 4
+    action_no_effect_streak = 0
+    last_obs_hash_after_action: str | None = None
+    _ACTION_TOOLS_FOR_PROGRESS = frozenset({
+        "click", "type", "select", "fill_form", "scroll",
+        "navigate", "go_back", "dismiss_modal",
+    })
+    # Phase I.1 — tighter post-HITL obs-hash gate. The agent's planner
+    # can pick action tools repeatedly after HITL and still NOT move
+    # the page (clicking the wrong thing because of the same wrong
+    # belief). If ``POST_HITL_OBS_UNCHANGED_LIMIT`` consecutive turns
+    # post-HITL produce the same observation hash, halt — regardless
+    # of which tool was picked.
+    POST_HITL_OBS_UNCHANGED_LIMIT = 3
+    post_hitl_unchanged_turns = 0
+    obs_hash_at_hitl_submission: str | None = None
+    # Phase O.3 — confidence + mistake memory.
+    # The planner emits a self-reported confidence per turn. When 2
+    # consecutive non-HITL turns produce confidence < LOW_CONFIDENCE
+    # AND no observable progress (no sub-goal closed since the streak
+    # started), halt for HITL escalation INSTEAD of burning the rest
+    # of max_turns. The mistake memory captures (target_hint →
+    # failure_reason) so the next planner turn sees a "don't retry"
+    # block and picks a different approach.
+    LOW_CONFIDENCE = 0.5
+    low_confidence_streak = 0
+    sub_goals_closed_at_streak_start = 0
+    failed_approaches: list[dict[str, str]] = []
+    MAX_FAILED_APPROACHES_REMEMBERED = 8
     if (
         plan is not None
         and request_intervention is not None
@@ -2611,6 +4257,41 @@ def run_agent_for_goal(
                 ),
                 "error_message": auth_result.error_message,
             })
+            # Phase E — when auth succeeded, record the identity onto
+            # WorldState so subsequent submodules see "auth_status:
+            # logged_in" and don't waste turns trying to re-auth.
+            if auth_result.status == "ok" and plan is not None:
+                try:
+                    from app.services.world_state import (  # noqa: PLC0415
+                        record_auth_success,
+                    )
+                    # Pick the credential we actually used. Same
+                    # resolution as auth_flow._pick_credential.
+                    from app.agents.auth_flow import (  # noqa: PLC0415
+                        _pick_credential,
+                    )
+                    cred = _pick_credential(plan, page.url if page else "")
+                    if cred is not None:
+                        from app.security.vault import (  # noqa: PLC0415
+                            VaultError, read_credential,
+                        )
+                        try:
+                            cred_plain = read_credential(cred)
+                            record_auth_success(
+                                world_state,
+                                username=cred_plain.username,
+                            )
+                        except VaultError:
+                            # Vault decrypt failed — fall back to the
+                            # label so we still record SOMETHING.
+                            record_auth_success(
+                                world_state,
+                                username=cred.label or "unknown",
+                            )
+                except Exception as e:
+                    logger.debug(
+                        "WorldState auth update skipped: %s", e,
+                    )
             if auth_result.status == "cancelled":
                 halt_reason = "cancelled"
                 final_status = "blocked"
@@ -2637,6 +4318,147 @@ def run_agent_for_goal(
             logger.warning(
                 "auth_flow pre-run failed (%s); falling back to main "
                 "agent loop", e,
+            )
+
+    # ── Phase A.5: AppMap (mindmap) load + first-time scout ──────────
+    # Try to load a previously-saved AppMap for this target_url. When
+    # absent (first run against this app), inline-scout the post-auth
+    # surface to build one. The map is then passed to the decomposer
+    # as ground truth — real button labels, real form fields, real
+    # navigation. Subsequent submodules in the same run reuse the same
+    # map; subsequent RUNS against the same target_url reuse it via
+    # the AKB persistence layer.
+    app_map_for_decomposer: "Any | None" = None
+    if plan is not None and db is not None:
+        try:
+            from app.agents.app_map import (  # noqa: PLC0415
+                load_app_map, save_app_map, consolidate_app_map,
+            )
+            from app.agents.authenticated_scout import (  # noqa: PLC0415
+                run_authenticated_scout,
+            )
+            target = plan_target_url or (
+                getattr(plan, "target_url", "") or ""
+            )
+            existing_map = load_app_map(db, target_url=target)
+            if existing_map is not None:
+                app_map_for_decomposer = existing_map
+                _emit(emit_event, "app_map_loaded", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "modules": len(existing_map.modules),
+                    "create_flows": len(existing_map.create_flows),
+                    "pages_scouted": existing_map.pages_scouted,
+                })
+            else:
+                # First-time scouting for this target_url. Inline so
+                # the decomposer sees the map on this submodule; the
+                # UX overhead is ~30-90s on the FIRST submodule only.
+                # Skipped when we don't have a logged-in browser
+                # (no auth_flow ran or page is still on a login URL).
+                page_looks_logged_in = not _looks_like_login_page(page)
+                if page_looks_logged_in:
+                    _emit(emit_event, "app_map_scout_started", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "target_url": target,
+                    })
+                    scout = run_authenticated_scout(
+                        page,
+                        target_url=target,
+                        depth="deep",
+                        emit_event=emit_event,
+                        is_cancelled=is_cancelled,
+                        submodule_run_id=submodule_run_id,
+                    )
+                    if scout.error_message:
+                        logger.info(
+                            "auth scout partial: %s", scout.error_message,
+                        )
+                    if scout.pages:
+                        new_map, in_tok, out_tok = consolidate_app_map(
+                            provider,
+                            scout_result=scout,
+                            cheap_provider=cheap_provider,
+                            on_escalate=_emit_escalation,
+                        )
+                        if in_tok:
+                            total_input += in_tok
+                        if out_tok:
+                            total_output += out_tok
+                        try:
+                            save_app_map(
+                                db,
+                                target_url=target,
+                                app_map=new_map,
+                                source_run_id=submodule_run_id,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "app_map save failed (non-fatal): %s", e,
+                            )
+                        app_map_for_decomposer = new_map
+                        _emit(emit_event, "app_map_built", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "modules": len(new_map.modules),
+                            "create_flows": len(new_map.create_flows),
+                            "pages_scouted": new_map.pages_scouted,
+                        })
+                        # Phase A.6 Step 6 — plan ↔ AppMap reconciliation.
+                        # ONE VL call that compares every submodule
+                        # against the freshly-built map and tags each
+                        # as ok / uncertain / mismatch / missing.
+                        # User sees the report BEFORE execution
+                        # progresses past submodule 1.
+                        if plan_submodules_summary:
+                            try:
+                                from app.agents.app_map import (  # noqa: PLC0415
+                                    reconcile_plan_with_map,
+                                )
+                                rows, rin, rout = reconcile_plan_with_map(
+                                    provider,
+                                    app_map=new_map,
+                                    submodules=plan_submodules_summary,
+                                    cheap_provider=cheap_provider,
+                                    on_escalate=_emit_escalation,
+                                )
+                                if rin:
+                                    total_input += rin
+                                if rout:
+                                    total_output += rout
+                                if rows:
+                                    by_status: dict[str, int] = {}
+                                    for r in rows:
+                                        by_status[r.status] = (
+                                            by_status.get(r.status, 0) + 1
+                                        )
+                                    _emit(emit_event, "plan_reconciled", {
+                                        "run_id": submodule_run_id,
+                                        "step_id": submodule_step_id,
+                                        "counts": by_status,
+                                        "rows": [
+                                            {
+                                                "submodule_id": r.submodule_id,
+                                                "title": r.title,
+                                                "status": r.status,
+                                                "reason": r.reason,
+                                                "matched_module": r.matched_module,
+                                                "matched_create_flow": (
+                                                    r.matched_create_flow
+                                                ),
+                                            }
+                                            for r in rows
+                                        ],
+                                    })
+                            except Exception as e:
+                                logger.debug(
+                                    "reconciliation skipped: %s", e,
+                                )
+        except Exception as e:
+            logger.warning(
+                "AppMap load / scout failed (%s); decomposer falls "
+                "back to no-map mode", e,
             )
 
     # ── Phase A: vision-driven sub-goal decomposition ────────────────
@@ -2685,12 +4507,50 @@ def run_agent_for_goal(
         except Exception:
             akb_text = ""
 
+        # Phase B Step 3 — load frozen v2 segments as decomposer hints.
+        # When the submodule has a prior-run frozen path with the
+        # ``segments`` shape, we hand it to the decomposer as
+        # "re-emit this breakdown if the screen still supports it".
+        # The replay walker (Step 4) checks the resulting fresh
+        # sub-goals against the frozen segments and walks the
+        # proven steps deterministically when they line up.
+        frozen_hint: list[dict[str, Any]] | None = None
+        try:
+            tc_row = None
+            if db is not None:
+                tc_row = db.get(TcNode, goal.submodule_id)
+            existing_frozen = (
+                getattr(tc_row, "frozen_path", None) if tc_row else None
+            )
+            if (
+                isinstance(existing_frozen, dict)
+                and existing_frozen.get("version") == 2
+                and isinstance(existing_frozen.get("segments"), list)
+            ):
+                frozen_hint = [
+                    {
+                        "description": seg.get("description", ""),
+                        "success_criterion": seg.get(
+                            "success_criterion", "",
+                        ),
+                        "max_turns": seg.get("max_turns", 6),
+                    }
+                    for seg in existing_frozen["segments"]
+                    if isinstance(seg, dict)
+                ]
+        except Exception as e:
+            logger.debug("frozen-hint load skipped: %s", e)
+            frozen_hint = None
+
         decomp = decompose_goal(
             provider,
             goal_description=goal.description,
             goal_success_criteria=list(goal.success_criteria or []),
             screenshot_bytes=decomp_shot,
             akb_block=akb_text,
+            app_map=app_map_for_decomposer,
+            frozen_sub_goals_hint=frozen_hint,
+            world_state=world_state,
             cheap_provider=cheap_provider,
             on_escalate=_emit_escalation,
         )
@@ -2699,7 +4559,24 @@ def run_agent_for_goal(
         if decomp.output_tokens:
             total_output += decomp.output_tokens
         if decomp.sub_goals:
-            runtime_sub_goals = decomp.sub_goals
+            # Phase A.5 — hardcoded create→verify guarantor. Catches
+            # cases where the decomposer forgot rule 7g (verify-in-list
+            # for create flows). Deterministic; ~free.
+            from app.agents.sub_goals import (  # noqa: PLC0415
+                ensure_create_verify_pattern,
+            )
+            augmented, appended_verify = ensure_create_verify_pattern(
+                decomp.sub_goals,
+                goal_description=goal.description,
+                app_map=app_map_for_decomposer,
+            )
+            runtime_sub_goals = augmented
+            if appended_verify:
+                _emit(emit_event, "sub_goal_verify_appended", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "reason": "decomposer omitted verify-in-list step",
+                })
             # Mirror into the static SubGoal shape the existing planner
             # / on-track / freeze code expects.
             goal.sub_goals = [
@@ -2759,6 +4636,16 @@ def run_agent_for_goal(
                 })
 
     for turn_idx in range(1, max_turns + 1):
+        # Phase F.1 — per-turn heartbeat so the live feed never
+        # appears dead even on long-running observation / planner
+        # calls. Cheap event; no payload beyond turn index.
+        _emit(emit_event, "agent_turn_starting", {
+            "run_id": submodule_run_id,
+            "step_id": submodule_step_id,
+            "turn": turn_idx,
+            "max_turns": max_turns,
+        })
+
         # ── Cancellation check ─────────────────────────────────────
         if is_cancelled and is_cancelled():
             halt_reason = "cancelled"
@@ -2787,6 +4674,93 @@ def run_agent_for_goal(
         wait_for_settled(page, speed_config)
         observation = _capture_observation(page)
         obs_hash = _hash_observation(observation)
+
+        # Phase E — keep WorldState's current_url in sync each turn
+        # so the decomposer + planner see live location without an
+        # extra page round-trip. Cheap; no LLM.
+        try:
+            from app.services.world_state import (  # noqa: PLC0415
+                record_current_page,
+            )
+            record_current_page(
+                world_state,
+                url=observation.get("url"),
+            )
+        except Exception:
+            pass
+
+        # Phase I.1 — action-no-effect guard. Fires BEFORE the regular
+        # stall guard so we halt the burning-LLM-loop much earlier
+        # than the stall_threshold lets the existing path catch.
+        # Trigger: the previous turn picked an action tool, returned
+        # status="ok", but the observation hash didn't advance — i.e.
+        # the agent thinks it's clicking the right thing but the page
+        # doesn't agree.
+        if turn_log:
+            _last_t = turn_log[-1]
+            _was_action = _last_t.tool in _ACTION_TOOLS_FOR_PROGRESS
+            _ok = (_last_t.status == "ok")
+            if _was_action and _ok:
+                if (
+                    last_obs_hash_after_action is not None
+                    and obs_hash == last_obs_hash_after_action
+                ):
+                    action_no_effect_streak += 1
+                else:
+                    action_no_effect_streak = 0
+                last_obs_hash_after_action = obs_hash
+        if action_no_effect_streak >= ACTION_NO_EFFECT_THRESHOLD:
+            _emit(emit_event, "agent_action_no_effect_halt", {
+                "run_id": submodule_run_id,
+                "step_id": submodule_step_id,
+                "turn": turn_idx,
+                "streak": action_no_effect_streak,
+                "last_tool": (
+                    turn_log[-1].tool if turn_log else "(none)"
+                ),
+                "last_target": (
+                    (turn_log[-1].args.get("target_hint") or "")[:120]
+                    if turn_log else ""
+                ),
+            })
+            halt_reason = "agent_failed"
+            final_status = "blocked"
+            final_narration = (
+                f"Agent fired {action_no_effect_streak} consecutive "
+                "actions with no observable page change — halting "
+                "to avoid burning the LLM budget. Likely cause: the "
+                "planner is clicking a non-interactive label (e.g. "
+                "form title) thinking it's an action button."
+            )
+            final_error = "actions_no_effect"
+            break
+
+        # Phase I.1 — tighter post-HITL obs-hash gate. Independent of
+        # the no-op-tool detector below; this one catches "agent picks
+        # actions after HITL but page doesn't move".
+        if obs_hash_at_hitl_submission is not None:
+            if obs_hash == obs_hash_at_hitl_submission:
+                post_hitl_unchanged_turns += 1
+            else:
+                obs_hash_at_hitl_submission = None
+                post_hitl_unchanged_turns = 0
+            if post_hitl_unchanged_turns >= POST_HITL_OBS_UNCHANGED_LIMIT:
+                _emit(emit_event, "post_hitl_no_progress_halt", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "unchanged_turns": post_hitl_unchanged_turns,
+                })
+                halt_reason = "agent_failed"
+                final_status = "blocked"
+                final_narration = (
+                    f"After HITL guidance, page state has not moved "
+                    f"for {post_hitl_unchanged_turns} consecutive "
+                    "turns — halting. The human's input did not "
+                    "produce observable progress."
+                )
+                final_error = "post_hitl_no_progress"
+                break
 
         # Stall guard: if last `stall_threshold` observations are
         # identical AND we already took at least one action (so we're
@@ -2855,6 +4829,8 @@ def run_agent_for_goal(
                         cheap_provider=cheap_provider,
                         on_escalate=_emit_escalation,
                         replan_iteration=replans_used + 1,
+                        app_map=app_map_for_decomposer,
+                        world_state=world_state,
                     )
                     if rp.input_tokens:
                         total_input += rp.input_tokens
@@ -2894,10 +4870,233 @@ def run_agent_for_goal(
                         })
 
             if not replanned:
+                # Phase A.6 Step 0 — when replans are exhausted (or
+                # were disabled by plan setting), try the in-test-
+                # browser HITL overlay before giving up. The user
+                # draws on the screenshot + types guidance → we feed
+                # it back as a user_guidance observation and reset
+                # the stall counter. ONE overlay attempt per
+                # submodule's stall path; if the user skips / times
+                # out / further stall occurs after the guidance, we
+                # then halt with stall.
+                # Phase F.1 — use the counter, not a derived flag from
+                # final_error (which gets cleared on successful submit).
+                # Caps HITL to ``HITL_MAX_PER_SUBMODULE`` attempts per
+                # submodule so a user-submits-page-doesnt-move loop
+                # doesn't re-trigger the overlay forever.
+                hitl_attempted_already = (
+                    hitl_attempts_this_submodule >= HITL_MAX_PER_SUBMODULE
+                )
+                if (
+                    not hitl_attempted_already
+                    and runtime_sub_goals
+                    and request_intervention is not None
+                    and open_typed_prompt is not None
+                ):
+                    try:
+                        from app.executor.hitl_overlay import (  # noqa: PLC0415
+                            open_and_wait as _open_hitl_overlay,
+                        )
+                        from app.agents.page_intel import (  # noqa: PLC0415
+                            capture_screenshot_for_vision as _cap_shot,
+                        )
+                        cur_rsg = next(
+                            (rsg for rsg in runtime_sub_goals
+                             if rsg.status not in ("done", "skipped")),
+                            None,
+                        )
+                        # Build a "what I tried" summary from the
+                        # last 3 turns so the user sees context.
+                        tail = turn_log[-3:] if turn_log else []
+                        tried_lines = []
+                        for t in tail:
+                            tried_lines.append(
+                                f"T{t.turn} · {t.tool}({(t.args.get('target_hint','') or t.args.get('value',''))[:60]}) "
+                                f"→ {t.status}"
+                                + (f": {t.error_message[:120]}"
+                                   if t.error_message else "")
+                            )
+                        tried_summary = "\n".join(tried_lines) or "(no turn history)"
+                        try:
+                            stuck_shot = _cap_shot(page)
+                        except Exception:
+                            stuck_shot = b""
+                        # F.1 — count this attempt before the
+                        # blocking call so cancellation mid-wait
+                        # still decrements correctly.
+                        hitl_attempts_this_submodule += 1
+                        _emit(emit_event, "hitl_overlay_opened", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "sub_goal": (
+                                cur_rsg.description[:200]
+                                if cur_rsg else "(unknown)"
+                            ),
+                            "replans_used": replans_used,
+                            "attempt": hitl_attempts_this_submodule,
+                            "max_attempts": HITL_MAX_PER_SUBMODULE,
+                        })
+                        response = _open_hitl_overlay(
+                            page,
+                            sub_goal_description=(
+                                cur_rsg.description if cur_rsg else
+                                "Agent is stuck"
+                            ),
+                            tried_summary=tried_summary,
+                            screenshot_png=stuck_shot,
+                            idle_skip_seconds=15,
+                        )
+                        _emit(emit_event, "hitl_overlay_submitted", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "status": response.get("status", "error"),
+                            "text_preview": (
+                                str(response.get("text", ""))[:160]
+                            ),
+                        })
+                        if response.get("status") == "submitted":
+                            # Inject the user's guidance into the
+                            # next turn as a special observation.
+                            user_text = (response.get("text") or "").strip()
+                            drawing_b64 = response.get("drawing_b64") or ""
+                            pending_user_guidance = {
+                                "text": user_text,
+                                "drawing_b64": drawing_b64,
+                                "sub_goal_id": (
+                                    cur_rsg.id if cur_rsg else None
+                                ),
+                            }
+                            # Stash on the page_memory sidecar so the
+                            # next turn's prompt-builder finds it
+                            # (similar to the diff/screenshot side-
+                            # channels already used).
+                            page_memory.setdefault("_pending_hitl", []).append(
+                                pending_user_guidance,
+                            )
+                            # Mark the sub-goal we WERE on as
+                            # in-progress again, reset obs_hashes,
+                            # consume one of the "replan budget"
+                            # slots for telemetry, and continue.
+                            if cur_rsg is not None:
+                                cur_rsg.status = "pending"
+                                cur_rsg.reason = (
+                                    "human guidance received via "
+                                    "HITL overlay; retrying"
+                                )
+                            obs_hashes.clear()
+                            final_error = None  # clear the stall marker
+                            # Mark in the result that HITL was used
+                            # so freeze gate skips this run.
+                            auth_used_manual_intervention = True
+                            # Phase F.1 — start the no-op streak
+                            # tracker from this turn. If the next
+                            # POST_HITL_NOOP_WINDOW turns all pick
+                            # wait/verify/extract_text with no page
+                            # change, the run halts explicitly with
+                            # halt_reason="planner_no_op_after_hitl"
+                            # instead of looking frozen.
+                            turns_since_hitl_consumed = 0
+                            post_hitl_noop_streak = 0
+                            # Phase I.1 — capture obs hash at HITL
+                            # submission so the obs-hash gate above
+                            # can detect "page didn't move post-HITL"
+                            # regardless of which tools the agent picks.
+                            obs_hash_at_hitl_submission = obs_hash
+                            post_hitl_unchanged_turns = 0
+                            # Also reset the action-no-effect streak —
+                            # the human's input is a fresh start; we
+                            # don't want pre-HITL stuckness to count.
+                            action_no_effect_streak = 0
+                            last_obs_hash_after_action = None
+                            # Phase C.1 — wallclock grace. The user
+                            # might have spent 10-15s reading + drawing
+                            # + typing inside the overlay. Without
+                            # this grace the next turn's wallclock
+                            # guard can fire immediately ("max_wallclock")
+                            # and silently halt the run before the
+                            # planner even sees the guidance. Push
+                            # the cap out by ``HITL_GRACE_SECONDS``
+                            # one-shot per HITL submission.
+                            HITL_GRACE_SECONDS = 60
+                            max_wallclock_s += HITL_GRACE_SECONDS
+                            logger.info(
+                                "HITL guidance accepted; "
+                                "max_wallclock extended by %ds "
+                                "(now %ds)",
+                                HITL_GRACE_SECONDS, max_wallclock_s,
+                            )
+                            # Skip the halt — continue the turn loop.
+                            continue
+                        elif response.get("status") in (
+                            "skipped", "idle_timeout",
+                        ):
+                            # Phase J.3 — idle/skip escalates the
+                            # whole submodule, not just the current
+                            # sub-goal. The old behavior ("mark this
+                            # sub-goal skipped, advance to the next")
+                            # was a re-entry trap: the page hadn't
+                            # moved, so the next sub-goal also
+                            # couldn't make progress, stall triggered
+                            # again, and the user saw the same screen
+                            # hang again. Idle = user is gone or
+                            # doesn't know; do NOT silently try the
+                            # rest of the plan on a screen they
+                            # already gave up on.
+                            skip_reason = (
+                                "user skipped via HITL overlay"
+                                if response.get("status") == "skipped"
+                                else "auto-skipped after 15s idle"
+                            )
+                            # Mark the current AND remaining sub-goals
+                            # as skipped so the report shows the
+                            # whole submodule was abandoned at this
+                            # point.
+                            for _rsg in runtime_sub_goals:
+                                if _rsg.status in ("pending", "in_progress"):
+                                    _rsg.status = "skipped"
+                                    _rsg.reason = skip_reason
+                                    _rsg.ended_at_turn = turn_idx
+                            _emit(emit_event, "submodule_abandoned_via_hitl", {
+                                "run_id": submodule_run_id,
+                                "step_id": submodule_step_id,
+                                "reason": skip_reason,
+                                "remaining_sub_goals": sum(
+                                    1 for r in runtime_sub_goals
+                                    if r.status == "skipped"
+                                ),
+                            })
+                            halt_reason = "agent_failed"
+                            final_status = "blocked"
+                            final_narration = (
+                                "Submodule abandoned after HITL "
+                                f"{skip_reason}. The screen had not "
+                                "moved before HITL fired and no "
+                                "guidance was provided; advancing "
+                                "to the next submodule instead of "
+                                "spinning on the same state."
+                            )
+                            final_error = "hitl_submodule_abandoned"
+                            break
+                        else:
+                            # error / no-response — fall through to
+                            # the stall halt path below.
+                            final_error = "hitl_overlay_error"
+                    except Exception as e:
+                        logger.warning(
+                            "HITL overlay invocation failed: %s — "
+                            "halting with stall", e,
+                        )
+                        final_error = f"hitl_overlay_error: {e!s}"[:200]
+
                 halt_reason = "stall"
                 final_status = "inconclusive"
                 final_narration = (
-                    f"Page unchanged for {stall_threshold} consecutive turns"
+                    f"Page unchanged for {stall_threshold} consecutive "
+                    f"turns; replans={replans_used}/{max_replans}; "
+                    "HITL attempted="
+                    + ("yes" if final_error and "hitl_overlay" in (
+                        final_error or ""
+                    ) else "no")
                 )
                 break
 
@@ -2928,6 +5127,87 @@ def run_agent_for_goal(
             f"\nWHAT CHANGED SINCE LAST TURN:\n{diff_text}\n"
             if diff_text else ""
         )
+
+        # Phase A.6 Step 1 — pop any pending FORM SIGNAL (toast /
+        # inline error from the previous submit) into this turn's
+        # prompt so the agent reads "after your Save click, a toast
+        # said 'Display Name is required'" before picking the next
+        # tool. Consumed once so we don't keep nagging.
+        form_signal_block = ""
+        pending_signals = page_memory.get("_pending_signals") or []
+        if pending_signals:
+            sig = pending_signals.pop(0)
+            kind_l = str(sig.get("kind") or "")
+            msg = str(sig.get("message") or "")[:300]
+            fields = sig.get("fields") or []
+            kind_label = {
+                "toast_error": "ERROR TOAST",
+                "toast_warning": "WARNING TOAST",
+                "toast_info": "INFO TOAST",
+                "toast_success": "SUCCESS TOAST",
+                "inline_error": "INLINE FORM ERROR",
+                "validation_error": "VALIDATION ERROR",
+            }.get(kind_l, "FORM SIGNAL")
+            fields_str = (
+                f" (fields: {', '.join(fields[:5])})"
+                if fields else ""
+            )
+            form_signal_block = (
+                f"\nFORM SIGNAL after your previous submit "
+                f"({kind_label}){fields_str}:\n"
+                f"  \"{msg}\"\n"
+                "Treat this as authoritative — the app rejected or "
+                "confirmed the submit. If it's an error, fix the "
+                "called-out fields then resubmit. If it's a success "
+                "toast, advance to the next sub-goal.\n"
+            )
+
+        # Phase A.6 Step 0 — pop any pending HITL guidance from the
+        # user's overlay submission into THIS turn's prompt. The
+        # guidance is consumed once (popped) so subsequent turns
+        # aren't repeatedly told the same thing — if the user wants
+        # to guide again, the overlay opens again on the next stall.
+        hitl_guidance_block = ""
+        # Phase N — capture the popped HITL so the planner-bypass
+        # downstream can read it. Set to the dict that was popped or
+        # None when no HITL is pending this turn.
+        pending_hitl_consumed_this_turn: dict[str, Any] | None = None
+        pending_hitl_queue = page_memory.get("_pending_hitl") or []
+        if pending_hitl_queue:
+            g = pending_hitl_queue.pop(0)
+            pending_hitl_consumed_this_turn = g
+            txt = (g.get("text") or "").strip()
+            if txt:
+                hitl_guidance_block = (
+                    "\nUSER GUIDANCE (from a human watching the run — "
+                    "treat as authoritative; previous attempts stalled "
+                    "and the user manually pointed out the next step):\n"
+                    f"  {txt}\n"
+                )
+            # Note: we keep `g["drawing_b64"]` for telemetry but
+            # don't re-attach the drawing as an image here — vision-
+            # on-demand will surface it next turn if the action
+            # fails. (Avoids ballooning every subsequent turn's
+            # image payload.)
+            if g.get("drawing_b64"):
+                hitl_guidance_block += (
+                    "  (The user also drew on the screenshot to point "
+                    "at the correct element; if you struggle, look at "
+                    "the attached screenshot for marks.)\n"
+                )
+            # Phase C.1 — emit a visible event so the operator KNOWS
+            # the guidance reached the planner's prompt for this turn.
+            # Closes the "I submitted but nothing happened" feedback
+            # gap. The next agent_acted event shows what the planner
+            # decided to do with the guidance.
+            _emit(emit_event, "hitl_overlay_consumed", {
+                "run_id": submodule_run_id,
+                "step_id": submodule_step_id,
+                "turn": turn_idx,
+                "sub_goal_id": g.get("sub_goal_id"),
+                "guidance_preview": txt[:240],
+                "has_drawing": bool(g.get("drawing_b64")),
+            })
 
         # A4.1c: mid-flow vision check. Every ``on_track_interval``
         # turns, ask a vision LLM whether the agent is still making
@@ -3146,14 +5426,77 @@ def run_agent_for_goal(
             f"{ws_block}"      # α.5 — WorldState across submodules
             f"{vision_note}"
             f"{diff_block}"
+            f"{form_signal_block}"
+            f"{hitl_guidance_block}"
             f"{on_track_block}"
             f"{memory_block}"
             f"{graph_block}\n"
+            f"{_format_failed_approaches_block(failed_approaches)}"
             f"{_format_goal_for_prompt(goal, turn_idx=turn_idx)}\n\n"
             f"HISTORY (last few turns):\n{_format_history_for_prompt(turn_log)}\n\n"
             f"{obs_block}\n\n"
             f"This is turn {turn_idx}/{max_turns}. Pick ONE tool."
         )
+
+        # Phase N — HITL → direct action dispatch. When the previous
+        # turn(s) submitted HITL guidance, BYPASS the planner and turn
+        # the human's input directly into one tool call. The user's
+        # input is authoritative; we don't ask the LLM to "consider"
+        # it among other options.
+        hitl_direct_parsed: dict[str, Any] | None = None
+        if pending_hitl_consumed_this_turn is not None:
+            try:
+                # Use the screenshot we already have for this turn's
+                # observation — the HITL drawing is interpreted RELATIVE
+                # to it.
+                from app.agents.page_intel import (  # noqa: PLC0415
+                    capture_screenshot_for_vision as _cap_hitl,
+                )
+                hitl_shot = _cap_hitl(page)
+            except Exception:
+                hitl_shot = None
+            hitl_direct_parsed = _interpret_hitl_as_action(
+                pending_hitl=pending_hitl_consumed_this_turn,
+                screenshot=hitl_shot,
+                provider=provider,
+                cheap_provider=cheap_provider,
+            )
+            if hitl_direct_parsed is not None:
+                _emit(emit_event, "hitl_direct_dispatch", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "tool": hitl_direct_parsed.get("tool"),
+                    "target_hint": (
+                        hitl_direct_parsed.get("target_hint") or ""
+                    )[:120],
+                    "confidence": hitl_direct_parsed.get("confidence"),
+                    "via_coord": (
+                        hitl_direct_parsed.get("_hitl_coord_x") is not None
+                    ),
+                })
+                # Account for the interpreter call's tokens.
+                tin = hitl_direct_parsed.pop("_hitl_tokens_in", 0)
+                tout = hitl_direct_parsed.pop("_hitl_tokens_out", 0)
+                if isinstance(tin, int):
+                    total_input += tin
+                if isinstance(tout, int):
+                    total_output += tout
+                llm_calls += 1
+
+        # Phase N — when the HITL bypass produced a tool call, use it
+        # directly and skip the planner LLM call entirely. The user's
+        # instruction is authoritative; we don't run the planner.
+        if hitl_direct_parsed is not None:
+            class _HitlResult:
+                def __init__(self, parsed):
+                    self.parsed = parsed
+                    self.input_tokens = 0
+                    self.output_tokens = 0
+            llm_result = _HitlResult(hitl_direct_parsed)
+            # Consume the screenshot — we already used it for the
+            # HITL interpreter call above.
+            pending_screenshot = None
 
         try:
             user_msg = ChatMessage(
@@ -3163,49 +5506,54 @@ def run_agent_for_goal(
             )
             import time as _planner_time  # noqa: PLC0415
             _planner_t0 = _planner_time.monotonic()
-            llm_result = provider.chat_structured(
-                messages=[
-                    ChatMessage(role="system", content=SYSTEM_PROMPT),
-                    user_msg,
-                ],
-                schema=TOOL_CALL_SCHEMA,
-                schema_name="qa_tool_call",
-                temperature=0.3,
-                # TOOL_CALL_SCHEMA requires ~200-300 output tokens
-                # at the median (tool name + args + reasoning + a
-                # short page_memory_note). 512 leaves comfortable
-                # headroom for verbose reasoning while cutting the
-                # tail-latency / cost ceiling vs the prior 1024.
-                max_output_tokens=512,
-            )
-            # Cost: planner call goes direct to the strong provider
-            # (bypasses the tier router because the planner is
-            # always strong-only). Record manually with role +
-            # model + duration so the drill-in view shows one
-            # ``planner`` row per turn.
-            try:
-                from app.llm.cost_tracker import (  # noqa: PLC0415
-                    record_call,
-                )
-                record_call(
-                    "strong",
-                    llm_result.input_tokens,
-                    llm_result.output_tokens,
-                    role="planner",
-                    model=getattr(provider, "model", None),
-                    cached_input_tokens=getattr(
-                        llm_result, "cached_input_tokens", None,
-                    ),
-                    duration_ms=int(
-                        (_planner_time.monotonic() - _planner_t0) * 1000,
-                    ),
-                )
-            except Exception:
+            if hitl_direct_parsed is not None:
+                # HITL bypass already populated llm_result above.
+                # Skip the planner LLM round-trip.
                 pass
-            if attach_screenshot:
-                vision_calls += 1
-            # Consume the screenshot — only attached once per failure.
-            pending_screenshot = None
+            else:
+                llm_result = provider.chat_structured(
+                    messages=[
+                        ChatMessage(role="system", content=SYSTEM_PROMPT),
+                        user_msg,
+                    ],
+                    schema=TOOL_CALL_SCHEMA,
+                    schema_name="qa_tool_call",
+                    temperature=0.3,
+                    # TOOL_CALL_SCHEMA requires ~200-300 output tokens
+                    # at the median (tool name + args + reasoning + a
+                    # short page_memory_note). 512 leaves comfortable
+                    # headroom for verbose reasoning while cutting the
+                    # tail-latency / cost ceiling vs the prior 1024.
+                    max_output_tokens=512,
+                )
+                # Cost: planner call goes direct to the strong provider
+                # (bypasses the tier router because the planner is
+                # always strong-only). Record manually with role +
+                # model + duration so the drill-in view shows one
+                # ``planner`` row per turn.
+                try:
+                    from app.llm.cost_tracker import (  # noqa: PLC0415
+                        record_call,
+                    )
+                    record_call(
+                        "strong",
+                        llm_result.input_tokens,
+                        llm_result.output_tokens,
+                        role="planner",
+                        model=getattr(provider, "model", None),
+                        cached_input_tokens=getattr(
+                            llm_result, "cached_input_tokens", None,
+                        ),
+                        duration_ms=int(
+                            (_planner_time.monotonic() - _planner_t0) * 1000,
+                        ),
+                    )
+                except Exception:
+                    pass
+                if attach_screenshot:
+                    vision_calls += 1
+                # Consume the screenshot — only attached once per failure.
+                pending_screenshot = None
         except Exception as e:
             halt_reason = "agent_failed"
             final_status = "inconclusive"
@@ -3219,11 +5567,15 @@ def run_agent_for_goal(
             logger.warning("agent LLM error: %s", e, exc_info=True)
             break
 
-        llm_calls += 1
-        if isinstance(llm_result.input_tokens, int):
-            total_input += llm_result.input_tokens
-        if isinstance(llm_result.output_tokens, int):
-            total_output += llm_result.output_tokens
+        # Phase N — when the HITL bypass ran, llm_calls + token totals
+        # were already credited inside the bypass block (the interpreter
+        # call). Don't double-count.
+        if hitl_direct_parsed is None:
+            llm_calls += 1
+            if isinstance(llm_result.input_tokens, int):
+                total_input += llm_result.input_tokens
+            if isinstance(llm_result.output_tokens, int):
+                total_output += llm_result.output_tokens
 
         parsed = llm_result.parsed
         if not isinstance(parsed, dict) or not parsed.get("tool"):
@@ -3261,6 +5613,145 @@ def run_agent_for_goal(
             if completed_sg_id:
                 for sg in goal.sub_goals:
                     if sg.id == completed_sg_id and sg.status != "done":
+                        # Phase A.6 Step 4 — verify-in-list gate.
+                        # The auto-appended verify sub-goal has id
+                        # ending in "_verify" (see
+                        # ensure_create_verify_pattern). When the
+                        # agent tries to close it, we deterministically
+                        # check that the entity name typed earlier in
+                        # this submodule actually appears in visible
+                        # text on the page. If not → refuse the close
+                        # + emit an event so the live feed shows why.
+                        is_verify_subgoal = sg.id.endswith("_verify")
+                        if is_verify_subgoal:
+                            recent_typed = _last_typed_entity_value(
+                                turn_log,
+                            )
+                            actually_visible = False
+                            if recent_typed:
+                                try:
+                                    actually_visible = bool(
+                                        page.evaluate(
+                                            "(needle) => {"
+                                            "  const t = (document.body."
+                                            "innerText || '');"
+                                            "  return t.toLowerCase()"
+                                            ".includes(needle"
+                                            ".toLowerCase());"
+                                            "}",
+                                            recent_typed,
+                                        ),
+                                    )
+                                except Exception:
+                                    actually_visible = False
+                            if recent_typed and not actually_visible:
+                                _emit(emit_event, "verify_check_failed", {
+                                    "run_id": submodule_run_id,
+                                    "step_id": submodule_step_id,
+                                    "sub_goal_id": sg.id,
+                                    "looked_for": recent_typed[:80],
+                                    "reason": (
+                                        "entity name not found in "
+                                        "visible page text — search "
+                                        "or scroll to locate the row "
+                                        "before marking this complete"
+                                    ),
+                                })
+                                # Refuse the close. Inject a one-shot
+                                # signal block so the next turn's
+                                # prompt explains why; the planner
+                                # will then use the search/filter.
+                                page_memory.setdefault(
+                                    "_pending_signals", [],
+                                ).append({
+                                    "turn": turn_idx,
+                                    "kind": "validation_error",
+                                    "message": (
+                                        f"Verify gate refused: the "
+                                        f"name '{recent_typed[:60]}' "
+                                        "is NOT visible in the page "
+                                        "text right now. Use the "
+                                        "list's search/filter input "
+                                        "(or scroll) to surface the "
+                                        "new row, THEN mark "
+                                        f"{sg.id} done."
+                                    ),
+                                    "fields": [],
+                                })
+                                # Keep the sub-goal in_progress.
+                                if sg.status == "pending":
+                                    sg.status = "in_progress"
+                                continue
+
+                        # Phase O.1 — generalized success_criterion
+                        # verification gate. The agent's claim to close
+                        # a sub-goal is checked against the criterion
+                        # text via deterministic patterns (URL contains,
+                        # quoted-text visible, drawer-state matches,
+                        # toast visible). When the page disagrees, we
+                        # refuse the close and inject a one-shot signal
+                        # so the next turn fixes it BEFORE advancing.
+                        # Without this, "I clicked Save" becomes
+                        # mark-the-sub-goal-done on faith — the source
+                        # of the "claim success without checking"
+                        # hallucination mode.
+                        rsg_match = next(
+                            (
+                                r for r in runtime_sub_goals
+                                if r.id == sg.id
+                            ),
+                            None,
+                        )
+                        criterion_text = (
+                            rsg_match.success_criterion if rsg_match
+                            else ""
+                        )
+                        if criterion_text:
+                            try:
+                                ok_obs, reason = (
+                                    _verify_subgoal_criterion(
+                                        page,
+                                        criterion=criterion_text,
+                                        observation=observation,
+                                    )
+                                )
+                            except Exception:
+                                ok_obs, reason = (
+                                    True,
+                                    "criterion check raised — gate skipped",
+                                )
+                            if not ok_obs:
+                                _emit(
+                                    emit_event,
+                                    "sub_goal_criterion_unmet",
+                                    {
+                                        "run_id": submodule_run_id,
+                                        "step_id": submodule_step_id,
+                                        "sub_goal_id": sg.id,
+                                        "criterion": criterion_text[:200],
+                                        "reason": reason[:200],
+                                    },
+                                )
+                                page_memory.setdefault(
+                                    "_pending_signals", [],
+                                ).append({
+                                    "turn": turn_idx,
+                                    "kind": "subgoal_unmet",
+                                    "message": (
+                                        f"Sub-goal {sg.id} close refused: "
+                                        f"the success_criterion "
+                                        f"({criterion_text[:120]!r}) is "
+                                        f"NOT observable on the current "
+                                        f"page — {reason[:160]}. Take "
+                                        "another action to make the "
+                                        "criterion observable BEFORE "
+                                        "claiming completion."
+                                    ),
+                                    "fields": [],
+                                })
+                                if sg.status == "pending":
+                                    sg.status = "in_progress"
+                                continue
                         sg.status = "done"
                         sg.completed_at_turn = turn_idx
                         _emit(emit_event, "sub_goal_progress", {
@@ -3383,6 +5874,79 @@ def run_agent_for_goal(
                 t.tool in ("verify", "extract_text") and t.status == "ok"
                 for t in turn_log
             )
+
+            # Phase Q.2 — create-flow Save gate. When the goal text
+            # says "create / add / register / make a <X>" and the
+            # turn history contains NO successful submit-class action
+            # (fill_form with submit_status='ok', OR a verify of a
+            # post-create signal like a created-toast or list-row),
+            # the role / user / record was never actually persisted —
+            # the drawer might be closed but the backend never got
+            # the POST. Refuse the mark_goal_complete and inject a
+            # signal so the next turn knows to fix it.
+            create_save_ok = True
+            goal_text_lower = (goal.description or "").lower()
+            is_create_goal = any(
+                v in goal_text_lower for v in (
+                    "create", "add new", "+add", "register",
+                    "make a", "make an", "new ", "set up",
+                )
+            )
+            if is_create_goal:
+                saved = any(
+                    (
+                        t.tool == "fill_form"
+                        and t.status == "ok"
+                        and isinstance(t.details, dict)
+                        and (
+                            (t.details.get("fill_form") or {}).get(
+                                "submit_status",
+                            ) == "ok"
+                        )
+                    )
+                    or (
+                        t.tool in ("click", "type")
+                        and t.status == "ok"
+                        and any(
+                            kw in (
+                                (t.args.get("target_hint") or "")
+                                + " "
+                                + (t.args.get("value") or "")
+                            ).lower()
+                            for kw in (
+                                "save", "create", "submit",
+                                "confirm", "apply",
+                            )
+                        )
+                    )
+                    for t in turn_log
+                    if t.args is not None
+                )
+                if not saved:
+                    create_save_ok = False
+                    _emit(emit_event, "complete_refused_no_save", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "goal_preview": goal.description[:200],
+                    })
+                    page_memory.setdefault(
+                        "_pending_signals", [],
+                    ).append({
+                        "turn": turn_idx,
+                        "kind": "create_no_save",
+                        "message": (
+                            "mark_goal_complete REFUSED: the goal is a "
+                            "create flow but no successful Save / Submit "
+                            "action is recorded in this submodule's "
+                            "turn history. The record has NOT been "
+                            "persisted. Find the Save button (it may "
+                            "be at the bottom-right of the drawer) and "
+                            "click it BEFORE marking the goal complete."
+                        ),
+                        "fields": [],
+                    })
+                    # Verified stays as-is; the create_save_ok flag
+                    # blocks the close below.
             # Soft-guard #2: when sub-goals exist, were enough of
             # them closed out? Allow the last sub-goal to be implicit
             # (some agents call mark_goal_complete with the final
@@ -3413,12 +5977,21 @@ def run_agent_for_goal(
             # downgrade to inconclusive anyway.
             verification_record: dict[str, Any] | None = None
 
-            if not verified or not sub_goal_completion_ok:
+            if (
+                not verified
+                or not sub_goal_completion_ok
+                or not create_save_ok
+            ):
                 halt_reason = "complete"
                 final_status = "inconclusive"
                 reasons = []
                 if not verified:
                     reasons.append("no successful verify/extract_text")
+                if not create_save_ok:
+                    reasons.append(
+                        "create-flow goal but no Save/Submit succeeded — "
+                        "the record was never persisted"
+                    )
                 if not sub_goal_completion_ok:
                     closed = sum(
                         1 for sg in goal.sub_goals
@@ -3685,6 +6258,19 @@ def run_agent_for_goal(
         # matches, this whole block is skipped — zero cost on the
         # happy path.
         smart_pick_record: dict[str, Any] | None = None
+        # Phase J.5 — smart-pick + vision_only ensemble.
+        # Pre-J: smart-pick + _vision_only_dispatch both fired
+        #   unconditionally on every click → wasted ~50% of vision
+        #   tokens with no upside on unambiguous targets.
+        # Post-J.1 (too aggressive): smart-pick muted entirely in
+        #   vision_only → removed the DOM-aware tie-breaker for cases
+        #   where the DOM HAS ambiguity smart-pick could resolve.
+        # J.5: smart-pick runs in vision_only mode ONLY when the DOM
+        #   resolver returns ≥2 candidates for the target_hint —
+        #   i.e. there IS DOM ambiguity worth breaking. When 0 (truly
+        #   custom widget) or 1 (unambiguous) candidates exist, skip
+        #   smart-pick; vision_only's coord proposal is enough.
+        # Helper signals ambiguity threshold via ``min_matches``.
         if (
             tool == "click"
             and provider_supports_vision
@@ -3692,6 +6278,9 @@ def run_agent_for_goal(
             and args["target_hint"].strip()
         ):
             smart_pick_record = _maybe_run_smart_pick(
+                min_matches=(
+                    2 if agent_strategy == "vision_only" else 3
+                ),
                 page=page,
                 provider=provider,
                 cheap_provider=cheap_provider,
@@ -3754,10 +6343,143 @@ def run_agent_for_goal(
                 vision_calls += 1
                 llm_calls += 1
 
+        # Phase O.2 — pre-action existence check. Before dispatching
+        # click/type, verify the proposed target_hint actually maps to
+        # a visible element on the current page. If not, refuse the
+        # dispatch, inject a "did you mean" signal listing visible
+        # alternatives, and let the next turn re-pick. This prevents
+        # the "hallucinated target" failure mode where the planner
+        # invents a button name that doesn't exist and burns turns +
+        # tokens trying to resolve it.
+        #
+        # Skipped when:
+        #   - HITL bypass produced this turn (user's input is
+        #     authoritative; trust them)
+        #   - vision_only / smart-pick already picked coords (the
+        #     visual proposer already verified visibility)
+        #   - tool isn't click/type
+        #   - target_hint is a selector (CSS/role-based — handled by
+        #     the DOM resolver, not by label match)
+        target_skipped_for_existence = False
+        if (
+            tool in ("click", "type")
+            and hitl_direct_parsed is None
+            and vision_only_outcome is None
+            and (
+                smart_pick_record is None
+                or smart_pick_record.get("preempt_outcome") is None
+            )
+            and isinstance(args.get("target_hint"), str)
+            and args["target_hint"].strip()
+        ):
+            try:
+                exists, similar = _check_target_exists(
+                    page, args["target_hint"],
+                )
+            except Exception:
+                exists, similar = True, []
+            # Diag.3 — recent-history allowlist. Transient dropdown
+            # items (e.g. "Roles" inside the Administration menu)
+            # disappear between turns when the menu auto-closes. If
+            # the target_hint was seen in the AX tree / fields scan
+            # in ANY of the last 3 turns, allow the click — the DOM
+            # resolver downstream can take its chance. Only block
+            # when the target hasn't been seen recently AND no close
+            # alternatives exist (no plausible "did-you-mean").
+            recently_seen = False
+            hint_lower = (args["target_hint"] or "").lower().strip()
+            if hint_lower and turn_log:
+                for prev_rec in turn_log[-3:]:
+                    prev_search = prev_rec.search_log or {}
+                    if isinstance(prev_search, dict):
+                        labels_seen = prev_search.get(
+                            "labels_seen",
+                        ) or []
+                        if any(
+                            hint_lower in str(lb).lower()
+                            or str(lb).lower() in hint_lower
+                            for lb in labels_seen
+                        ):
+                            recently_seen = True
+                            break
+                    # Also consider: a prior CLICK on this same
+                    # target succeeded recently → the target exists
+                    # in this app, just not THIS exact moment.
+                    if (
+                        prev_rec.tool == "click"
+                        and prev_rec.status == "ok"
+                        and hint_lower in str(
+                            (prev_rec.args or {}).get(
+                                "target_hint", "",
+                            ),
+                        ).lower()
+                    ):
+                        recently_seen = True
+                        break
+            if not exists and recently_seen:
+                # Don't block; emit a soft warning event so the
+                # operator sees the agent is trying a transient
+                # target.
+                _emit(emit_event, "target_transient_allowed", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "target_hint": (args["target_hint"] or "")[:120],
+                })
+                exists = True
+            if not exists:
+                _emit(emit_event, "target_not_visible_refused", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "target_hint": (args["target_hint"] or "")[:120],
+                    "similar": similar[:6],
+                })
+                # Inject a one-shot signal so the next planner turn
+                # sees the visible alternatives. The signal block is
+                # already consumed by the prompt builder via
+                # ``_pending_signals``.
+                similar_str = (
+                    ", ".join(f"'{s}'" for s in similar[:6])
+                    or "(no similar labels detected)"
+                )
+                page_memory.setdefault("_pending_signals", []).append({
+                    "turn": turn_idx,
+                    "kind": "target_not_visible",
+                    "message": (
+                        f"Pre-action gate refused: target_hint "
+                        f"'{args['target_hint'][:80]}' is NOT visible "
+                        "on the page. Visible interactive labels "
+                        f"include: {similar_str}. Pick one that "
+                        "exists, or scroll/navigate first."
+                    ),
+                    "fields": [],
+                })
+                # Synthesize a soft-skip outcome so the rest of the
+                # turn-loop accounting runs (turn_log, action counters)
+                # but no DOM-side action fires. The next turn will
+                # consume the signal block.
+                outcome = {
+                    "status": "failed",
+                    "narration": (
+                        f"target '{args['target_hint'][:60]}' not "
+                        "visible — refused by pre-action gate"
+                    ),
+                    "error_message": "target_not_visible",
+                    "extracted_text": "",
+                    "details": {
+                        "pre_action_gate": "target_not_visible",
+                        "similar": similar[:6],
+                    },
+                }
+                target_skipped_for_existence = True
+
         # Smart-pick may have written a coord-click outcome already;
         # in that case skip the normal dispatcher and use that result
         # directly (see ``_maybe_run_smart_pick`` for the contract).
-        if vision_only_outcome is not None:
+        if target_skipped_for_existence:
+            pass  # outcome already set above
+        elif vision_only_outcome is not None:
             pass  # already set
         elif (
             smart_pick_record is not None
@@ -3769,7 +6491,36 @@ def run_agent_for_goal(
                 page, tool, args,
                 plan_target_url=plan_target_url,
                 speed_config=speed_config,
+                emit_event=emit_event,
+                submodule_run_id=submodule_run_id,
+                submodule_step_id=submodule_step_id,
+                turn_idx=turn_idx,
             )
+
+        # Phase J.4 — entity-creation tracking. When fill_form returns
+        # status="ok" AND the goal text says "create / add / register
+        # a <kind>", record the first textbox value as the entity's
+        # identity in WorldState. The decomposer in subsequent
+        # submodules reads ``entities_created`` and emits
+        # "search for the existing <kind>" instead of "create a new
+        # <kind>" — which prevents the second-run "already exists"
+        # conflict you saw on Solar.
+        if (
+            tool == "fill_form"
+            and isinstance(outcome, dict)
+            and outcome.get("status") == "ok"
+        ):
+            try:
+                _record_entity_from_fill_form(
+                    world_state=world_state,
+                    goal_text=goal.description,
+                    args=args,
+                    page_url=page.url if page else "",
+                )
+            except Exception as e:
+                logger.debug(
+                    "entity record post fill_form skipped: %s", e,
+                )
 
         # ── Phase 10: popup classifier on intercepted clicks ──────
         # When a click failed because something is overlaying the
@@ -3895,12 +6646,25 @@ def run_agent_for_goal(
                     from app.agents.page_intel import (  # noqa: PLC0415
                         verify_semantic,
                     )
+                    # Phase J.1 — in vision_only mode, bypass the
+                    # cheap-tier verifier. The cheap→strong escalation
+                    # adds a second LLM call on every borderline
+                    # confidence read (~0.6-0.7) for no real upside:
+                    # vision_only already committed to spending VL
+                    # tokens, and the verifier's job (was the action
+                    # observable?) is too important to gamble on a
+                    # weaker model. Going strong-first here is the
+                    # honest cost.
+                    _sv_cheap = (
+                        None if agent_strategy == "vision_only"
+                        else cheap_provider
+                    )
                     sv = verify_semantic(
                         provider, page,
                         expected=expected_text,
                         target_hint=str(args.get("target_hint") or "") or None,
                         full_page=True,  # revalidation per user spec
-                        cheap_provider=cheap_provider,
+                        cheap_provider=_sv_cheap,
                         on_escalate=_emit_escalation,
                     )
                     if isinstance(sv.input_tokens, int):
@@ -3979,6 +6743,124 @@ def run_agent_for_goal(
                 sg.status in ("done", "skipped") for sg in goal.sub_goals
             )
         )
+        # Phase C.4 — for ``type`` actions whose DOM resolver missed,
+        # fast-fail straight to coord-typing instead of going through
+        # the fuzzy → AI → vision-search ladder. Empirically, hybrid's
+        # type ladder loses to vision-only on complex form widgets
+        # (MUI selects, React-controlled inputs, custom dropdowns)
+        # because DOM resolution picks a wrapper and the typed value
+        # never reaches the actual input. Coord-typing clicks the
+        # visible pixel and types into whatever has focus — which is
+        # almost always the right thing for a form field.
+        if (
+            tool == "type"
+            and miss_due_to_selector
+            and not sub_goals_done
+            and provider_supports_vision
+            and args.get("target_hint")
+            and args.get("value")
+        ):
+            try:
+                from app.agents.page_intel import (  # noqa: PLC0415
+                    capture_screenshot_for_vision,
+                    propose_click_coordinates,
+                )
+                from app.executor.actions import (  # noqa: PLC0415
+                    clear_focused_field,
+                )
+                fast_shot = capture_screenshot_for_vision(
+                    page, downscale=False,
+                )
+                coord_pick = propose_click_coordinates(
+                    provider, page,
+                    target_hint=str(args.get("target_hint", "")),
+                    screenshot_bytes=fast_shot,
+                )
+                if (
+                    coord_pick is not None
+                    and coord_pick.confidence >= 0.55
+                    and coord_pick.x > 0 and coord_pick.y > 0
+                ):
+                    page.mouse.click(coord_pick.x, coord_pick.y)
+                    try:
+                        page.wait_for_timeout(80)
+                    except Exception:
+                        pass
+                    clear_focused_field(page)
+                    typed_value = str(args.get("value") or "")
+                    delay = (
+                        20 if getattr(
+                            speed_config, "typing_delay_ms", 0,
+                        ) else 0
+                    )
+                    try:
+                        if delay > 0:
+                            page.keyboard.type(typed_value, delay=delay)
+                        else:
+                            page.keyboard.type(typed_value)
+                    except Exception:
+                        page.keyboard.type(typed_value)
+                    # type-and-submit: respect the agent's submit flag.
+                    if args.get("submit"):
+                        try:
+                            page.wait_for_timeout(80)
+                            page.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                    coord_record = {
+                        "kind": "coord_type_fast_fail",
+                        "x": coord_pick.x,
+                        "y": coord_pick.y,
+                        "confidence": coord_pick.confidence,
+                        "label_visible": coord_pick.label_visible[:120],
+                        "applied": True,
+                    }
+                    if isinstance(coord_pick.input_tokens, int):
+                        total_input += coord_pick.input_tokens
+                    if isinstance(coord_pick.output_tokens, int):
+                        total_output += coord_pick.output_tokens
+                    vision_calls += 1
+                    llm_calls += 1
+                    outcome = {
+                        "status": "ok",
+                        "narration": (
+                            f"COORD TYPE (fast-fail) at "
+                            f"({coord_pick.x}, {coord_pick.y}) on "
+                            f"{coord_pick.label_visible[:80]!r} — DOM "
+                            f"resolution missed, vision pointed at "
+                            f"pixels (confidence "
+                            f"{coord_pick.confidence:.2f})."
+                        ),
+                        "error_message": None,
+                        "extracted_text": "",
+                        "details": {
+                            **(outcome.get("details") or {}),
+                            "coord_type_fast_fail": coord_record,
+                        },
+                        "search_log": {
+                            "kind": "coord_type_fast_fail",
+                            **coord_record,
+                        },
+                    }
+                    _emit(emit_event, "coord_type_fast_fail", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "turn": turn_idx,
+                        "target_hint": args.get("target_hint"),
+                        "x": coord_pick.x,
+                        "y": coord_pick.y,
+                        "confidence": coord_pick.confidence,
+                        "label_visible": coord_pick.label_visible[:160],
+                    })
+                    # Skip the heavier rescue ladder below — the
+                    # fast-fail handled it.
+                    miss_due_to_selector = False
+            except Exception as e:
+                logger.debug(
+                    "coord-type fast-fail skipped (%s); falling "
+                    "through to standard rescue", e,
+                )
+
         if (
             target_bound
             and miss_due_to_selector
@@ -4272,6 +7154,110 @@ def run_agent_for_goal(
         )
         turn_log.append(rec)
 
+        # Phase O.3 — confidence + mistake memory.
+        # 1. Track the failed approach when this turn's action failed
+        #    so the next planner turn sees a "don't retry" list.
+        # 2. Track consecutive low-confidence turns WITHOUT progress;
+        #    halt to HITL escalation when the streak exceeds the cap.
+        # HITL-bypassed turns + post-HITL grace window are excluded
+        # (the human's input gets a fresh start).
+        if (
+            outcome.get("status") == "failed"
+            and tool in ("click", "type", "select", "fill_form")
+            and hitl_direct_parsed is None
+        ):
+            failed_approaches.append({
+                "turn": str(turn_idx),
+                "tool": tool,
+                "target": (args.get("target_hint") or "")[:80],
+                "value": (args.get("value") or "")[:80],
+                "reason": (
+                    outcome.get("error_message")
+                    or outcome.get("narration") or ""
+                )[:160],
+            })
+            # Cap memory size so the prompt block stays bounded.
+            if len(failed_approaches) > MAX_FAILED_APPROACHES_REMEMBERED:
+                failed_approaches = failed_approaches[
+                    -MAX_FAILED_APPROACHES_REMEMBERED:
+                ]
+
+        # Confidence streak (skip during post-HITL grace and on HITL-
+        # bypassed turns — we don't want HITL to count against the
+        # agent's own confidence).
+        if (
+            hitl_direct_parsed is None
+            and turns_since_hitl_consumed is None
+        ):
+            sub_goals_closed_now = sum(
+                1 for sg in goal.sub_goals
+                if sg.status in ("done", "skipped")
+            ) if goal.sub_goals else 0
+            if confidence < LOW_CONFIDENCE:
+                if low_confidence_streak == 0:
+                    sub_goals_closed_at_streak_start = sub_goals_closed_now
+                low_confidence_streak += 1
+            else:
+                low_confidence_streak = 0
+            progress_made = (
+                sub_goals_closed_now > sub_goals_closed_at_streak_start
+            )
+            if (
+                low_confidence_streak >= 2
+                and not progress_made
+            ):
+                _emit(emit_event, "low_confidence_escalation", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "streak": low_confidence_streak,
+                    "last_confidence": confidence,
+                    "sub_goals_closed": sub_goals_closed_now,
+                })
+                # Trigger the HITL path on the NEXT iteration via the
+                # stall route — set final_error so the planner's stall
+                # detector escalates instead of continuing to flail.
+                if final_error is None:
+                    final_error = "low_confidence_no_progress"
+                # Reset so we don't keep emitting on every subsequent
+                # turn until HITL fires.
+                low_confidence_streak = 0
+
+        # Phase F.1 — post-HITL no-op detector. Within the
+        # POST_HITL_NOOP_WINDOW turns after a HITL submission, if
+        # consecutive turns pick no-op tools AND the page hasn't
+        # moved (same obs hash as before HITL), halt explicitly so
+        # the operator sees the planner gave up instead of a silent
+        # freeze.
+        if turns_since_hitl_consumed is not None:
+            turns_since_hitl_consumed += 1
+            if tool in _POST_HITL_NOOP_TOOLS:
+                post_hitl_noop_streak += 1
+            else:
+                post_hitl_noop_streak = 0
+            if post_hitl_noop_streak >= POST_HITL_NOOP_WINDOW:
+                _emit(emit_event, "planner_no_op_after_hitl", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "turn": turn_idx,
+                    "noop_streak": post_hitl_noop_streak,
+                    "last_tool": tool,
+                })
+                halt_reason = "agent_failed"
+                final_status = "blocked"
+                final_narration = (
+                    f"After HITL guidance, planner picked "
+                    f"{post_hitl_noop_streak} consecutive no-op "
+                    "tools — halting to avoid silent freeze."
+                )
+                final_error = "planner_no_op_after_hitl"
+                break
+            if turns_since_hitl_consumed >= POST_HITL_NOOP_WINDOW + 2:
+                # Window expired without triggering — reset the
+                # tracker so future stalls aren't misattributed.
+                turns_since_hitl_consumed = None
+                post_hitl_noop_streak = 0
+
         # Vision-on-demand: when an action tool fails AND the provider
         # supports vision, capture a screenshot now so the NEXT turn's
         # observation includes visual context. We don't take screenshots
@@ -4298,6 +7284,39 @@ def run_agent_for_goal(
             "error": rec.error_message,
             "vision_pending": pending_screenshot is not None,
         })
+
+        # Phase A.6 Step 1 — post-action form-signal observer. Runs
+        # ONLY on submit-like turns (click/press_key on Save/Create/
+        # Submit-like targets). When a toast or inline error appears,
+        # stash the message in page_memory so the NEXT turn's prompt
+        # builder folds it in as a "FORM SIGNAL" block. Also emits a
+        # user-visible live-feed event so the operator sees the
+        # validation message in real time.
+        try:
+            from app.agents.form_signals import (  # noqa: PLC0415
+                is_submit_like, observe_form_signal,
+            )
+            target_for_signal = args.get("target_hint") or args.get("value") or ""
+            if is_submit_like(tool, target_for_signal):
+                sig = observe_form_signal(page)
+                if sig.kind != "none" and sig.message:
+                    _emit(emit_event, "form_signal_detected", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "turn": turn_idx,
+                        "kind": sig.kind,
+                        "message": sig.message[:300],
+                        "fields": sig.fields or [],
+                    })
+                    # Stash on page_memory so the next turn picks it up.
+                    page_memory.setdefault("_pending_signals", []).append({
+                        "turn": turn_idx,
+                        "kind": sig.kind,
+                        "message": sig.message,
+                        "fields": sig.fields or [],
+                    })
+        except Exception as e:
+            logger.debug("form-signal observer skipped: %s", e)
 
         # Phase 12 — page graph edge. When the URL changed during
         # this turn, record (from, to, tool) so future turns can
@@ -4495,6 +7514,11 @@ def run_qa_agent_for_plan(
     # ``vision_only`` (VL+coords for click/type). Threaded into
     # each submodule's ``run_agent_for_goal``.
     agent_strategy: str = "hybrid",
+    # Phase H — pre-execution Scout → Refine → Activate orchestrator.
+    # "auto" runs preflight when the plan isn't yet pinned to an
+    # app_map_refined version. "force" always re-scouts + re-refines.
+    # "skip" disables it (legacy / debugging path).
+    preflight: str = "auto",
 ) -> ExecutionResult:
     """Run the agentic executor: one agent-loop per submodule.
 
@@ -4540,11 +7564,66 @@ def run_qa_agent_for_plan(
             f"Plan {plan_id} has no target_url — cannot navigate",
         )
 
+    # Phase H — preflight (Scout → Refine → Activate) BEFORE the
+    # per-submodule agent loop. Without this, the agent walks
+    # BRD-derived sub-goals that don't match the actual UI; with
+    # it, the live TcNode tree the agent reads below is the refined
+    # plan. Short-circuits when a fresh app_map_refined version is
+    # already active.
+    if preflight != "skip" and provider is not None:
+        from app.services.preflight import run_preflight  # noqa: PLC0415
+
+        _emit(emit_event, "phase", {
+            "phase": "preflight",
+            "message": (
+                "Validating test cases against the actual UI before "
+                "execution (scout + refine)"
+            ),
+        })
+        try:
+            pf = run_preflight(
+                db,
+                plan_id=plan_id,
+                provider=provider,
+                cheap_provider=cheap_provider,
+                force=(preflight == "force"),
+                headless=True,
+                emit_event=emit_event,
+                is_cancelled=is_cancelled,
+            )
+            if pf.status == "failed":
+                logger.warning(
+                    "preflight failed for plan %s: %s — proceeding "
+                    "with current TC tree as-is",
+                    plan_id, pf.error_message,
+                )
+        except Exception as e:
+            logger.exception(
+                "preflight raised in run_qa_agent_for_plan; "
+                "continuing with live TC tree",
+            )
+            _emit(emit_event, "preflight_failed", {
+                "plan_id": plan_id,
+                "stage": "outer",
+                "error": str(e)[:200],
+            })
+
     project_id = plan.project_id
 
+    # Phase C.3 — TC version label. Activation OVERWRITES the live
+    # TcNode tree (audit-trail semantics chosen by the user), so the
+    # agent always reads the live tree. ``current_tc_version_id`` is
+    # kept as a UI label so the operator can see which version is
+    # active + roll back via the plan editor.
+    using_tc_version_id = getattr(plan, "current_tc_version_id", None)
     _emit(emit_event, "phase", {
         "phase": "loading_steps",
-        "message": f"Loading TC tree for plan '{plan.name}' (agentic mode)",
+        "message": (
+            f"Loading TC tree (active version v{using_tc_version_id}) "
+            f"for plan '{plan.name}'"
+            if using_tc_version_id
+            else f"Loading TC tree for plan '{plan.name}' (agentic mode)"
+        ),
     })
 
     stmt = (
@@ -4719,10 +7798,113 @@ def run_qa_agent_for_plan(
                     except Exception:
                         pass
 
+            # Phase A.6 Step 6 — build a plan-wide submodule summary
+            # once so the reconciliation pass (which fires inside the
+            # first submodule, after scout) can compare the AppMap
+            # against EVERY submodule in one VL call. Cheap to build,
+            # tiny payload (~N short objects).
+            plan_submodules_summary: list[dict[str, Any]] = []
+            for sm, _steps in groups:
+                plan_submodules_summary.append({
+                    "submodule_id": sm.id,
+                    "title": (sm.title or "")[:160],
+                    "description": (
+                        getattr(sm, "description_md", "") or ""
+                    )[:600],
+                })
+
+            # Phase D — pre-submodule validation gate. Before each
+            # submodule runs, look up the active TcVersion's
+            # validation rollup for THIS submodule and emit a
+            # cautionary event when confidence is low or any step is
+            # marked unreachable. This mirrors what a human QA does:
+            # glance at the test case, decide "this one's risky", note
+            # it before pressing play. Best-effort — missing version /
+            # missing validation → no warning, agent proceeds normally.
+            validation_by_submodule_id: dict[int, dict[str, Any]] = {}
+            try:
+                if plan.current_tc_version_id:
+                    from app.models.tc_version import (  # noqa: PLC0415
+                        TcNodeSnapshot,
+                    )
+                    snaps = list(db.execute(
+                        select(TcNodeSnapshot).where(
+                            TcNodeSnapshot.tc_version_id ==
+                            plan.current_tc_version_id,
+                        ),
+                    ).scalars())
+                    for s in snaps:
+                        if (
+                            s.kind == "submodule"
+                            and s.original_tc_node_id is not None
+                            and s.validation_status
+                            and s.validation_status != "pending"
+                        ):
+                            validation_by_submodule_id[
+                                int(s.original_tc_node_id)
+                            ] = {
+                                "status": s.validation_status,
+                                "confidence": s.validation_confidence,
+                                "reason": s.validation_reason,
+                            }
+            except Exception as e:
+                logger.debug(
+                    "pre-submodule validation lookup skipped: %s", e,
+                )
+
             for idx, ((submodule, steps), row) in enumerate(zip(groups, rows)):
                 if is_cancelled and is_cancelled():
                     cancelled = True
                     break
+
+                # Phase D — emit a pre-run health signal so the
+                # operator sees in the live feed which submodules the
+                # validator marked low-confidence. Doesn't block
+                # execution; just surfaces the risk.
+                pre_val = validation_by_submodule_id.get(submodule.id)
+                if pre_val is not None:
+                    _emit(emit_event, "submodule_pre_run_health", {
+                        "run_id": run_id,
+                        "step_id": row.id,
+                        "submodule_id": submodule.id,
+                        "title": submodule.title,
+                        "validation_status": pre_val.get("status"),
+                        "validation_confidence": pre_val.get("confidence"),
+                        "validation_reason": pre_val.get("reason"),
+                        "is_risky": (
+                            pre_val.get("status") in (
+                                "unresolved", "unreachable",
+                            )
+                            or (
+                                isinstance(
+                                    pre_val.get("confidence"), (int, float),
+                                )
+                                and float(pre_val["confidence"]) < 0.5
+                            )
+                        ),
+                    })
+
+                # Diag.4 — submodule state reset. Between submodules,
+                # dismiss any leftover drawer / modal AND scroll back
+                # to the top so the next decomposer call sees a clean
+                # base state. Without this, submodule N+1 starts with
+                # submodule N's drawer still open — the decomposer
+                # then plans "close this drawer first" or worse picks
+                # actions against the stale UI.
+                # Skipped for idx==0 (no previous state to clean up).
+                if idx > 0:
+                    try:
+                        _reset_inter_submodule_state(page)
+                        _emit(emit_event, "submodule_state_reset", {
+                            "step_id": row.id,
+                            "submodule_id": submodule.id,
+                            "ordinal": idx + 1,
+                        })
+                    except Exception as e:
+                        logger.debug(
+                            "submodule state reset failed (non-fatal): %s",
+                            e,
+                        )
 
                 # Extract goal — single LLM call per submodule.
                 _emit(emit_event, "agent_goal_extracting", {
@@ -4821,6 +8003,9 @@ def run_qa_agent_for_plan(
                     open_typed_prompt=open_typed_prompt,
                     request_intervention=wait_for_intervention,
                     som_enabled=som_enabled_default,
+                    plan_submodules_summary=(
+                        plan_submodules_summary if idx == 0 else None
+                    ),
                 )
 
                 # α.5 — persist WorldState after every submodule so
@@ -4833,7 +8018,18 @@ def run_qa_agent_for_plan(
                 total_llm_calls += result.llm_calls
                 total_vision_calls += result.vision_calls
 
-                screenshot = _take_screenshot(page, run_id, row.id)
+                # Phase L — settle the page BEFORE capturing evidence
+                # so screenshots reflect the post-action state, not a
+                # mid-navigation frame. The narration overlay is hidden
+                # only AFTER the capture to keep the existing "what the
+                # agent said" caption on the screenshot — but the
+                # underlying page is given a full settle window first.
+                screenshot = _take_screenshot(
+                    page, run_id, row.id,
+                    speed_config=speed_config,
+                    post_settle_ms=1200,
+                )
+                screenshot_meta = _capture_screenshot_meta(page)
                 hide_narration(page)
 
                 # A4.3: classify why this row landed where it did so
@@ -4857,6 +8053,10 @@ def run_qa_agent_for_plan(
                     "goal": goal.to_dict(),
                     "halt_reason": result.halt_reason,
                     "divergence": divergence,
+                    # Phase L — screenshot metadata so the report can
+                    # detect stale-screenshot binding (URL at capture
+                    # time vs the goal's expected destination).
+                    "screenshot_meta": screenshot_meta,
                     "agent_log": [
                         {
                             "turn": t.turn,
@@ -4921,10 +8121,58 @@ def run_qa_agent_for_plan(
                 ) or bool(
                     getattr(result, "manual_intervention_used", False)
                 )
+                # Phase O.4 — gate freeze on observed-criteria verification.
+                # Walk every sub-goal that was marked done AND has a
+                # non-empty success_criterion; re-verify against the
+                # CURRENT page (the post-submodule state). If any
+                # such sub-goal fails its observable signal NOW, the
+                # "passed" status was claimed but not proven — refuse
+                # to freeze the recipe so the next run doesn't replay
+                # a hallucinated path deterministically.
+                criteria_all_verified = True
+                criteria_unverified: list[dict[str, str]] = []
+                try:
+                    end_observation = _capture_observation(page)
+                except Exception:
+                    end_observation = {"url": "", "title": ""}
+                runtime_sgs_for_audit = list(
+                    getattr(result, "sub_goals", []) or []
+                )
+                for sg_dict in runtime_sgs_for_audit:
+                    if not isinstance(sg_dict, dict):
+                        continue
+                    if sg_dict.get("status") != "done":
+                        continue
+                    crit = (sg_dict.get("success_criterion") or "").strip()
+                    if not crit:
+                        continue
+                    try:
+                        ok_obs, reason = _verify_subgoal_criterion(
+                            page,
+                            criterion=crit,
+                            observation=end_observation,
+                        )
+                    except Exception:
+                        ok_obs, reason = True, "verify raised — skipped"
+                    if not ok_obs:
+                        criteria_all_verified = False
+                        criteria_unverified.append({
+                            "sub_goal_id": str(sg_dict.get("id", "?")),
+                            "criterion": crit[:160],
+                            "reason": reason[:160],
+                        })
+                if criteria_unverified:
+                    _emit(emit_event, "freeze_refused_unverified_criteria", {
+                        "run_id": run_id,
+                        "step_id": row.id,
+                        "details": criteria_unverified[:10],
+                    })
+
                 should_freeze = (
                     result.status == "passed"
                     and vision_verdict in (None, "pass")
                     and not manual_intervention_in_run
+                    and criteria_all_verified
                 )
 
                 # α.5 — apply postconditions to WorldState on success
@@ -4955,7 +8203,50 @@ def run_qa_agent_for_plan(
                 # querying "how do I do X on this app" see the proven
                 # working flow (text only — no selectors).
                 if should_freeze:
-                    frozen = _build_frozen_path(
+                    # Phase B Step 2 — prefer the v2 (per-sub-goal
+                    # segmented) frozen path when the run had VL-
+                    # derived runtime sub-goals. v2 lets replay
+                    # walk sub-goal-by-sub-goal with handoff to the
+                    # agent for any sub-goal that doesn't have a
+                    # frozen segment. Falls back to v1 when there
+                    # are no sub-goals (legacy / fallback runs).
+                    runtime_sgs_for_freeze = list(
+                        getattr(result, "sub_goals", []) or []
+                    )
+                    # Convert dict shape back into objects with .id
+                    # / .description / .status / etc. for the
+                    # segment builder. RuntimeSubGoal stores
+                    # to_dict() into result.sub_goals; we mirror
+                    # back into a light wrapper here.
+                    runtime_sg_objs: list[Any] = []
+                    for d in runtime_sgs_for_freeze:
+                        if not isinstance(d, dict):
+                            continue
+                        from app.agents.sub_goals import (  # noqa: PLC0415
+                            RuntimeSubGoal,
+                        )
+                        runtime_sg_objs.append(RuntimeSubGoal(
+                            id=str(d.get("id", "")),
+                            description=str(d.get("description", "")),
+                            success_criterion=str(
+                                d.get("success_criterion", ""),
+                            ),
+                            max_turns=int(d.get("max_turns", 6)),
+                            status=str(d.get("status", "pending")),  # type: ignore[arg-type]
+                            replan_iteration=int(
+                                d.get("replan_iteration", 0),
+                            ),
+                        ))
+                    frozen_v2: dict[str, Any] | None = None
+                    if runtime_sg_objs:
+                        frozen_v2 = _build_frozen_path_segments(
+                            run_id=run_id,
+                            goal=goal,
+                            turn_log=result.turn_log,
+                            runtime_sub_goals=runtime_sg_objs,
+                            agent_model=getattr(provider, "model", None),
+                        )
+                    frozen = frozen_v2 or _build_frozen_path(
                         run_id=run_id,
                         goal=goal,
                         turn_log=result.turn_log,
@@ -4970,17 +8261,31 @@ def run_qa_agent_for_plan(
                         if sm_row is not None:
                             sm_row.frozen_path = frozen
                             db.commit()
+                            step_count = (
+                                sum(
+                                    len(seg.get("steps", []))
+                                    for seg in frozen.get("segments", [])
+                                )
+                                if frozen.get("version") == 2
+                                else len(frozen.get("steps", []))
+                            )
                             _emit(emit_event, "frozen_path_captured", {
                                 "step_id": row.id,
                                 "tc_node_id": submodule.id,
-                                "step_count": len(frozen["steps"]),
+                                "step_count": step_count,
                                 "agent_model": frozen.get("agent_model"),
+                                "version": frozen.get("version", 1),
+                                "segments": (
+                                    len(frozen.get("segments", []))
+                                    if frozen.get("version") == 2
+                                    else None
+                                ),
                             })
                             logger.info(
                                 "froze path for submodule %s "
-                                "(%d steps) from run %s",
-                                submodule.id, len(frozen["steps"]),
-                                run_id,
+                                "(%d steps, v%s) from run %s",
+                                submodule.id, step_count,
+                                frozen.get("version", 1), run_id,
                             )
                             # γ.2 — append to the cross-submodule
                             # bundle. The parent module gets a

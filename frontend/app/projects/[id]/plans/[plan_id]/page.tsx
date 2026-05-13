@@ -311,6 +311,12 @@ export default function PlanEditorPage() {
             </p>
           </div>
 
+          <p className="text-xs text-muted-foreground">
+            Scout, refine test cases, and manage versions in the{" "}
+            <strong>Test Cases</strong> tab — they all act on the test
+            cases themselves.
+          </p>
+
           <div className="flex justify-end pt-2">
             <Button
               onClick={() => saveMutation.mutate()}

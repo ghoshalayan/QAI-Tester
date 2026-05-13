@@ -327,7 +327,24 @@ OVERLAY_INIT_SCRIPT = r"""
   };
 
   window.__qaiHideBanner = function() {
+    // Phase P.1 — fully remove from layout (visibility:hidden +
+    // display:none) so the banner can't be picked up by
+    // page.screenshot() even when alpha-compositing is applied at
+    // the OS level (some Windows builds render opacity:0 elements
+    // into the screenshot bitmap). The text content is preserved so
+    // __qaiShowBanner can restore it instantly.
     banner.style.opacity = '0';
+    banner.style.visibility = 'hidden';
+    banner.style.pointerEvents = 'none';
+  };
+
+  window.__qaiShowBanner = function() {
+    // Restore the banner after a screenshot capture. We only restore
+    // visibility; the text + phase styles persist from the last
+    // updateNarration call.
+    banner.style.opacity = '1';
+    banner.style.visibility = 'visible';
+    banner.style.pointerEvents = 'none';
   };
 
   // ── Target highlight ──────────────────────────────────────────

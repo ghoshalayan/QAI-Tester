@@ -18,6 +18,7 @@ from app.routers import (
     projects,
     requirements,
     settings as settings_router,
+    sub_flow_modules,
     tc_nodes,
     test_plans,
 )
@@ -46,6 +47,23 @@ async def lifespan(_app: FastAPI):
     ):
         d.mkdir(parents=True, exist_ok=True)
     logger.info("Data directories ready under %s", settings.data_dir.resolve())
+
+    # Phase K.2 — reap orphaned agent runs from the previous process.
+    # Any row left in (queued / running / paused) with no completed_at
+    # is dead by construction: no Python thread exists to drive it.
+    # Mark them as ``cancelled`` so the UI doesn't show ghost runs and
+    # the duplicate-run guards don't refuse new starts.
+    try:
+        from app.services.agent_run_service import reap_orphaned_runs  # noqa: PLC0415
+        result = reap_orphaned_runs(stale_after_seconds=0)
+        if result.get("count"):
+            logger.warning(
+                "Startup reaper cancelled %d orphaned run(s): %s",
+                result["count"], result.get("reaped"),
+            )
+    except Exception as e:
+        logger.exception("startup reaper failed (non-fatal): %s", e)
+
     yield
     logger.info("Shutting down")
 
@@ -84,6 +102,7 @@ app.include_router(test_plans.router)
 app.include_router(agent_runs.router)
 app.include_router(requirements.router)
 app.include_router(tc_nodes.router)
+app.include_router(sub_flow_modules.router)
 app.include_router(_debug.router)
 
 

@@ -269,7 +269,12 @@ _OVERLAY_JS = r"""
       width: 'min(780px, 92vw)', maxHeight: '92vh',
       boxShadow: '0 24px 64px rgba(0,0,0,0.45)',
       display: 'flex', flexDirection: 'column',
-      overflow: 'hidden',
+      // Card-level vertical scroll. When the content (screenshot +
+      // tools + textarea + footer) exceeds the card's max height,
+      // the user scrolls inside the modal to reach the bottom
+      // buttons. Horizontal overflow stays clipped (rounded corners
+      // remain crisp).
+      overflowY: 'auto', overflowX: 'hidden',
     });
     root.appendChild(card);
 
@@ -322,10 +327,12 @@ _OVERLAY_JS = r"""
     card.appendChild(meta);
 
     // ── Canvas area (Layer 1 background image + Layer 2 drawing) ──
+    // Natural height (no internal scroll). When the whole card
+    // exceeds 92vh the user scrolls the card itself to reach the
+    // footer — see overflowY:auto on the card root above.
     const canvasWrap = document.createElement('div');
     Object.assign(canvasWrap.style, {
       position: 'relative', background: '#f9fafb',
-      maxHeight: '46vh', overflow: 'auto',
       padding: '12px 20px',
     });
     const stage = document.createElement('div');

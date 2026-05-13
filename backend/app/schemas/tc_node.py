@@ -59,6 +59,13 @@ class TcNodeRead(BaseModel):
     status: TcNodeStatus
     source_requirement_ids: list[int]
 
+    # Phase E — lightweight flag so the test-cases viewer can show
+    # "Save as module" only on submodules that actually have a
+    # frozen path. We don't ship the full ``frozen_path`` JSON to
+    # the frontend (can be large) — just a boolean + the version.
+    has_frozen_path: bool = False
+    frozen_path_version: int | None = None
+
     created_at: datetime
     updated_at: datetime
     reviewed_at: datetime | None = None

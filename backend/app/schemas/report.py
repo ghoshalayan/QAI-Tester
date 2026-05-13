@@ -63,6 +63,18 @@ class ReportSubGoal(BaseModel):
     started_at_turn: int | None = None
     ended_at_turn: int | None = None
     max_turns: int | None = None
+    # Phase B — replay surfacing. ``source`` distinguishes a sub-goal
+    # that was walked by the deterministic frozen-path replay from
+    # one driven by the agentic loop. Frontend renders a "frozen" /
+    # "agentic" badge so the report tells you which sub-goals
+    # benefited from the proven path vs. were re-discovered.
+    # Values: ``"frozen"`` | ``"agentic"`` | ``"frozen_then_agentic"``
+    # (replay attempted, failed, agentic recovered)
+    source: str | None = None
+    # Phase B — when ``source`` includes "frozen", how many frozen
+    # steps were executed for this sub-goal. Useful for the report
+    # to show "skipped after 2/4 steps" attribution.
+    frozen_step_count: int | None = None
 
 
 AgentStatus = Literal[

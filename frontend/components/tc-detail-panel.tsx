@@ -4,8 +4,25 @@ import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { Check, ExternalLink, Pencil, Plus, Trash2, X } from "lucide-react";
+import {
+  Boxes,
+  Check,
+  ExternalLink,
+  Pencil,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
+
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 import {
   api,
@@ -260,7 +277,20 @@ export function TcDetailPanel({ projectId, node, onClose }: Props) {
             {childCount} {childCount === 1 ? "child" : "children"}
           </span>
         )}
+        {node.has_frozen_path && (
+          <span
+            className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400"
+            title="Submodule has a frozen path captured from a passing run"
+          >
+            v{node.frozen_path_version ?? "?"} frozen
+          </span>
+        )}
       </div>
+
+      {/* Phase E — promote to module (submodules with frozen paths only) */}
+      {node.kind === "submodule" && node.has_frozen_path && (
+        <PromoteToModuleAction node={node} />
+      )}
 
       {/* Action type — editable for steps only */}
       {isStep && editing && (
@@ -559,5 +589,165 @@ function DataNeedsEditor({
         Add data need
       </Button>
     </div>
+  );
+}
+
+
+// ── Phase E — Promote-to-module action ───────────────────────────
+
+
+function PromoteToModuleAction({
+  node,
+}: {
+  node: TcNodeTreeRead;
+}) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState(node.title || "");
+  const [description, setDescription] = useState(node.description_md ?? "");
+  const [pattern, setPattern] = useState("");
+  const [tags, setTags] = useState("");
+
+  // Re-seed defaults when the dialog opens.
+  useEffect(() => {
+    if (open) {
+      setName(node.title || "");
+      setDescription(node.description_md ?? "");
+      setPattern("");
+      setTags("");
+    }
+  }, [open, node.title, node.description_md]);
+
+  const promoteMutation = useMutation({
+    mutationFn: () =>
+      api.promoteToSubFlowModule(node.project_id, {
+        submodule_tc_node_id: node.id,
+        name: name.trim(),
+        description: description.trim(),
+        target_url_pattern: pattern.trim() || null,
+        tags: tags
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean),
+      }),
+    onSuccess: (resp) => {
+      toast.success(
+        `Saved as module "${resp.name}" — ${resp.steps} step(s)`,
+      );
+      qc.invalidateQueries({
+        queryKey: ["sub-flow-modules", node.project_id],
+      });
+      setOpen(false);
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Promote failed", { description: msg });
+    },
+  });
+
+  return (
+    <>
+      <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2 text-xs">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p className="font-medium text-emerald-900 dark:text-emerald-200">
+              Reusable across plans
+            </p>
+            <p className="text-[10px] text-emerald-800/80 dark:text-emerald-300/80">
+              This submodule has a proven frozen path. Save it as a
+              module to import into other plans without re-discovery.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setOpen(true)}
+          >
+            <Boxes className="size-3.5" />
+            Save as module
+          </Button>
+        </div>
+      </div>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Save submodule as module</DialogTitle>
+            <DialogDescription>
+              Captures this submodule&apos;s frozen path + step
+              snapshots into the project&apos;s module library.
+              Other plans can then import it as a pre-frozen
+              submodule.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div>
+              <Label htmlFor="promote-name">Name</Label>
+              <Input
+                id="promote-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={255}
+              />
+            </div>
+            <div>
+              <Label htmlFor="promote-desc">Description</Label>
+              <Textarea
+                id="promote-desc"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={3}
+                placeholder="What does this module do? Where can it be used?"
+              />
+            </div>
+            <div>
+              <Label htmlFor="promote-pattern">
+                Target URL pattern{" "}
+                <span className="text-[10px] text-muted-foreground">
+                  (optional — substring match for suggested imports)
+                </span>
+              </Label>
+              <Input
+                id="promote-pattern"
+                value={pattern}
+                onChange={(e) => setPattern(e.target.value)}
+                placeholder="e.g. solar.com or trycloudflare.com"
+              />
+            </div>
+            <div>
+              <Label htmlFor="promote-tags">
+                Tags{" "}
+                <span className="text-[10px] text-muted-foreground">
+                  (comma-separated)
+                </span>
+              </Label>
+              <Input
+                id="promote-tags"
+                value={tags}
+                onChange={(e) => setTags(e.target.value)}
+                placeholder="auth, admin, create"
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() => promoteMutation.mutate()}
+              disabled={!name.trim() || promoteMutation.isPending}
+            >
+              <Boxes className="size-4" />
+              {promoteMutation.isPending ? "Saving…" : "Save module"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

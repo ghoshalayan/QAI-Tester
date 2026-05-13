@@ -52,10 +52,93 @@ logger = logging.getLogger(__name__)
 
 
 _RESERVED_KEYS = (
+    # Phase E — structured identity / location keys. These are
+    # auto-populated by ``record_auth_success`` and
+    # ``record_current_page`` so the decomposer can read them as
+    # guaranteed preconditions without re-checking the page.
+    #
+    #   auth_status        : "logged_in" | "logged_out" | "unknown"
+    #   auth_identity      : dict (username, role, tenant, ...)
+    #   current_page_path  : list[str] — e.g. ["Administration", "Roles"]
+    #   current_url        : last observed URL (already used elsewhere)
+    #
+    # The agent's prompt builder lifts these into a dedicated
+    # "KNOWN STATE" block — the decomposer doesn't need a screenshot
+    # to know "I'm already logged in".
+    "auth_status", "auth_identity", "current_page_path",
+    # Legacy cart / e-commerce flow keys kept for back-compat.
     "logged_in_as", "current_url", "cart_count", "cart_items",
     "checkout_started", "order_placed", "last_search",
     "screens_visited",
+    # Phase E — entities created during the run so subsequent
+    # submodules can search for them (e.g. "the role created
+    # 5 minutes ago"). Each entry: {kind, identity, created_at_url}.
+    "entities_created",
 )
+
+
+# ── Phase E — structured state mutators ─────────────────────────
+
+
+def record_auth_success(
+    state: dict[str, Any],
+    *,
+    username: str,
+    role: str | None = None,
+    tenant: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Mark the agent as logged in. Called by ``auth_flow`` after a
+    successful login submit + post-login screen detection. Idempotent
+    — calling twice with the same username is a no-op."""
+    state["auth_status"] = "logged_in"
+    identity: dict[str, Any] = {"username": username}
+    if role:
+        identity["role"] = role
+    if tenant:
+        identity["tenant"] = tenant
+    if extra:
+        identity.update(extra)
+    state["auth_identity"] = identity
+    # Legacy key — kept in sync so existing prompts that read
+    # ``logged_in_as`` keep working.
+    state["logged_in_as"] = username
+
+
+def record_current_page(
+    state: dict[str, Any],
+    *,
+    url: str | None = None,
+    breadcrumb: list[str] | None = None,
+) -> None:
+    """Update the agent's location tracking. Called from the agent
+    loop after each settled observation (cheap; no LLM)."""
+    if url:
+        state["current_url"] = url
+    if breadcrumb is not None:
+        state["current_page_path"] = list(breadcrumb)
+
+
+def record_entity_created(
+    state: dict[str, Any],
+    *,
+    kind: str,
+    identity: str,
+    url: str | None = None,
+) -> None:
+    """Append to the entities_created log so subsequent submodules
+    can search for what was just made (e.g. role name typed two
+    submodules ago that needs to be assigned now)."""
+    entries = state.get("entities_created")
+    if not isinstance(entries, list):
+        entries = []
+    entries.append({
+        "kind": kind,
+        "identity": identity[:200],
+        "created_at_url": url or state.get("current_url", ""),
+    })
+    # Cap the log at 50 to bound prompt size on long runs.
+    state["entities_created"] = entries[-50:]
 
 
 def load_world_state(run: "AgentRun") -> dict[str, Any]:

@@ -341,6 +341,156 @@ def _mark_cancelled(db, run: AgentRun, reason: str) -> None:
     _emit_run_event(run, "cancelled", {"message": reason[:500]})
 
 
+def force_cancel(run_id: int, *, reason: str = "force-cancelled") -> dict:
+    """Phase K.1 — strict stop.
+
+    The cooperative cancel path (``request_cancel`` + poll at the next
+    safe checkpoint) waits for the runner thread to notice the flag.
+    If the thread is stuck inside an LLM call, browser navigation, or
+    HITL wait, that can take minutes. Force-cancel bypasses the wait:
+
+      1. Set the cancel flag (so the eventual checkpoint also halts).
+      2. Wake every blocker (pause / intervention).
+      3. WRITE THE DB ROW DIRECTLY to ``status='cancelled'`` — the
+         system considers the run terminal from this instant.
+      4. Emit ``cancelled`` on the SSE bus so the UI moves on.
+
+    The orphan Python thread may keep running for a beat (we can't
+    kill OS threads from inside Python). When it eventually reaches
+    a checkpoint, it'll see ``is_cancelled=True`` and exit cleanly.
+    Any DB writes it attempts afterwards target a row that's already
+    terminal — harmless.
+
+    Idempotent on terminal rows. Returns a small dict the API surfaces
+    so the operator sees what happened.
+    """
+    request_cancel(run_id)
+
+    db = SessionLocal()
+    out: dict[str, object] = {
+        "run_id": run_id,
+        "force_cancel": True,
+        "previous_status": None,
+        "new_status": None,
+    }
+    try:
+        run = db.get(AgentRun, run_id)
+        if run is None:
+            out["error"] = "run not found"
+            return out
+        out["previous_status"] = run.status
+        if run.status in ("completed", "failed", "cancelled"):
+            out["new_status"] = run.status
+            out["note"] = "already terminal — no DB change"
+            return out
+        run.status = "cancelled"
+        run.completed_at = _utcnow()
+        run.error_message = (
+            f"force-cancelled: {reason}"[:2000]
+        )
+        # Mark the worker side: stash a flag in output_summary_json
+        # so reports can flag "DB cancelled but the runner thread may
+        # have continued briefly".
+        prev_summary = dict(run.output_summary_json or {})
+        prev_summary["force_cancelled"] = True
+        prev_summary["force_cancel_reason"] = reason[:500]
+        run.output_summary_json = prev_summary
+        db.commit()
+        out["new_status"] = "cancelled"
+        try:
+            _emit_run_event(
+                run, "cancelled",
+                {"message": f"force-cancelled: {reason}"[:500]},
+            )
+        except Exception as e:
+            logger.warning("emit force-cancel event failed: %s", e)
+        logger.warning(
+            "Run %s FORCE-CANCELLED (was %s): %s",
+            run_id, out["previous_status"], reason,
+        )
+    except Exception as e:
+        logger.exception("force_cancel DB write failed for run %s", run_id)
+        out["error"] = str(e)[:200]
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+    return out
+
+
+def reap_orphaned_runs(*, stale_after_seconds: int = 60) -> dict:
+    """Phase K.2 — reaper for runs left in non-terminal status after
+    a process restart / crash. Marks them ``cancelled`` so they don't
+    block the UI or duplicate-run guards forever.
+
+    Definition of "orphaned": a run in ('queued', 'running', 'paused')
+    whose ``started_at`` is older than ``stale_after_seconds`` AND
+    whose ``completed_at`` is NULL. We don't try to distinguish
+    "running and slow" from "dead" — at process boot, EVERY non-
+    terminal row is orphaned by construction (no live thread exists
+    for it). The threshold matters only when the reaper runs while
+    other runs are legitimately active.
+    """
+    from datetime import timedelta  # noqa: PLC0415
+    from sqlalchemy import select, or_ as _or  # noqa: PLC0415
+
+    db = SessionLocal()
+    cutoff = _utcnow() - timedelta(seconds=stale_after_seconds)
+    reaped: list[int] = []
+    try:
+        rows = list(db.execute(
+            select(AgentRun).where(
+                AgentRun.status.in_(["queued", "running", "paused"]),
+                AgentRun.completed_at.is_(None),
+                _or(
+                    AgentRun.started_at.is_(None),
+                    AgentRun.started_at < cutoff,
+                ),
+            ),
+        ).scalars())
+        for r in rows:
+            r.status = "cancelled"
+            r.completed_at = _utcnow()
+            prev_msg = r.error_message or ""
+            r.error_message = (
+                "orphaned: process restart / runner dead — auto-reaped"
+                + (f" (prior msg: {prev_msg[:200]})" if prev_msg else "")
+            )[:2000]
+            prev_summary = dict(r.output_summary_json or {})
+            prev_summary["reaped"] = True
+            prev_summary["reap_reason"] = "process_restart"
+            r.output_summary_json = prev_summary
+            reaped.append(r.id)
+        if reaped:
+            db.commit()
+            logger.warning(
+                "Reaped %d orphaned agent run(s): %s",
+                len(reaped), reaped,
+            )
+            # Emit cancelled events post-commit so subscribers see
+            # the terminal transition.
+            for r in rows:
+                try:
+                    _emit_run_event(
+                        r, "cancelled",
+                        {"message": "auto-reaped after process restart"},
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.exception("reap_orphaned_runs failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"reaped": [], "error": str(e)[:200]}
+    finally:
+        db.close()
+    return {"reaped": reaped, "count": len(reaped)}
+
+
 # ── Runners (one per agent kind) ─────────────────────────────────
 
 
@@ -676,6 +826,14 @@ def execute_run(run_id: int) -> None:
         mode = input_data.get("mode", "scripted")
         if mode not in ("scripted", "agentic", "replay"):
             mode = "scripted"
+        # Phase H — preflight selector. "auto" runs Scout + refine
+        # when needed (default for agentic; off for scripted/replay
+        # since those modes don't need a vision-grounded plan to
+        # function). "force" always re-scouts. "skip" disables it.
+        raw_preflight = input_data.get("preflight")
+        if raw_preflight not in ("auto", "force", "skip"):
+            raw_preflight = "auto" if mode == "agentic" else "skip"
+        preflight = raw_preflight
         # Phase 6 — agent strategy. Only meaningful for ``agentic``.
         # Persist on the run row so the report can show which path
         # actually drove the run.
@@ -757,6 +915,7 @@ def execute_run(run_id: int) -> None:
                     provider=provider,
                     cheap_provider=cheap_provider,
                     agent_strategy=agent_strategy,
+                    preflight=preflight,
                     auto_adjust=auto_adjust,
                     promote_fixes=promote_fixes,
                     window_position=window_position,
@@ -810,6 +969,8 @@ def execute_run(run_id: int) -> None:
                     headless=headless,
                     speed=speed_raw,
                     provider=provider,
+                    cheap_provider=cheap_provider,
+                    preflight=preflight,
                     ai_assist=ai_assist,
                     auto_adjust=auto_adjust,
                     promote_fixes=promote_fixes,

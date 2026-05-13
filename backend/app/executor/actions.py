@@ -101,6 +101,81 @@ def clear_focused_field(page: "Page") -> None:
             pass
 
 
+_DRAWER_SCROLL_JS = r"""
+(direction) => {
+  // Find the dominant scrollable drawer/dialog and scroll it
+  // top or bottom. Returns true when a drawer was found + scrolled,
+  // false when we fell back to scrolling the document. Used by the
+  // agent's pre-submit scroll-to-find-Save helper.
+  const candidates = [
+    ...document.querySelectorAll(
+      '[role=dialog], [role=alertdialog], .MuiDialog-paper, ' +
+      '.MuiDrawer-paper, [class*="Drawer"], [class*="drawer"], ' +
+      '[class*="Modal"], [class*="modal"]'
+    ),
+  ].filter(el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 100 || r.height < 100) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden';
+  });
+  candidates.sort((a, b) => {
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (br.width * br.height) - (ar.width * ar.height);
+  });
+  const target = candidates[0];
+  if (!target) {
+    if (direction === 'bottom') {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    } else {
+      window.scrollTo(0, 0);
+    }
+    return false;
+  }
+  let scroller = target;
+  if (scroller.scrollHeight <= scroller.clientHeight + 4) {
+    const inner = [...target.querySelectorAll('*')].find(el => {
+      const cs = getComputedStyle(el);
+      return (cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+        && el.scrollHeight > el.clientHeight + 4;
+    });
+    if (inner) scroller = inner;
+  }
+  if (direction === 'bottom') {
+    scroller.scrollTop = scroller.scrollHeight;
+  } else {
+    scroller.scrollTop = 0;
+  }
+  return true;
+};
+"""
+
+
+def scroll_drawer_to_bottom(page: "Page") -> bool:
+    """Scroll the active modal/drawer to the bottom so the submit
+    button (typically pinned bottom-right inside the drawer) is in
+    view.
+
+    Returns True when a drawer was located and scrolled, False when
+    we fell back to scrolling the document body. Best-effort —
+    failures are swallowed; the agent's next action will retry from
+    whatever state the page is in.
+    """
+    try:
+        return bool(page.evaluate(_DRAWER_SCROLL_JS, "bottom"))
+    except Exception:
+        return False
+
+
+def scroll_drawer_to_top(page: "Page") -> bool:
+    """Counterpart to :func:`scroll_drawer_to_bottom`."""
+    try:
+        return bool(page.evaluate(_DRAWER_SCROLL_JS, "top"))
+    except Exception:
+        return False
+
+
 @dataclass
 class ActionContext:
     """Per-step context the dispatcher needs.

@@ -281,6 +281,51 @@ def extract_goal(
     Raises:
         RuntimeError: LLM call failed or returned malformed shape.
     """
+    # Phase I.4 — goal-mode short-circuit. When the submodule has no
+    # step children AND has authored description/postconditions/
+    # evidence_signals, the goal is ALREADY explicit — we build the
+    # Goal directly without an LLM call. The agent's decomposer then
+    # plans from the goal + screenshot + AppMap, ignoring step-level
+    # prescription entirely (the user's stated preference: "concept
+    # from the test cases text, not the executional test cases").
+    leaf_steps = [s for s in steps if s.kind == "step"]
+    if not leaf_steps:
+        description = (
+            (submodule.description_md or "").strip()
+            or (submodule.title or "").strip()
+            or "Achieve the submodule's stated outcome on this page."
+        )
+        # Success criteria come from evidence_signals when present;
+        # fall back to postconditions; final fallback synthesises one
+        # from the title so the agent still has something to verify.
+        signals = list(submodule.evidence_signals or [])
+        if not signals:
+            signals = list(submodule.postconditions or [])
+        if not signals:
+            signals = [
+                "the action's primary effect is visible on the page "
+                "(toast, badge update, list-row added, drawer closed)",
+            ]
+        return Goal(
+            submodule_id=submodule.id,
+            submodule_title=submodule.title or "",
+            path=(
+                submodule_path
+                or submodule.path_cached
+                or submodule.title
+                or ""
+            ),
+            description=description,
+            success_criteria=signals,
+            hints=[],
+            preconditions=list(submodule.preconditions or []),
+            postconditions=list(submodule.postconditions or []),
+            evidence_signals=list(submodule.evidence_signals or []),
+            alternative_paths=list(submodule.alternative_paths or []),
+            input_tokens=0,
+            output_tokens=0,
+        )
+
     hints = [
         StepHint(
             ordinal=s.ordinal,
@@ -290,8 +335,7 @@ def extract_goal(
             narrative=s.narrative,
             expected=s.expected,
         )
-        for s in steps
-        if s.kind == "step"
+        for s in leaf_steps
     ]
     hints.sort(key=lambda h: h.ordinal)
 

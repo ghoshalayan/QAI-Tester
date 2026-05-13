@@ -423,7 +423,6 @@ def scout_app(
 
     from app.agents.recon import run_recon  # noqa: PLC0415
     from app.executor.browser import browser_session  # noqa: PLC0415
-    from app.executor.pacing import get_speed_config  # noqa: PLC0415
     from app.llm.cost_tracker import (  # noqa: PLC0415
         begin_run as _begin_cost,
         end_run as _end_cost,
@@ -468,10 +467,12 @@ def scout_app(
     db.refresh(run_row)
 
     _begin_cost(run_id=run_row.id)
-    config = get_speed_config(None)
     try:
-        with browser_session(headless=True, speed_config=config) as bs:
-            page = bs.context.new_page()
+        # ``browser_session`` yields a Page directly; ``speed=None``
+        # defaults to the configured speed preset. The previous call
+        # used ``speed_config=`` + ``bs.context.new_page()`` which
+        # were stale APIs left over from an earlier wrapper.
+        with browser_session(headless=True, speed=None) as page:
             try:
                 result = run_recon(
                     page,
@@ -548,6 +549,536 @@ def delete_plan(
 ):
     plan = _require_plan(db, project_id, plan_id)
     db.delete(plan)  # CASCADE removes credentials and doc-links
+    db.commit()
+
+
+# ── Phase A.5 — AppMap (mindmap) inspection + refresh ──────────────
+
+
+@router.get("/{plan_id}/app-map")
+def get_app_map(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return the current AppMap for the plan's target_url, or 404
+    when none exists yet. Lets the UI render the mindmap viewer
+    + show "no map yet — first run will build one"."""
+    plan = _require_plan(db, project_id, plan_id)
+    target_url = (plan.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "Plan has no target_url; can't load an app map.",
+        )
+    from app.agents.app_map import load_app_map  # noqa: PLC0415
+
+    m = load_app_map(db, target_url=target_url)
+    if m is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"No app map exists for {target_url} yet. The next "
+            "agentic run will build one automatically after login.",
+        )
+    return m.to_dict()
+
+
+# ── Phase C — TC version listing + refinement endpoint ────────────
+
+
+@router.get("/{plan_id}/tc-versions")
+def list_tc_versions(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return all TcVersions for this plan, newest first. Lets the
+    run-start dialog show "use v1 BRD-initial / v2 app-map-refined /
+    v3 manual" choices."""
+    plan = _require_plan(db, project_id, plan_id)
+    from app.models.tc_version import TcVersion  # noqa: PLC0415
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    rows = list(db.execute(
+        _select(TcVersion)
+        .where(TcVersion.plan_id == plan.id)
+        .order_by(TcVersion.version_number.desc()),
+    ).scalars())
+    return {
+        "current_tc_version_id": plan.current_tc_version_id,
+        "versions": [
+            {
+                "id": r.id,
+                "version_number": r.version_number,
+                "source": r.source,
+                "label": r.label or f"v{r.version_number} ({r.source})",
+                "created_at": r.created_at.isoformat()
+                if r.created_at else None,
+                "notes": r.notes_json or None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/{plan_id}/tc-versions/{version_id}")
+def get_tc_version(
+    project_id: int,
+    plan_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return one version's full snapshot tree — used by the diff
+    dialog after refinement so the user can review each change
+    before activating the version."""
+    plan = _require_plan(db, project_id, plan_id)
+    from app.models.tc_version import (  # noqa: PLC0415
+        TcVersion, TcNodeSnapshot,
+    )
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    version = db.get(TcVersion, version_id)
+    if version is None or version.plan_id != plan.id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Version {version_id} not found for plan {plan.id}",
+        )
+    snaps = list(db.execute(
+        _select(TcNodeSnapshot)
+        .where(TcNodeSnapshot.tc_version_id == version.id)
+        .order_by(
+            TcNodeSnapshot.depth,
+            TcNodeSnapshot.parent_snapshot_id,
+            TcNodeSnapshot.ordinal,
+        ),
+    ).scalars())
+    return {
+        "id": version.id,
+        "plan_id": version.plan_id,
+        "version_number": version.version_number,
+        "source": version.source,
+        "label": version.label or f"v{version.version_number} ({version.source})",
+        "created_at": version.created_at.isoformat()
+        if version.created_at else None,
+        "notes": version.notes_json or None,
+        "snapshots": [
+            {
+                "id": s.id,
+                "original_tc_node_id": s.original_tc_node_id,
+                "parent_snapshot_id": s.parent_snapshot_id,
+                "kind": s.kind,
+                "ordinal": s.ordinal,
+                "depth": s.depth,
+                "title": s.title,
+                "description_md": s.description_md,
+                "action_type": s.action_type,
+                "target_hint": s.target_hint,
+                "narrative": s.narrative,
+                "expected": s.expected,
+                "change_kind": s.change_kind,
+                "change_reason": s.change_reason,
+                "selectable_default": s.selectable_default,
+                # Phase D — validation surface.
+                "validation_status": getattr(
+                    s, "validation_status", "pending",
+                ),
+                "validation_confidence": getattr(
+                    s, "validation_confidence", None,
+                ),
+                "validation_reason": getattr(
+                    s, "validation_reason", None,
+                ),
+                "validation_at": (
+                    s.validation_at.isoformat()
+                    if getattr(s, "validation_at", None) else None
+                ),
+            }
+            for s in snaps
+        ],
+    }
+
+
+@router.put("/{plan_id}/tc-versions/{version_id}/activate")
+def activate_tc_version(
+    project_id: int,
+    plan_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+):
+    """Activate this TcVersion — OVERWRITE the live TcNode tree with
+    the version's snapshot tree (per the user's audit-trail
+    semantics). What you see in the test-cases viewer is what runs
+    against. The version snapshots remain queryable for audit /
+    rollback (activate v1 = revert to the BRD-initial baseline).
+
+    Pass version_id=0 to clear the pointer without changing the
+    tree (rare; advanced use).
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    if version_id == 0:
+        plan.current_tc_version_id = None
+        db.commit()
+        return {"current_tc_version_id": None}
+    from app.models.tc_version import TcVersion  # noqa: PLC0415
+    from app.services.tc_refinement import (  # noqa: PLC0415
+        apply_tc_version_to_live,
+    )
+
+    version = db.get(TcVersion, version_id)
+    if version is None or version.plan_id != plan.id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Version {version_id} not found for plan {plan.id}",
+        )
+
+    try:
+        counts = apply_tc_version_to_live(
+            db, plan_id=plan.id, version_id=version.id,
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            500,
+            f"Failed to apply version to live tree: {e}",
+        ) from e
+
+    plan.current_tc_version_id = version.id
+    db.commit()
+    return {
+        "current_tc_version_id": version.id,
+        "version_number": version.version_number,
+        "applied": counts,
+    }
+
+
+@router.post("/{plan_id}/tc-versions/{version_id}/validate")
+def validate_tc_version(
+    project_id: int,
+    plan_id: int,
+    version_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase D — dry-run validate a TcVersion against the live UI.
+
+    Opens a (headless) browser, logs into the target app via
+    ``auth_flow``, walks each refined step, and probes each
+    target_hint against the live DOM **without dispatching the
+    action**. Writes ``validation_status`` + ``validation_confidence``
+    onto each snapshot row.
+
+    Synchronous (~60-90s for Solar's 30+ steps). The dialog shows a
+    spinner. Cancellable via the same cancel registry used for runs
+    (planned).
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    from app.models.tc_version import TcVersion  # noqa: PLC0415
+
+    version = db.get(TcVersion, version_id)
+    if version is None or version.plan_id != plan.id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Version {version_id} not found for plan {plan.id}",
+        )
+    if not (plan.target_url or "").strip():
+        raise HTTPException(
+            400,
+            "Plan has no target_url — can't dry-run validate.",
+        )
+    from app.llm.router import build_tier_pair  # noqa: PLC0415
+    try:
+        provider, cheap_provider = build_tier_pair(db)
+    except Exception:
+        provider, cheap_provider = None, None
+    from app.services.tc_validation import (  # noqa: PLC0415
+        validate_version_against_live,
+    )
+    result = validate_version_against_live(
+        db,
+        plan_id=plan.id,
+        version_id=version.id,
+        headless=True,
+        provider=provider,
+        cheap_provider=cheap_provider,
+    )
+    return {
+        "plan_id": plan.id,
+        "version_id": version.id,
+        "total_probed": result.total_probed,
+        "total_seconds": result.total_seconds,
+        "error_message": result.error_message,
+        "cancelled": result.cancelled,
+        "submodules": [
+            {
+                "submodule_snapshot_id": sm.submodule_snapshot_id,
+                "title": sm.submodule_title,
+                "confirmed": sm.confirmed,
+                "partial": sm.partial,
+                "unresolved": sm.unresolved,
+                "unreachable": sm.unreachable,
+                "skipped": sm.skipped,
+                "confidence": round(sm.confidence, 3),
+            }
+            for sm in result.submodules
+        ],
+    }
+
+
+@router.post("/{plan_id}/refine-from-app-map")
+def refine_from_app_map(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase C.2 — kick off the per-submodule TC refinement.
+
+    Synchronous (the call returns when refinement is done). For
+    Solar (7 submodules) this is ~10-30s wallclock. The response
+    carries the new version_id so the UI can immediately fetch the
+    diff via ``GET /tc-versions/{id}``.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    target_url = (plan.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "Plan has no target_url; can't refine without an AppMap.",
+        )
+    from app.agents.app_map import load_app_map  # noqa: PLC0415
+
+    if load_app_map(db, target_url=target_url) is None:
+        raise HTTPException(
+            400,
+            "No AppMap exists for this target_url yet. Run agentic "
+            "mode once OR click 'Scout this app' to build one first.",
+        )
+
+    from app.llm.router import build_tier_pair  # noqa: PLC0415
+
+    try:
+        provider, cheap_provider = build_tier_pair(db)
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"LLM provider not configured: {e}",
+        ) from e
+
+    from app.services.tc_refinement import refine_plan  # noqa: PLC0415
+
+    result = refine_plan(
+        db,
+        plan_id=plan_id,
+        provider=provider,
+        cheap_provider=cheap_provider,
+    )
+
+    if result.error_message:
+        raise HTTPException(
+            400,
+            f"Refinement failed: {result.error_message}",
+        )
+    return {
+        "plan_id": plan_id,
+        "version_id": result.version_id,
+        "version_number": result.version_number,
+        "submodule_count": len(result.submodules),
+        "input_tokens": result.total_input_tokens,
+        "output_tokens": result.total_output_tokens,
+        "submodule_summaries": [
+            {
+                "submodule_id": rs.submodule_id,
+                "title": rs.submodule_title,
+                "step_count": len(rs.steps),
+                "kept": sum(
+                    1 for s in rs.steps if s.change_kind == "kept"
+                ),
+                "rewritten": sum(
+                    1 for s in rs.steps
+                    if s.change_kind == "rewritten"
+                ),
+                "added": sum(
+                    1 for s in rs.steps if s.change_kind == "added"
+                ),
+                "flagged_missing": sum(
+                    1 for s in rs.steps
+                    if s.change_kind == "flagged_missing"
+                ),
+                "confidence": rs.confidence,
+                "error": rs.error_message,
+            }
+            for rs in result.submodules
+        ],
+    }
+
+
+@router.post("/{plan_id}/preflight")
+def preflight_plan(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+    force: bool = False,
+    skip_scout: bool = False,
+):
+    """Phase H — run the full Scout → Refine → Activate preflight.
+
+    Convenience endpoint. Identical to what auto-runs at the head of
+    an agentic run, but exposed so the tester can validate + refine
+    the plan WITHOUT actually starting execution. Useful when:
+
+    - Adding new submodules to an existing plan (refine before run).
+    - Switching the target_url to a new environment (re-scout +
+      re-refine).
+    - Reviewing what the refiner would change before committing.
+
+    Synchronous. Scout-needed first runs are ~30-90s; cached re-runs
+    skip straight to refinement (~10-30s for a 7-submodule plan).
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    target_url = (plan.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "Plan has no target_url; can't preflight without one.",
+        )
+
+    from app.llm.router import build_tier_pair  # noqa: PLC0415
+    try:
+        provider, cheap_provider = build_tier_pair(db)
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"LLM provider not configured: {e}",
+        ) from e
+
+    from app.services.preflight import run_preflight  # noqa: PLC0415
+
+    result = run_preflight(
+        db,
+        plan_id=plan_id,
+        provider=provider,
+        cheap_provider=cheap_provider,
+        force=force,
+        skip_scout=skip_scout,
+        headless=True,
+    )
+    if result.status == "failed":
+        raise HTTPException(
+            400,
+            f"Preflight failed: {result.error_message}",
+        )
+    return {
+        "plan_id": plan_id,
+        "status": result.status,
+        "scout_ran": result.scout_ran,
+        "scout_pages": result.scout_pages,
+        "scout_create_surfaces": result.scout_create_surfaces,
+        "refine_ran": result.refine_ran,
+        "new_version_id": result.new_version_id,
+        "refined_submodules": result.refined_submodules,
+        "rewritten": result.refined_rewritten,
+        "added": result.refined_added,
+        "flagged_missing": result.refined_flagged_missing,
+        "activated_version_id": result.activated_version_id,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "total_seconds": result.total_seconds,
+        "notes": result.notes,
+    }
+
+
+@router.post("/{plan_id}/submodules/{submodule_id}/convert-to-goal-mode")
+def convert_submodule_to_goal_mode(
+    project_id: int,
+    plan_id: int,
+    submodule_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase I.4 — drop a submodule's step children so the agentic
+    runner treats it as goal-mode.
+
+    Goal-mode contract: the submodule's ``description_md`` IS the
+    goal (intent); ``evidence_signals`` are the success criteria;
+    ``preconditions`` / ``postconditions`` / ``alternative_paths``
+    are passed as context. The agent decomposes from goal +
+    screenshot + AppMap, ignoring step-level prescription entirely.
+
+    Idempotent: calling on a submodule that's already goal-mode
+    (no step children) is a no-op.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    from app.models.tc_node import TcNode  # noqa: PLC0415
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    submodule = db.execute(
+        _select(TcNode).where(
+            TcNode.id == submodule_id,
+            TcNode.plan_id == plan.id,
+            TcNode.kind == "submodule",
+        ),
+    ).scalar_one_or_none()
+    if submodule is None:
+        raise HTTPException(
+            404,
+            f"submodule {submodule_id} not found on plan {plan_id}",
+        )
+
+    children = list(db.execute(
+        _select(TcNode).where(
+            TcNode.parent_id == submodule.id,
+            TcNode.kind == "step",
+        ),
+    ).scalars())
+    removed = 0
+    for c in children:
+        db.delete(c)
+        removed += 1
+    db.commit()
+    return {
+        "submodule_id": submodule.id,
+        "title": submodule.title,
+        "goal_mode": True,
+        "steps_removed": removed,
+        "description_md": submodule.description_md,
+        "has_evidence_signals": bool(submodule.evidence_signals),
+        "has_postconditions": bool(submodule.postconditions),
+    }
+
+
+@router.delete(
+    "/{plan_id}/app-map",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def clear_app_map(
+    project_id: int,
+    plan_id: int,
+    db: Session = Depends(get_db),
+):
+    """Delete the AppMap so the next agentic run rebuilds it.
+
+    We don't run the scout synchronously here — that needs a
+    logged-in browser session, which only exists during an agent
+    run. Instead the "refresh" UX deletes the stale map; the next
+    run notices it's missing and inline-scouts.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    target_url = (plan.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            400,
+            "Plan has no target_url; can't clear an app map.",
+        )
+    from app.models.app_knowledge import AppKnowledge  # noqa: PLC0415
+    from app.services.akb import _normalise_pattern  # noqa: PLC0415
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    pattern = _normalise_pattern(target_url)
+    rows = db.execute(
+        _select(AppKnowledge).where(
+            AppKnowledge.target_url_pattern == pattern,
+            AppKnowledge.kind == "app_map",
+        ),
+    ).scalars().all()
+    for row in rows:
+        db.delete(row)
     db.commit()
 
 

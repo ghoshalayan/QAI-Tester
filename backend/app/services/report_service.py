@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import logging
 from collections import OrderedDict
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -114,6 +115,71 @@ def _step_to_report_row(step: ExecutionStep) -> ReportStepRead:
         runtime_sg = details.get("sub_goals")
         if isinstance(runtime_sg, list) and runtime_sg:
             sub_goals = [s for s in runtime_sg if isinstance(s, dict)]
+
+        # Phase B Step 7 — replay-mode segment surfacing. When the
+        # submodule ran in replay mode with a v2 frozen path, the
+        # per-segment metadata lives at ``details["frozen_segments_meta"]``
+        # and the agentic recovery (if any) lives at
+        # ``details["agentic_recovery"]["sub_goals"]``. Merge them
+        # into the report's sub_goals timeline so the report row
+        # shows BOTH the replay's segment outcomes AND the agentic
+        # recovery's per-sub-goal status. Frozen segments tagged
+        # source="frozen"; agentic recovery sub_goals tagged
+        # source="agentic"; segments that were attempted+failed AND
+        # later recovered get tagged "frozen_then_agentic".
+        frozen_segments = details.get("frozen_segments_meta")
+        agentic_recovery = details.get("agentic_recovery")
+        if isinstance(frozen_segments, list) and frozen_segments:
+            replay_rows: list[dict[str, Any]] = []
+            recovered_ids: set[str] = set()
+            if isinstance(agentic_recovery, dict):
+                rec_sgs = agentic_recovery.get("sub_goals") or []
+                if isinstance(rec_sgs, list):
+                    for rsg in rec_sgs:
+                        if isinstance(rsg, dict) and rsg.get("status") == "done":
+                            recovered_ids.add(str(rsg.get("id", "")))
+            for seg in frozen_segments:
+                if not isinstance(seg, dict):
+                    continue
+                sg_id = str(seg.get("sub_goal_id", ""))
+                seg_status = str(seg.get("status", "pending"))
+                source = "frozen"
+                final_status = seg_status
+                if seg_status == "failed" and sg_id in recovered_ids:
+                    source = "frozen_then_agentic"
+                    final_status = "done"
+                replay_rows.append({
+                    "id": sg_id,
+                    "description": str(seg.get("description", "")),
+                    "status": final_status,
+                    "success_criterion": str(
+                        seg.get("success_criterion", ""),
+                    ) or None,
+                    "reason": (
+                        str(seg.get("failure_reason", ""))
+                        if seg_status == "failed" else None
+                    ),
+                    "source": source,
+                    "frozen_step_count": int(
+                        seg.get("step_count", 0) or 0,
+                    ) or None,
+                })
+            # Append any agentic-only sub_goals (those NOT present in
+            # frozen segments) at the end of the timeline.
+            seen_ids = {str(r.get("id", "")) for r in replay_rows}
+            if isinstance(agentic_recovery, dict):
+                rec_sgs = agentic_recovery.get("sub_goals") or []
+                if isinstance(rec_sgs, list):
+                    for rsg in rec_sgs:
+                        if not isinstance(rsg, dict):
+                            continue
+                        if str(rsg.get("id", "")) in seen_ids:
+                            continue
+                        merged = dict(rsg)
+                        merged["source"] = "agentic"
+                        replay_rows.append(merged)
+            if replay_rows:
+                sub_goals = replay_rows
         log = details.get("agent_log") or []
         if isinstance(log, list):
             # Preserve the raw dicts; Pydantic coerces them on the

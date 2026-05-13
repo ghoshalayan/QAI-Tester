@@ -129,6 +129,20 @@ export default function LivePresenterPage() {
       toast.error("Cancel failed", { description: msg });
     },
   });
+  const forceCancelMut = useMutation({
+    mutationFn: () => api.forceCancelAgentRun(projectId, runId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId, runId] });
+      toast.success("Force-stopped", {
+        description:
+          "Run marked cancelled in the DB. The worker thread may run for a beat longer.",
+      });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Force-stop failed", { description: msg });
+    },
+  });
 
   // Page title reflects status so the user can spot completion in the
   // taskbar/dock without focusing the popup.
@@ -158,9 +172,20 @@ export default function LivePresenterPage() {
         pausePending={pauseMut.isPending}
         resumePending={resumeMut.isPending}
         cancelPending={cancelMut.isPending}
+        forceCancelPending={forceCancelMut.isPending}
         onPause={() => pauseMut.mutate()}
         onResume={() => resumeMut.mutate()}
         onCancel={() => cancelMut.mutate()}
+        onForceCancel={() => {
+          if (
+            window.confirm(
+              "Force-stop will mark this run cancelled in the DB immediately. " +
+                "The worker thread may keep running for a few seconds. Continue?",
+            )
+          ) {
+            forceCancelMut.mutate();
+          }
+        }}
       />
 
       {intervention && (
@@ -179,6 +204,22 @@ export default function LivePresenterPage() {
         runId={runId}
         events={events}
       />
+
+      {/* Phase A.6 Step 5 — Scout progress panel. Auto-opens on
+          ``app_map_scout_started``, ticks through ``auth_scout_page``,
+          closes on ``app_map_built``. Gives the user visibility into
+          what the agent is learning about the app before execution
+          begins. */}
+      <ScoutProgressPanel
+        projectId={projectId}
+        runId={runId}
+        events={events}
+      />
+
+      {/* Phase A.6 Step 6 — Plan ↔ AppMap reconciliation. Renders
+          above execution so the user sees which submodules will
+          likely struggle BEFORE turns burn on them. */}
+      <ReconciliationPanel events={events} />
 
       <CostMeter run={run ?? null} />
 
@@ -242,9 +283,11 @@ function Controls({
   pausePending,
   resumePending,
   cancelPending,
+  forceCancelPending,
   onPause,
   onResume,
   onCancel,
+  onForceCancel,
 }: {
   isPaused: boolean;
   isRunning: boolean;
@@ -252,9 +295,11 @@ function Controls({
   pausePending: boolean;
   resumePending: boolean;
   cancelPending: boolean;
+  forceCancelPending: boolean;
   onPause: () => void;
   onResume: () => void;
   onCancel: () => void;
+  onForceCancel: () => void;
 }) {
   if (isTerminal) return null;
   return (
@@ -288,6 +333,19 @@ function Controls({
       >
         <Square className="size-3.5" />
         Stop
+      </Button>
+      {/* Phase K.1 — STRICT STOP. Writes the DB row to cancelled
+          immediately; the worker thread may run for a beat longer
+          but the system treats it as terminal from this click. */}
+      <Button
+        size="sm"
+        variant="destructive"
+        onClick={onForceCancel}
+        disabled={forceCancelPending}
+        title="Force-stop: marks the run cancelled in the DB immediately"
+      >
+        <Square className="size-3.5" />
+        Force stop
       </Button>
     </div>
   );
@@ -632,6 +690,423 @@ function EventRow({ event }: { event: LiveEvent }) {
   // and the live feed shows what the VL planner came up with — gives
   // the user a glimpse of the agent's mental model before any
   // actions fire.
+  // Phase H — preflight pass (Scout → Refine → Activate) that runs
+  // BEFORE per-submodule execution so the agent reads a UI-grounded
+  // test plan, not the BRD-derived baseline.
+  if (type === "preflight_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="preflight · started"
+        title={
+          data.force
+            ? "force re-run: rescout + refine"
+            : "validating test cases against the actual UI"
+        }
+        sublabel={data.target_url as string | undefined}
+      />
+    );
+  }
+  if (type === "preflight_scout_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="preflight · scout · started"
+        sublabel={
+          (data.depth as string | undefined) ?? "deep"
+        }
+      />
+    );
+  }
+  if (type === "preflight_scout_auth_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="preflight · scout · auth"
+        title="logging in to scout the post-auth surface"
+        sublabel={data.url as string | undefined}
+      />
+    );
+  }
+  if (type === "preflight_scout_auth_completed") {
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="preflight · scout · auth ok"
+        sublabel={`${data.iterations ?? "?"} auth iterations`}
+      />
+    );
+  }
+  if (type === "preflight_scout_auth_failed") {
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-rose-500" />}
+        label="preflight · scout · auth failed"
+        title={(data.error as string | undefined) ?? "auth failed"}
+      />
+    );
+  }
+  if (type === "preflight_scout_completed") {
+    const pages = typeof data.pages === "number" ? data.pages : "?";
+    const cs = typeof data.create_surfaces === "number" ? data.create_surfaces : "?";
+    const mods = typeof data.modules === "number" ? data.modules : "?";
+    const flows = typeof data.create_flows === "number" ? data.create_flows : "?";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="preflight · scout · completed"
+        title={`${pages} pages · ${cs} create-surfaces`}
+        sublabel={`${mods} modules · ${flows} create-flows`}
+      />
+    );
+  }
+  if (type === "preflight_scout_failed" || type === "preflight_scout_empty") {
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-rose-500" />}
+        label="preflight · scout · failed"
+        title={(data.error as string | undefined) ?? "scout failed"}
+      />
+    );
+  }
+  if (type === "preflight_refine_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="preflight · refine · started"
+        sublabel={
+          `${data.appmap_modules ?? "?"} modules · ` +
+          `${data.appmap_create_flows ?? "?"} create-flows in AppMap`
+        }
+      />
+    );
+  }
+  if (type === "preflight_refine_completed") {
+    const sm = typeof data.submodules === "number" ? data.submodules : "?";
+    const rw = typeof data.rewritten === "number" ? data.rewritten : 0;
+    const ad = typeof data.added === "number" ? data.added : 0;
+    const fl = typeof data.flagged_missing === "number" ? data.flagged_missing : 0;
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-amber-500" />}
+        label="preflight · refine · completed"
+        title={`${sm} submodules refined`}
+        sublabel={
+          `rewritten ${rw} · added ${ad} · flagged ${fl}`
+        }
+      />
+    );
+  }
+  if (type === "preflight_activation_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="preflight · activating"
+        sublabel={`v${data.version_id ?? "?"}`}
+      />
+    );
+  }
+  if (type === "preflight_activation_completed") {
+    const cre = typeof data.nodes_created === "number" ? data.nodes_created : "?";
+    const rem = typeof data.nodes_removed === "number" ? data.nodes_removed : "?";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="preflight · activated"
+        title={`v${data.version_id ?? "?"} is now the live plan`}
+        sublabel={`${cre} nodes created · ${rem} replaced`}
+      />
+    );
+  }
+  if (type === "preflight_completed") {
+    const status = (data.status as string | undefined) ?? "completed";
+    const scoutRan = data.scout_ran ? "scout✓" : "scout—";
+    const refineRan = data.refine_ran ? "refine✓" : "refine—";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`preflight · ${status}`}
+        title={
+          status === "skipped"
+            ? "no changes needed; existing refined plan is current"
+            : undefined
+        }
+        sublabel={`${scoutRan} · ${refineRan} · ${data.seconds ?? "?"}s`}
+      />
+    );
+  }
+  if (type === "preflight_failed") {
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-rose-500" />}
+        label="preflight · failed"
+        title={(data.error as string | undefined) ?? "preflight failed"}
+        sublabel={data.stage as string | undefined}
+      />
+    );
+  }
+  // Per-submodule refinement events (also emitted standalone via the
+  // /refine-from-app-map button — kept for both lifecycles).
+  if (type === "tc_refinement_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label="refine · started"
+        sublabel={`${data.submodule_count ?? "?"} submodules`}
+      />
+    );
+  }
+  if (type === "tc_refinement_submodule_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-amber-500" />}
+        label={`refine · ${data.title ?? "submodule"}`}
+        sublabel={`${data.step_count ?? "?"} steps`}
+      />
+    );
+  }
+  if (type === "tc_refinement_submodule_completed") {
+    const kept = data.kept ?? 0;
+    const rw = data.rewritten ?? 0;
+    const ad = data.added ?? 0;
+    const fl = data.flagged_missing ?? 0;
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`refine · done · ${data.submodule_id ?? "?"}`}
+        sublabel={`kept ${kept} · rewritten ${rw} · added ${ad} · flagged ${fl}`}
+      />
+    );
+  }
+  // Phase A.5 — authenticated scout + AppMap events. The scout
+  // runs on the first submodule of a fresh target_url to build the
+  // mindmap (modules → sections → create-flows). Subsequent runs
+  // load the cached map. Cached → app_map_loaded; fresh →
+  // app_map_scout_started → auth_scout_page (per page) →
+  // auth_scout_create_captured (per drawer) → auth_scout_completed
+  // → app_map_built.
+  if (type === "app_map_loaded") {
+    const mods = typeof data.modules === "number" ? data.modules : "?";
+    const flows = typeof data.create_flows === "number" ? data.create_flows : "?";
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label={`app map · loaded`}
+        title={`${mods} modules · ${flows} create-flows · cached`}
+      />
+    );
+  }
+  if (type === "app_map_scout_started") {
+    return (
+      <Row
+        icon={<Loader2 className="size-3.5 animate-spin text-purple-500" />}
+        label="scout · started"
+        title="walking authenticated surface — first run only"
+        sublabel={data.target_url as string | undefined}
+      />
+    );
+  }
+  if (type === "auth_scout_page") {
+    const navPath = Array.isArray(data.nav_path)
+      ? (data.nav_path as string[]).join(" → ")
+      : "(landing)";
+    const els = typeof data.elements === "number" ? `${data.elements} els` : "";
+    return (
+      <Row
+        icon={<Eye className="size-3.5 text-purple-500" />}
+        label={`scout · page · ${navPath}`}
+        title={data.title as string | undefined}
+        sublabel={els}
+      />
+    );
+  }
+  if (type === "auth_scout_create_captured") {
+    const trigger = data.trigger as string | undefined;
+    const fields = typeof data.fields === "number" ? data.fields : "?";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`scout · create-form captured`}
+        title={trigger ? `trigger: "${trigger}"` : undefined}
+        sublabel={`${fields} fields · submit "${data.submit_label ?? ""}"`}
+      />
+    );
+  }
+  if (type === "auth_scout_completed") {
+    const pages = typeof data.pages_captured === "number" ? data.pages_captured : "?";
+    const cs = typeof data.create_surfaces === "number" ? data.create_surfaces : "?";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="scout · completed"
+        sublabel={`${pages} pages · ${cs} create-flows`}
+      />
+    );
+  }
+  if (type === "app_map_built") {
+    const mods = typeof data.modules === "number" ? data.modules : "?";
+    const flows = typeof data.create_flows === "number" ? data.create_flows : "?";
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label="app map · built"
+        title={`${mods} modules · ${flows} create-flows · saved to AKB`}
+      />
+    );
+  }
+  // Phase B — per-sub-goal frozen-path replay events. The replay
+  // walker emits these as it walks each frozen segment; the
+  // partial-handoff event marks the transition from deterministic
+  // replay to agentic recovery for the failed sub-goals.
+  if (type === "frozen_segment_started") {
+    return (
+      <Row
+        icon={<CircleDashed className="size-3.5 text-blue-500" />}
+        label={`replay · segment · ${data.sub_goal_id ?? "?"}`}
+        title={data.description as string | undefined}
+      />
+    );
+  }
+  if (type === "frozen_segment_completed") {
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`replay · segment done · ${data.sub_goal_id ?? "?"}`}
+      />
+    );
+  }
+  if (type === "frozen_segment_failed") {
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-red-500" />}
+        label={`replay · segment failed · ${data.sub_goal_id ?? "?"}`}
+        title={data.reason as string | undefined}
+        sublabel="skipping remaining steps of this segment"
+      />
+    );
+  }
+  if (type === "frozen_partial_handoff") {
+    const failed = Array.isArray(data.failed_sub_goal_ids)
+      ? (data.failed_sub_goal_ids as string[])
+      : [];
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label="replay · partial → agentic recovery"
+        title={
+          failed.length > 0
+            ? `agent re-decomposing for: ${failed.join(", ")}`
+            : "handing off remaining work to the agent"
+        }
+      />
+    );
+  }
+  if (type === "frozen_path_captured") {
+    const version = (data.version as number | undefined) ?? 1;
+    const segs = data.segments as number | undefined;
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-emerald-500" />}
+        label={`frozen path · v${version} captured`}
+        title={
+          typeof data.step_count === "number"
+            ? `${data.step_count} step(s)${segs ? ` · ${segs} segment(s)` : ""}`
+            : undefined
+        }
+        sublabel={data.agent_model as string | undefined}
+      />
+    );
+  }
+  // Phase A.6 Step 6 — Plan ↔ AppMap reconciliation. Emitted once
+  // after the first-time scout completes. Summarises how each
+  // submodule maps onto the discovered app surface.
+  if (type === "plan_reconciled") {
+    const counts = (data.counts ?? {}) as Record<string, number>;
+    const ok = counts.ok ?? 0;
+    const unc = counts.uncertain ?? 0;
+    const mm = counts.mismatch ?? 0;
+    const miss = counts.missing ?? 0;
+    const isClean = mm === 0 && miss === 0;
+    const Icon = isClean ? CheckCircle2 : AlertTriangle;
+    const colorClass = isClean ? "text-emerald-500" : "text-amber-500";
+    const parts = [];
+    if (ok > 0) parts.push(`${ok} ok`);
+    if (unc > 0) parts.push(`${unc} uncertain`);
+    if (mm > 0) parts.push(`${mm} mismatch`);
+    if (miss > 0) parts.push(`${miss} missing`);
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label="plan ↔ app · reconciled"
+        title={parts.join(" · ") || "(no rows)"}
+        sublabel={
+          isClean
+            ? "all submodules align with the app map"
+            : "see the reconciliation panel above for details"
+        }
+      />
+    );
+  }
+  // Phase A.6 Step 4 — verify-in-list gate refused a sub-goal close.
+  // The agent claimed verify done; the gate scanned for the typed
+  // entity name in visible page text, didn't find it, refused the
+  // close, and asked the agent to use search/scroll.
+  if (type === "verify_check_failed") {
+    return (
+      <Row
+        icon={<AlertTriangle className="size-3.5 text-amber-500" />}
+        label="verify gate · refused"
+        title={
+          typeof data.looked_for === "string"
+            ? `couldn't find "${data.looked_for}" in visible text`
+            : (data.reason as string | undefined)
+        }
+        sublabel="agent must search/scroll the list before mark_done"
+      />
+    );
+  }
+  // Phase A.6 Step 1 — toast / inline-error signal from a submit.
+  // Tells the user "the app pushed back" before the agent's next
+  // turn even runs.
+  if (type === "form_signal_detected") {
+    const kind = (data.kind as string | undefined) ?? "?";
+    const isError =
+      kind === "toast_error" ||
+      kind === "inline_error" ||
+      kind === "validation_error";
+    const isSuccess = kind === "toast_success";
+    const Icon = isError
+      ? XCircle
+      : isSuccess
+        ? CheckCircle2
+        : AlertTriangle;
+    const colorClass = isError
+      ? "text-red-500"
+      : isSuccess
+        ? "text-emerald-500"
+        : "text-amber-500";
+    const fields =
+      Array.isArray(data.fields) && (data.fields as string[]).length > 0
+        ? `fields: ${(data.fields as string[]).join(", ")}`
+        : undefined;
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={`form · ${kind.replace("_", " ")}`}
+        title={data.message as string | undefined}
+        sublabel={fields}
+      />
+    );
+  }
+  if (type === "sub_goal_verify_appended") {
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="verify sub-goal · appended"
+        title={data.reason as string | undefined}
+      />
+    );
+  }
   if (type === "sub_goals_decomposed") {
     const count =
       typeof data.count === "number" ? data.count : 0;
@@ -716,6 +1191,242 @@ function EventRow({ event }: { event: LiveEvent }) {
         label="HITL overlay opened"
         title={data.sub_goal as string | undefined}
         sublabel="waiting for user guidance in the test browser"
+      />
+    );
+  }
+  // Phase D — pre-submodule health signal from the runtime SOP.
+  // Surfaces the validator's verdict on this submodule before any
+  // turn fires so the user sees "this one's risky" up front.
+  if (type === "submodule_pre_run_health") {
+    const status = (data.validation_status as string | undefined) ?? "";
+    const conf =
+      typeof data.validation_confidence === "number"
+        ? Math.round(data.validation_confidence * 100)
+        : null;
+    const risky = data.is_risky === true;
+    const Icon = risky
+      ? AlertTriangle
+      : status === "confirmed"
+        ? CheckCircle2
+        : Eye;
+    const colorClass = risky
+      ? "text-amber-500"
+      : status === "confirmed"
+        ? "text-emerald-500"
+        : "text-muted-foreground";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={
+          risky
+            ? `pre-run · risky · ${status}${conf !== null ? ` (${conf}%)` : ""}`
+            : `pre-run · ${status}${conf !== null ? ` (${conf}%)` : ""}`
+        }
+        title={data.title as string | undefined}
+        sublabel={data.validation_reason as string | undefined}
+      />
+    );
+  }
+  // Phase C.4 — hybrid `type` action fell through to coord-typing
+  // on first DOM miss. Distinct event from the heavier coord-click
+  // rescue so the user can see WHEN the fast-fail saved them.
+  if (type === "coord_type_fast_fail") {
+    const conf =
+      typeof data.confidence === "number"
+        ? Math.round(data.confidence * 100)
+        : null;
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label={`type · coord fast-fail${conf !== null ? ` (${conf}%)` : ""}`}
+        title={data.label_visible as string | undefined}
+        sublabel={
+          typeof data.x === "number" && typeof data.y === "number"
+            ? `clicked + typed at (${data.x}, ${data.y})`
+            : undefined
+        }
+      />
+    );
+  }
+  // Phase F — bundled fill_form routine events. Walk: started →
+  // scanned → field × N → submit_attempt × M → completed.
+  if (type === "form_fill_started") {
+    const arr = (data.fields_requested as { label: string }[]) ?? [];
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-purple-500" />}
+        label={`form-fill · ${arr.length} field(s) requested`}
+        title={
+          arr.length > 0
+            ? arr.map((f) => f.label).slice(0, 4).join(", ") +
+              (arr.length > 4 ? `, +${arr.length - 4} more` : "")
+            : undefined
+        }
+        sublabel={
+          typeof data.submit_label === "string"
+            ? `submit="${data.submit_label}"`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "form_fill_scanned") {
+    const count =
+      typeof data.detected_count === "number" ? data.detected_count : "?";
+    return (
+      <Row
+        icon={<Eye className="size-3.5 text-muted-foreground" />}
+        label={`form-fill · scanned · ${count} field(s)`}
+      />
+    );
+  }
+  if (type === "form_fill_field") {
+    const status = (data.status as string | undefined) ?? "?";
+    const Icon =
+      status === "verified" || status === "filled"
+        ? CheckCircle2
+        : status === "miss"
+          ? XCircle
+          : status === "skipped"
+            ? Circle
+            : AlertTriangle;
+    const colorClass =
+      status === "verified" || status === "filled"
+        ? "text-emerald-500"
+        : status === "miss"
+          ? "text-red-500"
+          : status === "skipped"
+            ? "text-muted-foreground"
+            : "text-amber-500";
+    return (
+      <Row
+        icon={<Icon className={cn("size-3.5", colorClass)} />}
+        label={`field · ${data.label} · ${status}`}
+        title={
+          status === "verified" || status === "filled"
+            ? typeof data.final_value === "string"
+              ? `value: ${data.final_value}`
+              : undefined
+            : (data.error as string | undefined)
+        }
+        sublabel={
+          typeof data.role === "string" && typeof data.attempts === "number"
+            ? `${data.role} · ${data.attempts} attempt(s)`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "form_fill_field_retry") {
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-amber-500" />}
+        label={`field · retry · ${data.label}`}
+        title={data.validation_error as string | undefined}
+        sublabel={
+          typeof data.attempts === "number"
+            ? `attempt ${data.attempts}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "form_fill_submit_attempt") {
+    const ok = data.ok === true;
+    return (
+      <Row
+        icon={
+          ok ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : (
+            <AlertTriangle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={
+          ok
+            ? `form-fill · submit ok (attempt ${data.attempt}/${data.max})`
+            : `form-fill · submit retry (attempt ${data.attempt}/${data.max})`
+        }
+        title={data.message as string | undefined}
+        sublabel={
+          Array.isArray(data.invalid_fields) &&
+          (data.invalid_fields as string[]).length > 0
+            ? `invalid: ${(data.invalid_fields as string[]).join(", ")}`
+            : undefined
+        }
+      />
+    );
+  }
+  if (type === "form_fill_completed") {
+    const filled = typeof data.filled === "number" ? data.filled : 0;
+    const miss = typeof data.miss === "number" ? data.miss : 0;
+    const status = (data.submit_status as string | undefined) ?? "?";
+    const seconds =
+      typeof data.seconds === "number" ? data.seconds.toFixed(1) : "?";
+    const isClean = miss === 0 && status === "ok";
+    return (
+      <Row
+        icon={
+          isClean ? (
+            <CheckCircle2 className="size-3.5 text-emerald-500" />
+          ) : (
+            <AlertTriangle className="size-3.5 text-amber-500" />
+          )
+        }
+        label={`form-fill · ${filled} filled${miss ? `, ${miss} missed` : ""} · submit=${status}`}
+        sublabel={`${seconds}s`}
+      />
+    );
+  }
+  // Phase F.1 — turn-loop heartbeat. Keeps the feed visibly alive
+  // even when an observation / planner call is slow. Rendered tiny
+  // so it doesn't dominate the feed.
+  if (type === "agent_turn_starting") {
+    const t = typeof data.turn === "number" ? data.turn : "?";
+    const max = typeof data.max_turns === "number" ? data.max_turns : "?";
+    return (
+      <Row
+        icon={<CircleDashed className="size-3 text-muted-foreground" />}
+        label={`turn ${t}/${max}`}
+      />
+    );
+  }
+  // Phase F.1 — planner-after-HITL gave up streak detector.
+  if (type === "planner_no_op_after_hitl") {
+    return (
+      <Row
+        icon={<AlertTriangle className="size-3.5 text-red-500" />}
+        label="planner · gave up after HITL"
+        title={
+          typeof data.noop_streak === "number"
+            ? `${data.noop_streak} consecutive no-op tools after guidance`
+            : undefined
+        }
+        sublabel="run halted to avoid silent freeze; submodule marked blocked"
+      />
+    );
+  }
+  // Phase C.1 — confirmation that the user's guidance reached the
+  // planner's prompt. Closes the "I submitted but nothing happened"
+  // feedback gap — operator sees this row immediately after
+  // hitl_overlay_submitted, then watches the next agent_acted to
+  // see what the planner did with the guidance.
+  if (type === "hitl_overlay_consumed") {
+    const preview =
+      typeof data.guidance_preview === "string"
+        ? data.guidance_preview
+        : undefined;
+    const turn = typeof data.turn === "number" ? data.turn : undefined;
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-emerald-500" />}
+        label={
+          turn !== undefined
+            ? `HITL guidance · consumed at T${turn}`
+            : "HITL guidance · consumed"
+        }
+        title={preview}
+        sublabel="planner will act on this in the next turn"
       />
     );
   }
@@ -1402,4 +2113,313 @@ function formatOrdinal(
     return `${ordinal}/${total}`;
   }
   return "";
+}
+
+
+// ── Phase A.6 Step 5 — Scout progress panel ──────────────────────
+
+
+interface ScoutPageEntry {
+  url: string;
+  title: string;
+  nav_path: string[];
+  elements?: number;
+  has_create?: boolean;
+  trigger?: string;
+  fields?: number;
+  submit_label?: string;
+}
+
+interface ScoutState {
+  active: boolean;
+  finished: boolean;
+  targetUrl: string;
+  pages: ScoutPageEntry[];
+  modules?: number;
+  flows?: number;
+  pagesScouted?: number;
+  cached: boolean;
+}
+
+function ScoutProgressPanel({
+  projectId: _projectId,
+  runId: _runId,
+  events,
+}: {
+  projectId: number;
+  runId: number;
+  events: LiveEvent[];
+}) {
+  // Derive scout state from the event stream.
+  const state: ScoutState = (() => {
+    const s: ScoutState = {
+      active: false,
+      finished: false,
+      targetUrl: "",
+      pages: [],
+      cached: false,
+    };
+    for (const ev of events) {
+      const d = ev.data ?? {};
+      if (ev.type === "app_map_scout_started") {
+        s.active = true;
+        s.finished = false;
+        s.targetUrl = (d.target_url as string) ?? "";
+        s.pages = [];
+        s.cached = false;
+      } else if (ev.type === "app_map_loaded") {
+        // Cached map — surface it briefly so user knows the
+        // scout was SKIPPED on this run.
+        s.cached = true;
+        s.finished = true;
+        s.modules = typeof d.modules === "number" ? d.modules : undefined;
+        s.flows =
+          typeof d.create_flows === "number" ? d.create_flows : undefined;
+      } else if (ev.type === "auth_scout_page") {
+        const navPath = Array.isArray(d.nav_path)
+          ? (d.nav_path as string[])
+          : [];
+        s.pages.push({
+          url: (d.url as string) ?? "",
+          title: (d.title as string) ?? "",
+          nav_path: navPath,
+          elements: typeof d.elements === "number" ? d.elements : undefined,
+        });
+      } else if (ev.type === "auth_scout_create_captured") {
+        // Mark the most recent page as having a create-surface.
+        const last = s.pages[s.pages.length - 1];
+        if (last) {
+          last.has_create = true;
+          last.trigger = (d.trigger as string) ?? undefined;
+          last.fields =
+            typeof d.fields === "number" ? d.fields : undefined;
+          last.submit_label =
+            (d.submit_label as string) ?? undefined;
+        }
+      } else if (ev.type === "auth_scout_completed") {
+        s.pagesScouted =
+          typeof d.pages_captured === "number"
+            ? d.pages_captured
+            : undefined;
+      } else if (ev.type === "app_map_built") {
+        s.finished = true;
+        s.active = false;
+        s.modules =
+          typeof d.modules === "number" ? d.modules : s.modules;
+        s.flows =
+          typeof d.create_flows === "number" ? d.create_flows : s.flows;
+        s.pagesScouted =
+          typeof d.pages_scouted === "number"
+            ? d.pages_scouted
+            : s.pagesScouted;
+      }
+    }
+    return s;
+  })();
+
+  const [dismissed, setDismissed] = useState(false);
+  // Auto-undismiss when a fresh scout starts.
+  useEffect(() => {
+    if (state.active && !state.finished) setDismissed(false);
+  }, [state.active, state.finished]);
+
+  if (dismissed || (!state.active && !state.finished)) return null;
+
+  return (
+    <div className="border-b border-purple-500/30 bg-purple-500/5 px-3 py-2">
+      <div className="flex items-start gap-2">
+        {state.active && !state.finished ? (
+          <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-purple-600" />
+        ) : (
+          <Sparkles className="mt-0.5 size-4 shrink-0 text-purple-600" />
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-2">
+            <p className="text-xs font-medium text-purple-900 dark:text-purple-200">
+              {state.cached
+                ? "App map loaded from cache"
+                : state.active && !state.finished
+                  ? "Building app mindmap (first-time scout)…"
+                  : "App map built"}
+            </p>
+            <button
+              type="button"
+              className="text-[10px] text-muted-foreground hover:text-foreground"
+              onClick={() => setDismissed(true)}
+              aria-label="Dismiss scout panel"
+            >
+              dismiss
+            </button>
+          </div>
+          {!state.cached && state.targetUrl && (
+            <p className="truncate text-[10px] text-purple-800/80 dark:text-purple-300/80">
+              {state.targetUrl}
+            </p>
+          )}
+          {state.pages.length > 0 && (
+            <ol className="mt-1.5 max-h-32 space-y-0.5 overflow-y-auto pr-1">
+              {state.pages.map((p, i) => (
+                <li
+                  key={`${p.url}-${i}`}
+                  className="flex items-baseline gap-1.5 text-[10px] text-purple-900/90 dark:text-purple-200/90"
+                >
+                  <span className="shrink-0 font-mono text-purple-600">
+                    {i + 1}.
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">
+                    {p.nav_path.length > 0
+                      ? p.nav_path.join(" → ")
+                      : p.title || p.url || "(landing)"}
+                  </span>
+                  {p.has_create && (
+                    <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/10 px-1 text-emerald-700 dark:text-emerald-400">
+                      +{p.fields ?? "?"} fields
+                    </span>
+                  )}
+                  {typeof p.elements === "number" && !p.has_create && (
+                    <span className="shrink-0 text-[9px] text-muted-foreground">
+                      {p.elements} els
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
+          {state.finished && (
+            <p className="mt-1 text-[10px] text-purple-800/80 dark:text-purple-300/80">
+              {state.cached ? (
+                <>
+                  {state.modules ?? "?"} modules ·{" "}
+                  {state.flows ?? "?"} create-flows · reused (skip
+                  re-scouting via plan editor &gt; refresh)
+                </>
+              ) : (
+                <>
+                  {state.modules ?? "?"} modules ·{" "}
+                  {state.flows ?? "?"} create-flows ·{" "}
+                  {state.pagesScouted ?? state.pages.length} pages —
+                  open the plan editor to inspect the map
+                </>
+              )}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ── Phase A.6 Step 6 — Plan ↔ AppMap reconciliation panel ─────────
+
+
+type ReconStatus = "ok" | "uncertain" | "mismatch" | "missing";
+
+interface ReconRow {
+  submodule_id: number;
+  title: string;
+  status: ReconStatus;
+  reason: string;
+  matched_module?: string;
+  matched_create_flow?: string;
+}
+
+const _RECON_TINT: Record<ReconStatus, string> = {
+  ok: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  uncertain:
+    "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  mismatch: "border-orange-500/30 bg-orange-500/10 text-orange-700 dark:text-orange-300",
+  missing: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
+};
+
+function ReconciliationPanel({ events }: { events: LiveEvent[] }) {
+  // Take the LATEST plan_reconciled event in the stream.
+  const latest = (() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      if (ev.type === "plan_reconciled") return ev;
+    }
+    return null;
+  })();
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    if (latest) setDismissed(false);
+  }, [latest]);
+  if (!latest || dismissed) return null;
+
+  const data = latest.data ?? {};
+  const rows = (Array.isArray(data.rows) ? data.rows : []) as ReconRow[];
+  if (rows.length === 0) return null;
+
+  const counts: Record<ReconStatus, number> = {
+    ok: 0, uncertain: 0, mismatch: 0, missing: 0,
+  };
+  for (const r of rows) {
+    if (r.status in counts) counts[r.status] += 1;
+  }
+  const isClean = counts.mismatch === 0 && counts.missing === 0;
+
+  return (
+    <div className="border-b border-purple-500/20 bg-purple-500/5 px-3 py-2">
+      <div className="flex items-start gap-2">
+        {isClean ? (
+          <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600" />
+        ) : (
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-2">
+            <p className="text-xs font-medium text-purple-900 dark:text-purple-200">
+              Plan ↔ App reconciliation
+              <span className="ml-2 text-[10px] font-normal text-muted-foreground">
+                {counts.ok} ok · {counts.uncertain} uncertain ·{" "}
+                {counts.mismatch} mismatch · {counts.missing} missing
+              </span>
+            </p>
+            <button
+              type="button"
+              className="text-[10px] text-muted-foreground hover:text-foreground"
+              onClick={() => setDismissed(true)}
+              aria-label="Dismiss reconciliation panel"
+            >
+              dismiss
+            </button>
+          </div>
+          <ol className="mt-1.5 max-h-44 space-y-1 overflow-y-auto pr-1">
+            {rows.map((r) => (
+              <li
+                key={r.submodule_id}
+                className={cn(
+                  "rounded border px-2 py-1 text-[11px]",
+                  _RECON_TINT[r.status],
+                )}
+              >
+                <div className="flex items-baseline gap-1.5">
+                  <span className="shrink-0 font-mono text-[9px] uppercase tracking-wide opacity-80">
+                    {r.status}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate font-medium">
+                    {r.title || `Submodule ${r.submodule_id}`}
+                  </span>
+                  {r.matched_module && (
+                    <span className="shrink-0 text-[9px] opacity-80">
+                      → {r.matched_module}
+                      {r.matched_create_flow
+                        ? ` / ${r.matched_create_flow}`
+                        : ""}
+                    </span>
+                  )}
+                </div>
+                {r.reason && r.status !== "ok" && (
+                  <p className="ml-1 mt-0.5 text-[10px] italic opacity-80">
+                    {r.reason}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      </div>
+    </div>
+  );
 }

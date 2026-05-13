@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
+    from app.agents.app_map import AppMap
     from app.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -197,10 +198,18 @@ DECOMPOSITION_SCHEMA: dict[str, Any] = {
 DECOMPOSER_SYSTEM_PROMPT = """You are a senior QA test planner. You receive:
 - A high-level GOAL written in business terms (from the BRD).
 - A SCREENSHOT of the application's CURRENT screen.
+- Optionally, an APP MAP — a structured summary of the modules,
+  navigation, and create-flows the system already learned about
+  this app during an authenticated Scout pass. When present, use
+  it as the source of truth for module names, button labels, form
+  field names, and where to find things. If the APP MAP says the
+  Create button is labelled "+ Add New Role", that's what your
+  sub-goal text says — even if the BRD said "Create Role".
 - Optionally, knowledge-base notes about this app from prior runs.
 
 Your job: produce 3-7 ordered SUB-GOALS the agent will execute
-sequentially to reach the goal, BASED ON WHAT YOU SEE on the screen.
+sequentially to reach the goal, BASED ON WHAT YOU SEE on the screen
+AND what the APP MAP tells you about the app's structure.
 
 Rules
 =====
@@ -209,9 +218,13 @@ Rules
    "click Create Role" but the screen shows "+ Add New Role",
    the sub-goal says "click the +Add New Role button".
 2. Each sub-goal must produce ONE discrete advance toward the
-   goal. "Fill the role form" is too coarse — split into "type
-   the name", "type the display name", "configure permissions",
-   "click Save".
+   goal. EXCEPTION: a create-form drawer is one atomic unit — emit
+   ONE sub-goal "Fill the <entity> form via fill_form and submit"
+   that bundles every field (incl. permission_tree / paginated
+   tables) into a single fill_form tool call. DO NOT split a form
+   into per-field sub-goals; the runtime's fill_form routine fills
+   atomically, retries on validation, and submits. Per-field
+   splitting wastes turns and almost always runs out before Save.
 3. INCLUDE form fields and controls the BRD missed. If the BRD
    says "enter role name" but the form has Name + Display Name
    + Description, add sub-goals for the visible fields the agent
@@ -223,6 +236,135 @@ Rules
 6. If the screen is unrelated to the goal (e.g. you see a login
    screen but the goal is "create a role"), return ONE sub-goal:
    "navigate to the section where this goal can be performed".
+7. APP-MAP RULES (when APP MAP is provided):
+   a. NAVIGATION: For goals that require a specific section ("create
+      a role"), the FIRST sub-goal is opening the module + section
+      path from the map. Example: section_path=["Administration",
+      "Roles"] → first sub-goal: "Open the Administration menu and
+      click Roles".
+   b. EXACT LABELS: When the map gives a trigger_label (e.g.
+      "+ Add New Role"), your sub-goal text quotes it verbatim. Do
+      NOT paraphrase to "click Create" — the actual button is
+      "+ Add New Role".
+   c. FORM FIELDS — BUNDLE INTO ONE fill_form. When the map's
+      create-flow lists fields, the sub-goal that handles the form
+      is ONE fill_form call with all REQUIRED fields (and any
+      compound widgets — permission_tree, paginated_resource_table —
+      included as additional entries in the same fill_form payload).
+      The sub-goal description must literally start with
+      "fill_form: fill the <Entity> drawer with …" so the planner
+      picks fill_form (not a sequence of click/type). Example for
+      a Role drawer with name + display + permission tree:
+        description: "fill_form: fill the Create Role drawer with
+                     Name='QA Role X', Display Name='QA Role X',
+                     Description='…', Permissions=only:Administration,
+                     Management; then submit via Save."
+        success_criterion: "Role 'QA Role X' appears in the role
+                            list"
+      DO NOT emit "type the Name", "type the Display Name", "click
+      each permission" as separate sub-goals.
+   d. (Removed — see rule 7i for the authoritative permission-tree
+      rule: bundle into ONE fill_form with role_hint=permission_tree.
+      Do NOT emit "expand and check each leaf" sub-goals; that
+      contradicts rule 7c / 7i and runs out of turns.)
+   e. SEARCHABLE LIST: When list_has_search=true, sub-goals that
+      require finding an entity in the list say "type the entity
+      name into the search/filter input" rather than "scroll until
+      you find it".
+   f. SUBMIT BUTTON: Use the map's submit_label verbatim ("Save",
+      "Create", etc.). Don't say "click Submit" if the actual
+      button says "Save".
+   g. VERIFY AFTER CREATE: For any goal that creates an entity, ALWAYS
+      append a final sub-goal: "Verify the new <entity> appears in
+      the list by searching for its name". Without this, the agent
+      can't prove the create succeeded — a real QA would never trust
+      "I clicked Save" as evidence of creation.
+   h. DROPDOWN NAVIGATION: When a module is marked ``[dropdown]`` in
+      the MODULES list (e.g. "Administration [dropdown] → Roles |
+      Users"), navigation is TWO clicks, not one. Emit a sub-goal
+      "Click the Administration top-bar menu to open the dropdown",
+      then a separate sub-goal "Click Roles in the open dropdown".
+      Reusing a single "Go to Administration > Roles" sub-goal loses
+      the ordering and the agent will misclick.
+   i. PERMISSION TREE — DETAILED: When the matched create-flow has
+      ``[permission tree]`` flag, your sub-goal that handles the
+      tree uses the ``fill_form`` tool with role_hint=permission_tree
+      and an explicit value matching one of:
+         - "all"               (tick every leaf)
+         - "none"               (untick everything)
+         - "only:Users,Roles"   (tick only leaves containing those tokens)
+         - "all_except:Audit"  (tick everything except matching tokens)
+      Pick "all" when the goal says "grant all permissions" or
+      similar; pick "only:..." when the goal names specific modules.
+      DO NOT emit a sub-goal "click each parent then each child" —
+      that's brittle; the routine handles expansion + leaf clicking
+      atomically.
+   j. PAGINATED RESOURCE TABLE: When the create-flow has
+      ``[paginated resource table]`` flag, your sub-goal for the
+      access-grant step uses ``fill_form`` with
+      role_hint=paginated_resource_table and a value of:
+         - "all:read,update"
+              (tick the read + update masters for every row across pages)
+         - "specific:CH-0001:read,update;CH-0002:read"
+              (tick only the named rows with their per-row actions)
+         - "none"
+              (untick everything visible)
+      The routine walks pagination for you — do not emit a "click
+      Next page" sub-goal between rows.
+   k. CONDITIONAL SECTION ORDERING: When the create-flow has
+      ``[conditional sections]`` flag and a section is listed
+      ``"appears after \"<field>\""``, the sub-goal that fills
+      ``<field>`` MUST come BEFORE the sub-goal that uses the
+      conditional section's fields. Example: Solar's user-create
+      drawer hides the Resource Access Control table until a role
+      is selected — fill Role first, THEN the access table.
+
+8. ENTITY REUSE (when KNOWN STATE lists recently created entities):
+   a) SAME-KIND reuse: When the goal is to ACT ON an entity (assign,
+      edit, delete a <kind>) and KNOWN STATE's "recently created
+      entities" shows the SAME kind exists:
+      - DO NOT emit a "create the X" sub-goal — it already exists.
+      - The FIRST sub-goal opens the X list and searches for the
+        previously created <kind>=<identity> (quote the identity
+        verbatim from KNOWN STATE).
+   b) CROSS-KIND reuse: When the goal's primary action is to CREATE
+      a NEW entity (e.g. "Create user U") BUT the form references
+      another entity that exists in KNOWN STATE (e.g. the user-
+      create form has a Role dropdown, and KNOWN STATE shows a
+      role was just created):
+      - Use the EXACT identity from KNOWN STATE as the value for
+        that field in fill_form.
+      - Example: KNOWN STATE has ``role='QA Auto Role-616023'``;
+        goal is "Create user Alice with that role". fill_form
+        payload includes:
+          {"label": "Role", "value": "QA Auto Role-616023",
+           "role_hint": "custom_combobox"}
+        NOT a made-up role name. NOT "the previously created role".
+        The exact identity string, verbatim.
+   c) When KNOWN STATE shows no relevant entity, fall through to
+      regular create-flow planning.
+   This prevents duplicate-name conflicts (same-kind) and prevents
+   the planner from inventing values for fields that should reference
+   real, just-created records (cross-kind).
+
+9. GOAL-MODE (no step hints in the prompt):
+   When the input contains a GOAL + SUCCESS CRITERIA but NO step
+   hints / no executable test-case steps, treat the goal as the
+   AUTHORED INTENT and decompose freely from:
+     - The current screen (what you SEE)
+     - The APP MAP (what the app supports)
+     - The WORLD STATE (what's already true)
+   Do NOT invent step-by-step prescription. Sub-goals should be
+   OUTCOMES the agent can verify on screen, in the smallest set
+   that reaches the goal. Examples:
+     GOAL: "Verify a role can be created with all permissions"
+       sg1: Open the Roles section (via Administration dropdown)
+       sg2: Open the Create Role drawer
+       sg3: Fill the role form (use fill_form with permission_tree
+            value="all"); submit
+       sg4: Verify the new role appears in the list
+   This mode is INTENT-DRIVEN: the user trusts the agent + the
+   AppMap to figure out HOW. Test cases are concepts, not scripts.
 
 Output
 ======
@@ -275,6 +417,9 @@ def decompose_goal(
     goal_success_criteria: list[str],
     screenshot_bytes: bytes | None,
     akb_block: str = "",
+    app_map: "AppMap | None" = None,
+    frozen_sub_goals_hint: list[dict[str, Any]] | None = None,
+    world_state: dict[str, Any] | None = None,
     cheap_provider: "LLMProvider | None" = None,
     on_escalate: Callable[[str, str, str], None] | None = None,
 ) -> DecompositionResult:
@@ -284,6 +429,13 @@ def decompose_goal(
     call — accuracy matters more than cost). ``cheap_provider`` is
     accepted for symmetry with the rest of the agent helpers but
     unused unless we add a cheap-first variant later.
+
+    Phase A.5 — ``app_map`` is the structured mindmap from the
+    authenticated Scout pass. When present, the decomposer's prompt
+    includes it as ground-truth context: real button labels, real
+    form fields, real section paths. The agent's resulting sub-goals
+    are anchored to the actual UI instead of paraphrased from the
+    BRD.
     """
     from app.llm.base import ChatMessage  # noqa: PLC0415
 
@@ -292,13 +444,120 @@ def decompose_goal(
         f"\n\nAPP KNOWLEDGE BASE (from prior runs):\n{akb_block}\n"
         if akb_block.strip() else ""
     )
+    app_map_section = ""
+    if app_map is not None:
+        try:
+            app_map_section = (
+                "\n\nAPP MAP (from authenticated Scout — use as "
+                "ground truth for navigation, labels, form fields):\n"
+                + app_map.format_for_prompt()
+                + "\n"
+            )
+        except Exception:
+            app_map_section = ""
+
+    # Phase B Step 3 — frozen sub-goals as decomposer hints. When a
+    # prior run on this submodule passed and got frozen, the saved
+    # segments come back here. Tell the LLM to RE-EMIT the same
+    # breakdown when the screen still supports it — replay then
+    # walks the frozen steps deterministically. When the LLM
+    # deviates, replay falls through to agentic execution.
+    frozen_hint_section = ""
+    if frozen_sub_goals_hint:
+        try:
+            lines = []
+            for h in frozen_sub_goals_hint:
+                if not isinstance(h, dict):
+                    continue
+                desc = str(h.get("description", "")).strip()
+                crit = str(h.get("success_criterion", "")).strip()
+                mt = h.get("max_turns", 6)
+                if not desc:
+                    continue
+                lines.append(
+                    f"  - {desc}\n"
+                    f"    success_criterion: {crit}\n"
+                    f"    max_turns: {mt}"
+                )
+            if lines:
+                frozen_hint_section = (
+                    "\n\nFROZEN SUB-GOALS (a prior run passed this "
+                    "submodule with the breakdown below — re-emit "
+                    "the SAME sub-goals if the current screen still "
+                    "supports them, in the SAME order, with the "
+                    "SAME success_criterion text. The runtime "
+                    "deterministically replays the proven steps "
+                    "whenever your output matches. If the screen "
+                    "has changed, plan freshly):\n"
+                    + "\n".join(lines) + "\n"
+                )
+        except Exception:
+            frozen_hint_section = ""
+
+    # Phase E — structured WorldState block. When set, the decomposer
+    # sees guaranteed preconditions ("user is logged in as admin",
+    # "current page is Administration > Roles", "Role 'QA-1' was
+    # created 2 submodules ago") so it doesn't waste sub-goals
+    # re-asserting state we already have.
+    world_state_section = ""
+    if world_state:
+        ws_lines: list[str] = []
+        if world_state.get("auth_status") == "logged_in":
+            identity = world_state.get("auth_identity") or {}
+            who = identity.get("username") if isinstance(
+                identity, dict,
+            ) else None
+            if who:
+                ws_lines.append(
+                    f"  - already logged in as {who}"
+                    + (
+                        f" (role={identity.get('role')})"
+                        if isinstance(identity, dict)
+                        and identity.get("role") else ""
+                    )
+                )
+            else:
+                ws_lines.append("  - already logged in")
+        cur_path = world_state.get("current_page_path")
+        if isinstance(cur_path, list) and cur_path:
+            ws_lines.append(
+                f"  - current page: {' > '.join(str(p) for p in cur_path)}"
+            )
+        cur_url = world_state.get("current_url")
+        if isinstance(cur_url, str) and cur_url:
+            ws_lines.append(f"  - current URL: {cur_url}")
+        ents = world_state.get("entities_created")
+        if isinstance(ents, list) and ents:
+            # Show the LAST 5 created entities — most useful for
+            # "now assign that role" / "now search for that user"
+            # sub-goals.
+            tail = ents[-5:]
+            lines = ", ".join(
+                f"{e.get('kind','?')}={e.get('identity','?')!r}"
+                for e in tail if isinstance(e, dict)
+            )
+            if lines:
+                ws_lines.append(
+                    f"  - recently created entities: {lines}"
+                )
+        if ws_lines:
+            world_state_section = (
+                "\n\nKNOWN STATE (guaranteed — don't re-verify):\n"
+                + "\n".join(ws_lines) + "\n"
+            )
+
     user_text = (
         f"GOAL:\n  {goal_description}\n\n"
         f"SUCCESS CRITERIA:\n{crit_block}\n"
+        f"{world_state_section}"
+        f"{app_map_section}"
+        f"{frozen_hint_section}"
         f"{akb_section}\n"
         "Look at the attached screenshot. Decompose the goal into "
         "3-7 ordered sub-goals based on what you actually see on "
-        "this page."
+        "this page AND the APP MAP above (when present). When KNOWN "
+        "STATE says you're already logged in or already on the "
+        "right page, DON'T emit sub-goals to do those again."
     )
 
     messages: list[ChatMessage] = [
@@ -330,11 +589,15 @@ def replan_sub_goals(
     cheap_provider: "LLMProvider | None" = None,
     on_escalate: Callable[[str, str, str], None] | None = None,
     replan_iteration: int = 1,
+    app_map: "AppMap | None" = None,
+    world_state: dict[str, Any] | None = None,
 ) -> DecompositionResult:
     """Replan after a sub-goal fails. Routes to CHEAP tier first.
 
     ``replan_iteration`` is recorded on each returned sub-goal so
-    the report timeline shows which replan produced it.
+    the report timeline shows which replan produced it. ``app_map``
+    (when present) is included in the prompt so the replanner can
+    pick alternative trigger labels / section paths from ground truth.
     """
     from app.llm.base import ChatMessage  # noqa: PLC0415
 
@@ -342,12 +605,48 @@ def replan_sub_goals(
         "\n".join(f"  ✓ {sg.description}" for sg in completed_sub_goals)
         or "  (none — first sub-goal failed)"
     )
+    app_map_section = ""
+    if app_map is not None:
+        try:
+            app_map_section = (
+                "\n\nAPP MAP (ground truth — use exact labels / paths):\n"
+                + app_map.format_for_prompt() + "\n"
+            )
+        except Exception:
+            app_map_section = ""
+    # Phase E — guaranteed-state block. The replanner gets the same
+    # short KNOWN STATE summary as the decomposer so it doesn't
+    # waste recovery sub-goals re-asserting login or already-known
+    # current_page_path.
+    ws_section = ""
+    if world_state:
+        ws_bits: list[str] = []
+        if world_state.get("auth_status") == "logged_in":
+            ident = world_state.get("auth_identity") or {}
+            who = ident.get("username") if isinstance(ident, dict) else None
+            ws_bits.append(
+                f"logged in as {who}" if who else "logged in"
+            )
+        cur_path = world_state.get("current_page_path")
+        if isinstance(cur_path, list) and cur_path:
+            ws_bits.append(
+                "current page: " + " > ".join(str(p) for p in cur_path)
+            )
+        cur_url = world_state.get("current_url")
+        if isinstance(cur_url, str) and cur_url:
+            ws_bits.append(f"current URL: {cur_url}")
+        if ws_bits:
+            ws_section = (
+                "\nKNOWN STATE: " + "; ".join(ws_bits) + "\n"
+            )
     user_text = (
         f"ORIGINAL GOAL:\n  {goal_description}\n\n"
         f"SUB-GOALS COMPLETED:\n{done_block}\n\n"
         f"FAILED SUB-GOAL:\n  {failed_sub_goal.description}\n"
         f"  success_criterion: {failed_sub_goal.success_criterion}\n"
-        f"  failure reason: {failure_reason}\n\n"
+        f"  failure reason: {failure_reason}\n"
+        f"{ws_section}"
+        f"{app_map_section}\n"
         "The screenshot shows the page AT THE MOMENT OF FAILURE. "
         "Plan 1-5 fresh sub-goals to continue from here. Skip "
         "anything already completed."
@@ -454,3 +753,98 @@ def _call_planner(
         input_tokens=result.input_tokens or 0,
         output_tokens=result.output_tokens or 0,
     )
+
+
+# ── Phase A.5 — create→verify guarantor ──────────────────────────
+
+
+_CREATE_KEYWORDS: tuple[str, ...] = (
+    "create", "add", "new ", "register", " a new ",
+    "make a", "set up",
+)
+_VERIFY_KEYWORDS: tuple[str, ...] = (
+    "verify", "confirm", "check it appears", "appears in",
+    "shows up", "is listed", "is present", "find it",
+)
+
+
+def ensure_create_verify_pattern(
+    sub_goals: list[RuntimeSubGoal],
+    *,
+    goal_description: str,
+    app_map: "AppMap | None" = None,
+) -> tuple[list[RuntimeSubGoal], bool]:
+    """Hardcoded guarantor: append a "verify in list" sub-goal when
+    the goal looks like a create-flow and the decomposer forgot to.
+
+    Why this exists
+    ---------------
+    Rule 7g in the decomposer prompt asks the LLM to append a verify
+    sub-goal for create flows. The LLM gets this right MOST of the
+    time but drifts under prompt pressure (long goals, dense app
+    maps). This deterministic post-processor catches the misses so
+    every create flow ends with an explicit, observable confirmation
+    that a real QA would do.
+
+    Heuristic
+    ---------
+    Triggers when:
+    1. The goal description contains a create-style keyword.
+    2. The decomposer's sub-goal list does NOT already end with a
+       verify-style sub-goal.
+    3. Optionally the AppMap exposes a matching create_flow with
+       ``list_has_search=True`` so we know the search-then-verify
+       pattern is feasible.
+
+    Returns ``(possibly-augmented list, appended?)``.
+    """
+    if not sub_goals:
+        return sub_goals, False
+    goal_l = (goal_description or "").lower()
+    if not any(k in goal_l for k in _CREATE_KEYWORDS):
+        return sub_goals, False
+
+    # Already has a verify step? Scan the LAST two sub-goals for
+    # verify wording.
+    tail = sub_goals[-2:]
+    for sg in tail:
+        text = (sg.description + " " + sg.success_criterion).lower()
+        if any(k in text for k in _VERIFY_KEYWORDS):
+            return sub_goals, False
+
+    # Pick the entity from a matching create_flow when available;
+    # otherwise fall back to a generic "newly created entity" phrase.
+    entity_phrase = "the newly created entity"
+    search_phrase = "scroll through the list to find it"
+    if app_map is not None:
+        for kw in (
+            "role", "user", "project", "chainage",
+            "permission", "tenant", "client", "account",
+        ):
+            if kw in goal_l:
+                flow = app_map.create_flow_for_entity(kw)
+                if flow is not None:
+                    entity_phrase = f"the newly created {flow.entity}"
+                    if flow.list_has_search:
+                        search_phrase = (
+                            "type its name into the list's search/"
+                            "filter input to find it"
+                        )
+                    break
+
+    next_idx = len(sub_goals) + 1
+    verify_sg = RuntimeSubGoal(
+        id=f"sg{next_idx}_verify",
+        description=(
+            f"Verify {entity_phrase} appears in the list — "
+            f"{search_phrase}, then confirm a row with the entered "
+            "name is visible."
+        ),
+        success_criterion=(
+            f"A row matching {entity_phrase}'s name is visible in "
+            "the list/table."
+        ),
+        max_turns=4,
+        replan_iteration=0,
+    )
+    return sub_goals + [verify_sg], True

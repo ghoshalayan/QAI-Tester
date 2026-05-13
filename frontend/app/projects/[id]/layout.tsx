@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useParams, usePathname } from "next/navigation";
 import {
   ArrowLeft,
+  Boxes,
   ClipboardList,
   FileText,
   ListTree,
@@ -33,6 +34,7 @@ const TABS = [
   { slug: "requirements", label: "Requirements", icon: ScrollText },
   { slug: "plans", label: "Plans", icon: ClipboardList },
   { slug: "test-cases", label: "Test Cases", icon: ListTree },
+  { slug: "modules", label: "Modules", icon: Boxes },
   { slug: "runs", label: "Runs", icon: Play },
 ] as const;
 

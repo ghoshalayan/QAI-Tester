@@ -75,6 +75,81 @@ def _check_cancel(
         raise AgentCancelled(f"Cancelled at: {where}")
 
 
+# ── Phase B Step 5 — segment success-criterion gate ───────────────
+
+
+# Stopwords filtered out when extracting high-information tokens
+# from a sub-goal's success_criterion. We don't want to "validate"
+# a segment by finding the word "the" on the page.
+_CRIT_STOPWORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "being", "to", "of", "and", "or", "in", "on", "at", "by",
+    "for", "with", "as", "this", "that", "these", "those", "it",
+    "its", "has", "have", "had", "should", "will", "can", "must",
+    "may", "shows", "show", "shown", "visible", "displayed",
+    "appears", "appear", "contains", "contain",
+})
+
+
+def _segment_criterion_visible(
+    page: Any,
+    criterion: str,
+    *,
+    min_token_len: int = 4,
+    require_matches: int = 1,
+) -> bool:
+    """Best-effort DOM check that a sub-goal's success_criterion is
+    observable on the current page.
+
+    The criterion text is tokenized into high-information words
+    (length >= ``min_token_len``, not in the stopword list) and we
+    require at least ``require_matches`` of those tokens to appear
+    in the page's visible text (case-insensitive substring).
+
+    Heuristic by design — false-negatives (criterion met but our
+    naive tokens didn't match) are preferred over false-positives
+    (claiming success when nothing happened). False-negatives feed
+    the segment to agentic recovery, which is the safe fallback.
+
+    Returns True when the gate is satisfied OR when there's nothing
+    to check (empty criterion / page closed / no high-info tokens).
+    Failures inside this function never raise — replay treats a
+    raised exception identically to "True" via the outer try block.
+    """
+    if not criterion or not criterion.strip():
+        return True
+    import re  # noqa: PLC0415
+
+    tokens = [
+        t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", criterion)
+        if len(t) >= min_token_len and t.lower() not in _CRIT_STOPWORDS
+    ]
+    if not tokens:
+        return True
+    # Cap tokens to the first 6 distinct ones — long criteria
+    # would otherwise require an unrealistic number of matches.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        ordered.append(t)
+        if len(ordered) >= 6:
+            break
+    try:
+        page_text = page.evaluate(
+            "() => (document.body && document.body.innerText) || ''"
+        )
+    except Exception:
+        return True
+    if not isinstance(page_text, str):
+        return True
+    haystack = page_text.lower()
+    hits = sum(1 for t in ordered if t in haystack)
+    return hits >= max(1, require_matches)
+
+
 def _persist_self_heal_patches(
     db: Session,
     submodule: TcNode,
@@ -405,22 +480,77 @@ def _replay_submodule(
     so the caller can fold it into the row uniformly.
     """
     frozen = submodule.frozen_path
-    if not isinstance(frozen, dict) or not frozen.get("steps"):
-        return {
-            "status": "blocked",
-            "halt_reason": "no_frozen_path",
-            "step_log": [],
-            "self_healed_steps": [],
-            "vision_calls": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "narration": (
-                "No frozen path available for this submodule. "
-                "Run agentic mode once to capture one."
-            ),
-        }
+    # Phase B Step 4 — v2 (per-sub-goal segmented) frozen path.
+    # Detect the new schema and flatten segments into a step list
+    # where each step carries a ``_sub_goal_id`` annotation so the
+    # replay loop can attribute outcomes per-sub-goal. On per-step
+    # failure the loop skips the REST of the failing segment and
+    # tries the next segment; sub-goals without a segment fall
+    # through to agentic. The v1 (whole-submodule) path is preserved
+    # below for back-compat with runs frozen before Phase B.
+    segments_meta: list[dict[str, Any]] = []
+    is_v2 = (
+        isinstance(frozen, dict)
+        and frozen.get("version") == 2
+        and isinstance(frozen.get("segments"), list)
+        and frozen.get("segments")  # non-empty
+    )
+    if is_v2:
+        steps_v2: list[dict[str, Any]] = []
+        for seg in frozen["segments"]:  # type: ignore[index]
+            if not isinstance(seg, dict):
+                continue
+            sg_id = str(seg.get("sub_goal_id", ""))
+            seg_steps = seg.get("steps") or []
+            segments_meta.append({
+                "sub_goal_id": sg_id,
+                "description": seg.get("description", ""),
+                "success_criterion": seg.get("success_criterion", ""),
+                "step_count": len(seg_steps),
+                "status": "pending",  # → done | failed | skipped
+            })
+            for s in seg_steps:
+                if not isinstance(s, dict):
+                    continue
+                tagged = dict(s)
+                tagged["_sub_goal_id"] = sg_id
+                steps_v2.append(tagged)
+        if not steps_v2:
+            # v2 shape but every segment was empty — treat as
+            # missing frozen path.
+            return {
+                "status": "blocked",
+                "halt_reason": "no_frozen_path",
+                "step_log": [],
+                "self_healed_steps": [],
+                "vision_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "narration": (
+                    "Frozen path v2 had no replayable steps."
+                ),
+            }
+        steps = steps_v2
+    else:
+        if not isinstance(frozen, dict) or not frozen.get("steps"):
+            return {
+                "status": "blocked",
+                "halt_reason": "no_frozen_path",
+                "step_log": [],
+                "self_healed_steps": [],
+                "vision_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "narration": (
+                    "No frozen path available for this submodule. "
+                    "Run agentic mode once to capture one."
+                ),
+            }
+        steps = list(frozen.get("steps") or [])
 
-    steps = list(frozen.get("steps") or [])
+    # Phase B Step 4 — track which sub-goal we're currently inside
+    # so on failure we can skip the rest of the current segment.
+    skip_until_sub_goal: str | None = None
     step_log: list[dict[str, Any]] = []
     self_healed_steps: list[int] = []
     vision_calls = 0
@@ -434,8 +564,48 @@ def _replay_submodule(
         provider and getattr(provider, "supports_vision", False),
     )
 
+    # Phase B Step 4 — sub-goal entry tracking. Each time we see a
+    # tagged step whose ``_sub_goal_id`` differs from the previous,
+    # we emit a ``frozen_segment_started`` event. On a failure we
+    # set ``skip_until_sub_goal`` so the loop drops the rest of the
+    # current segment and resumes at the next sub-goal's first step.
+    prev_sub_goal_id: str | None = None
+    segments_by_id: dict[str, dict[str, Any]] = {
+        s["sub_goal_id"]: s for s in segments_meta
+    }
     for idx, step in enumerate(steps):
         _check_cancel(is_cancelled, f"frozen step {idx + 1}")
+
+        # Phase B — sub-goal handling for v2 frozen paths.
+        step_sub_goal_id = (
+            step.get("_sub_goal_id") if is_v2 else None
+        )
+        if is_v2 and step_sub_goal_id:
+            # Skip the rest of a failed segment.
+            if (
+                skip_until_sub_goal is not None
+                and step_sub_goal_id == skip_until_sub_goal
+            ):
+                continue
+            # Reached the next segment — clear the skip latch.
+            if (
+                skip_until_sub_goal is not None
+                and step_sub_goal_id != skip_until_sub_goal
+            ):
+                skip_until_sub_goal = None
+            # Emit segment-started on the first step of a sub-goal.
+            if step_sub_goal_id != prev_sub_goal_id:
+                seg = segments_by_id.get(step_sub_goal_id)
+                seg_desc = seg["description"] if seg else ""
+                _emit(emit_event, "frozen_segment_started", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "sub_goal_id": step_sub_goal_id,
+                    "description": str(seg_desc)[:200],
+                })
+                if seg is not None:
+                    seg["status"] = "in_progress"
+                prev_sub_goal_id = step_sub_goal_id
 
         wait_for_settled(page, speed_config)
 
@@ -621,9 +791,39 @@ def _replay_submodule(
             "self_healed": healed,
         })
 
-        # Replay halts on the first hard failure — a stable plan
-        # shouldn't have one. Self-heal got its chance above.
+        # Replay halts on the first hard failure — UNLESS this is a
+        # v2 (per-sub-goal) frozen path, in which case we abandon
+        # just the failing SEGMENT and try the next one. Sub-goals
+        # without successful segments at the end will fall through
+        # to an agentic recovery pass.
         if outcome["status"] == "failed":
+            if is_v2 and step_sub_goal_id:
+                seg = segments_by_id.get(step_sub_goal_id)
+                if seg is not None:
+                    seg["status"] = "failed"
+                    seg["failure_reason"] = (
+                        outcome.get("error_message")
+                        or outcome.get("narration")
+                        or "frozen step failed"
+                    )[:300]
+                _emit(emit_event, "frozen_segment_failed", {
+                    "run_id": submodule_run_id,
+                    "step_id": submodule_step_id,
+                    "sub_goal_id": step_sub_goal_id,
+                    "frozen_step_index": idx + 1,
+                    "reason": (
+                        outcome.get("error_message")
+                        or outcome.get("narration") or ""
+                    )[:300],
+                })
+                # Skip the remaining steps that belong to this
+                # sub-goal. Resumes at the next sub-goal's first
+                # step.
+                skip_until_sub_goal = step_sub_goal_id
+                # DON'T return — continue the for-loop. Persist
+                # any self-heal patches as we go.
+                continue
+
             # Persist patches accumulated for steps 1..idx-1 even on
             # failure so the next run's healed prefix doesn't pay the
             # self-heal cost again. Only the failing step is lost.
@@ -647,12 +847,121 @@ def _replay_submodule(
                 "failed_step_index": idx + 1,
             }
 
+        # v2 — emit segment-complete on the LAST step of a sub-goal
+        # (i.e. when the next step belongs to a different sub-goal,
+        # or we've reached the end of the steps list).
+        if is_v2 and step_sub_goal_id:
+            next_sub_goal_id = (
+                steps[idx + 1].get("_sub_goal_id")
+                if idx + 1 < len(steps) else None
+            )
+            if next_sub_goal_id != step_sub_goal_id:
+                seg = segments_by_id.get(step_sub_goal_id)
+                # Phase B Step 5 — segment success_criterion gate.
+                # Before marking the segment "done", run a cheap DOM
+                # check that the criterion text fragments are visible
+                # on the page. The check is best-effort heuristic:
+                # tokenize the criterion into 2-3 high-information
+                # phrases and require at least one to be visible.
+                # Failure flags the segment as failed (skip-until-
+                # next-sub-goal) so the agentic recovery picks it up.
+                gate_ok = True
+                if seg is not None and seg.get("status") != "failed":
+                    crit_text = str(
+                        seg.get("success_criterion", "")
+                    ).strip()
+                    if crit_text:
+                        try:
+                            gate_ok = _segment_criterion_visible(
+                                page, crit_text,
+                            )
+                        except Exception:
+                            gate_ok = True  # never fail-stop on gate
+                if seg is not None and gate_ok and seg.get(
+                    "status",
+                ) != "failed":
+                    seg["status"] = "done"
+                    _emit(emit_event, "frozen_segment_completed", {
+                        "run_id": submodule_run_id,
+                        "step_id": submodule_step_id,
+                        "sub_goal_id": step_sub_goal_id,
+                    })
+                elif seg is not None and not gate_ok:
+                    seg["status"] = "failed"
+                    seg["failure_reason"] = (
+                        f"success_criterion not observed on page: "
+                        f"{str(seg.get('success_criterion', ''))[:120]}"
+                    )
+                    _emit(
+                        emit_event, "frozen_segment_failed", {
+                            "run_id": submodule_run_id,
+                            "step_id": submodule_step_id,
+                            "sub_goal_id": step_sub_goal_id,
+                            "frozen_step_index": idx + 1,
+                            "reason": (
+                                "success_criterion check failed — "
+                                "steps ran but the expected post-"
+                                "state isn't visible on the page"
+                            ),
+                        },
+                    )
+                    # Skip-latch is moot here (this WAS the last step
+                    # of the segment); the agentic recovery will
+                    # pick up this sub-goal id from segments_meta.
+
     # All steps passed — persist any self-heal patches back to the
     # submodule so future runs use the patched selectors.
     _persist_self_heal_patches(
         db, submodule, frozen, steps,
         self_healed_steps, submodule_run_id,
     )
+
+    # Phase B Step 4/5 — v2 partial-replay outcome. When some
+    # segments failed, mark the submodule as partially-passed and
+    # surface the failed sub-goals so the orchestrator can hand
+    # the remaining work off to the agentic loop.
+    if is_v2 and segments_meta:
+        failed_segments = [
+            s for s in segments_meta if s.get("status") == "failed"
+        ]
+        if failed_segments:
+            return {
+                "status": "partial",
+                "halt_reason": "frozen_segments_partial",
+                "step_log": step_log,
+                "self_healed_steps": self_healed_steps,
+                "vision_calls": vision_calls,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
+                "narration": (
+                    f"Replayed {len(steps)} frozen step(s) across "
+                    f"{len(segments_meta)} segment(s); "
+                    f"{len(failed_segments)} failed — "
+                    "handing the rest to the agentic loop."
+                ),
+                "segments_meta": segments_meta,
+                "failed_sub_goal_ids": [
+                    s["sub_goal_id"] for s in failed_segments
+                ],
+            }
+        return {
+            "status": "passed",
+            "halt_reason": "complete",
+            "step_log": step_log,
+            "self_healed_steps": self_healed_steps,
+            "vision_calls": vision_calls,
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "narration": (
+                f"Replayed {len(steps)} frozen step(s) across "
+                f"{len(segments_meta)} segment(s)"
+                + (
+                    f" — {len(self_healed_steps)} self-healed"
+                    if self_healed_steps else ""
+                )
+            ),
+            "segments_meta": segments_meta,
+        }
 
     return {
         "status": "passed",
@@ -857,6 +1166,90 @@ def run_replay_for_plan(
                     if res.get("vision_calls"):
                         total_llm_calls += res["vision_calls"]
 
+                    # Phase B Step 4 — partial replay → agentic handoff.
+                    # When v2 frozen path partially completed (some
+                    # segments succeeded, some failed), invoke the
+                    # agentic loop on the SAME browser to recover the
+                    # rest of the submodule. The fresh decomposer sees
+                    # the (now-stale) frozen breakdown as a hint and
+                    # plans a recovery path from the current page state.
+                    if res.get("status") == "partial":
+                        _emit(emit_event, "frozen_partial_handoff", {
+                            "step_id": row.id,
+                            "tc_node_id": row.tc_node_id,
+                            "failed_sub_goal_ids": res.get(
+                                "failed_sub_goal_ids", [],
+                            ),
+                        })
+                        if provider is not None:
+                            from app.agents.qa_agent import (  # noqa: PLC0415
+                                run_agent_for_goal,
+                            )
+                            from app.agents.goal import (  # noqa: PLC0415
+                                extract_goal,
+                            )
+                            try:
+                                fb_goal = extract_goal(
+                                    provider, submodule, steps_under,
+                                )
+                                fb_result = run_agent_for_goal(
+                                    page, provider, fb_goal,
+                                    plan_target_url=plan.target_url or "",
+                                    speed_config=speed_config,
+                                    emit_event=emit_event,
+                                    is_cancelled=is_cancelled,
+                                    submodule_run_id=run_id,
+                                    submodule_step_id=row.id,
+                                    db=db,
+                                    plan=plan,
+                                )
+                                # Fold the agentic outcome over the
+                                # partial replay result.
+                                total_input_tokens += (
+                                    fb_result.input_tokens or 0
+                                )
+                                total_output_tokens += (
+                                    fb_result.output_tokens or 0
+                                )
+                                total_vision_calls += (
+                                    fb_result.vision_calls or 0
+                                )
+                                total_llm_calls += (
+                                    fb_result.llm_calls or 0
+                                )
+                                # Promote status from the agentic
+                                # pass; capture the partial replay
+                                # log into details_json for the report.
+                                res = {
+                                    **res,
+                                    "status": fb_result.status,
+                                    "halt_reason": fb_result.halt_reason,
+                                    "narration": (
+                                        f"Replay covered "
+                                        f"{len(res.get('segments_meta') or []) - len(res.get('failed_sub_goal_ids') or [])} "
+                                        f"of {len(res.get('segments_meta') or [])} segments; "
+                                        f"agentic recovery: {fb_result.final_narration[:200]}"
+                                    ),
+                                    "agentic_recovery": {
+                                        "halt_reason": fb_result.halt_reason,
+                                        "turns": len(fb_result.turn_log),
+                                        "sub_goals": list(
+                                            getattr(
+                                                fb_result, "sub_goals", [],
+                                            ) or []
+                                        ),
+                                    },
+                                }
+                            except Exception as e:
+                                logger.warning(
+                                    "agentic recovery after partial "
+                                    "replay failed: %s", e,
+                                )
+                                res["status"] = "failed"
+                                res["halt_reason"] = (
+                                    "agentic_recovery_error"
+                                )
+
                     screenshot = _take_screenshot(page, run_id, row.id)
                     hide_narration(page)
 
@@ -883,8 +1276,25 @@ def run_replay_for_plan(
                         "vision_calls": res["vision_calls"],
                         "input_tokens": res.get("input_tokens", 0),
                         "output_tokens": res.get("output_tokens", 0),
+                        # Phase B — per-sub-goal segment status from v2
+                        # replay; let the report timeline render
+                        # frozen-vs-agentic per sub-goal.
+                        "frozen_segments_meta": res.get(
+                            "segments_meta", [],
+                        ),
+                        "agentic_recovery": res.get(
+                            "agentic_recovery",
+                        ),
                     }
-                    counts[res["status"]] = counts.get(res["status"], 0) + 1
+                    # Phase B — clamp unknown statuses to "failed" for
+                    # the counts dict (which only tracks the standard
+                    # four). "partial" already promoted to an agentic
+                    # outcome above; if we somehow still see it, treat
+                    # as failed for accounting.
+                    bucket = res["status"]
+                    if bucket not in counts:
+                        bucket = "failed"
+                    counts[bucket] = counts.get(bucket, 0) + 1
                     db.commit()
                     _emit(emit_event, "step_completed", {
                         "step_id": row.id,

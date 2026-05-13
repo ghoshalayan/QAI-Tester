@@ -23,11 +23,13 @@ import {
   type PlanReadCompact,
   type TcNodeStatus,
   type TcNodeTreeRead,
+  type TcVersionSummary,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RunProgressCard } from "@/components/run-progress-card";
 import { SynthesizeTcDialog } from "@/components/synthesize-tc-dialog";
+import { TestCasesAppMapPanel } from "@/components/test-cases-app-map-panel";
 import { TcDetailPanel } from "@/components/tc-detail-panel";
 import { TcTree } from "@/components/tc-tree";
 import { useAgentRunsEvents } from "@/hooks/use-agent-runs-events";
@@ -73,6 +75,60 @@ export default function TestCasesTabPage() {
     queryFn: () => api.listTcNodes(projectId, selectedPlanId!),
     enabled: !!selectedPlanId,
   });
+
+  // Phase C — active TC version banner. Whenever a refinement has
+  // been activated, the test-cases tree shown above IS the active
+  // version's content (activation overwrites the live tree). We
+  // surface the active version's label so the user knows which
+  // refinement they're looking at + can roll back from the plan
+  // editor.
+  const { data: tcVersionsData } = useQuery({
+    queryKey: ["tc-versions", projectId, selectedPlanId],
+    queryFn: () => api.listTcVersions(projectId, selectedPlanId!),
+    enabled: !!selectedPlanId,
+  });
+  const activeVersion = useMemo(() => {
+    if (!tcVersionsData) return null;
+    return (
+      tcVersionsData.versions.find(
+        (v) => v.id === tcVersionsData.current_tc_version_id,
+      ) ?? null
+    );
+  }, [tcVersionsData]);
+
+  // Phase D — overlay per-node validation status onto the live tree
+  // by looking up each node's original_tc_node_id in the active
+  // version's snapshots. The TcTree component reads from this map
+  // to render confidence badges.
+  const { data: activeVersionDetail } = useQuery({
+    queryKey: [
+      "tc-version-detail", projectId, selectedPlanId,
+      activeVersion?.id,
+    ],
+    queryFn: () =>
+      api.getTcVersion(projectId, selectedPlanId!, activeVersion!.id),
+    enabled: !!selectedPlanId && !!activeVersion,
+  });
+  const validationByNodeId = useMemo(() => {
+    const m = new Map<number, {
+      status: import("@/lib/api").ValidationStatus;
+      confidence: number | null;
+      reason: string | null;
+    }>();
+    if (!activeVersionDetail) return m;
+    for (const s of activeVersionDetail.snapshots) {
+      if (s.original_tc_node_id == null) continue;
+      if (!s.validation_status || s.validation_status === "pending") {
+        continue;
+      }
+      m.set(s.original_tc_node_id, {
+        status: s.validation_status,
+        confidence: s.validation_confidence ?? null,
+        reason: s.validation_reason ?? null,
+      });
+    }
+    return m;
+  }, [activeVersionDetail]);
 
   const { data: runs } = useQuery({
     queryKey: ["agent-runs", projectId],
@@ -203,6 +259,8 @@ export default function TestCasesTabPage() {
               onTriggerSynthesize={() => setSynthesizeOpen(true)}
               onBulkApproveDrafts={() => bulkApproveDrafts.mutate()}
               bulkApproveDisabled={bulkApproveDrafts.isPending}
+              activeVersion={activeVersion}
+              validationByNodeId={validationByNodeId}
             />
           )}
         </>
@@ -263,6 +321,8 @@ function TreeArea({
   onTriggerSynthesize,
   onBulkApproveDrafts,
   bulkApproveDisabled,
+  activeVersion,
+  validationByNodeId,
 }: {
   projectId: number;
   plan: PlanReadCompact;
@@ -279,6 +339,15 @@ function TreeArea({
   onTriggerSynthesize: () => void;
   onBulkApproveDrafts: () => void;
   bulkApproveDisabled: boolean;
+  activeVersion: TcVersionSummary | null;
+  validationByNodeId: Map<
+    number,
+    {
+      status: import("@/lib/api").ValidationStatus;
+      confidence: number | null;
+      reason: string | null;
+    }
+  >;
 }) {
   if (isLoading) {
     return (
@@ -310,6 +379,11 @@ function TreeArea({
 
   return (
     <div className="space-y-4">
+      {/* Phase C/D — Scout + Refine + AppMap viewer + Versions list.
+          Moved here from the plan editor since these all act on the
+          test cases shown below. */}
+      <TestCasesAppMapPanel projectId={projectId} planId={plan.id} />
+
       {/* Quick stats */}
       <div className="flex flex-wrap gap-2 text-xs">
         <span className="rounded-md border px-2.5 py-1 font-medium">
@@ -398,28 +472,53 @@ function TreeArea({
           {" "}to see everything.
         </div>
       ) : (
-        <div
-          className={cn(
-            "grid gap-4",
-            selectedNode
-              ? "lg:grid-cols-[minmax(0,1fr)_420px]"
-              : "grid-cols-1",
+        <div className="space-y-3">
+          {activeVersion && (
+            <div className="rounded-md border border-blue-500/30 bg-blue-500/5 px-3 py-2 text-xs">
+              <div className="flex items-baseline gap-2">
+                <span className="rounded bg-blue-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-blue-800 dark:text-blue-200">
+                  v{activeVersion.version_number}
+                </span>
+                <span className="font-medium text-blue-900 dark:text-blue-200">
+                  Active: {activeVersion.label}
+                </span>
+                <span className="ml-auto text-[10px] text-blue-800/70 dark:text-blue-300/70">
+                  Showing the active version. Manage versions in the
+                  panel above.
+                </span>
+              </div>
+              {activeVersion.source === "app_map_refined" && (
+                <p className="mt-1 text-[10px] text-blue-800/80 dark:text-blue-300/80">
+                  Refined from the authenticated app map — the steps
+                  below now use the real UI labels captured by Scout.
+                </p>
+              )}
+            </div>
           )}
-        >
-          <TcTree
-            projectId={projectId}
-            planId={plan.id}
-            tree={filteredTree}
-            onSelectNode={onSelectNode}
-            selectedNodeId={selectedNodeId}
-          />
-          {selectedNode && (
-            <TcDetailPanel
+          <div
+            className={cn(
+              "grid gap-4",
+              selectedNode
+                ? "lg:grid-cols-[minmax(0,1fr)_420px]"
+                : "grid-cols-1",
+            )}
+          >
+            <TcTree
               projectId={projectId}
-              node={selectedNode}
-              onClose={onCloseDetail}
+              planId={plan.id}
+              tree={filteredTree}
+              onSelectNode={onSelectNode}
+              selectedNodeId={selectedNodeId}
+              validationByNodeId={validationByNodeId}
             />
-          )}
+            {selectedNode && (
+              <TcDetailPanel
+                projectId={projectId}
+                node={selectedNode}
+                onClose={onCloseDetail}
+              />
+            )}
+          </div>
         </div>
       )}
     </div>

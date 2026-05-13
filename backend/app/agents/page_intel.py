@@ -588,8 +588,35 @@ def capture_screenshot_for_vision(
     Falls back to the raw screenshot bytes if Pillow isn't available
     (e.g. a partially-installed dev environment) — the call still
     succeeds, it just doesn't get the size cut.
+
+    Phase P.1 — narration overlay is HIDDEN before the screenshot and
+    RESTORED immediately after. The overlay is a fixed-position banner
+    at the bottom of the viewport (~60px tall); without this gate it
+    occludes the drawer's Save / Submit buttons in every vision call,
+    so the model literally cannot see the button to propose coords for.
+    Cheap: two ``window.__qaiHideBanner / __qaiShowBanner`` evals.
     """
-    raw = page.screenshot(full_page=full_page)
+    # Phase P.1 — hide the narration overlay if installed. Best-effort:
+    # if the overlay isn't installed (e.g. running headless without
+    # the overlay) the eval no-ops via the `&&` short-circuit.
+    try:
+        page.evaluate(
+            "window.__qaiHideBanner && window.__qaiHideBanner()",
+        )
+    except Exception:
+        pass
+    try:
+        raw = page.screenshot(full_page=full_page)
+    finally:
+        # Restore the overlay so the operator sees live narration
+        # again. The most-recent narration text is preserved (we only
+        # toggled opacity, not the text content).
+        try:
+            page.evaluate(
+                "window.__qaiShowBanner && window.__qaiShowBanner()",
+            )
+        except Exception:
+            pass
     if not downscale:
         return raw
     try:

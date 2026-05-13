@@ -73,12 +73,21 @@ const KIND_ICON: Record<TcNodeKind, ComponentType<{ className?: string }>> = {
   step: CircleDot,
 };
 
+interface ValidationOverlay {
+  status: "pending" | "confirmed" | "partial" | "unresolved" | "unreachable" | "skipped";
+  confidence: number | null;
+  reason: string | null;
+}
+
 interface TreeProps {
   projectId: number;
   planId: number;
   tree: TcNodeTreeRead[];
   onSelectNode?: (node: TcNodeTreeRead) => void;
   selectedNodeId?: number | null;
+  /** Phase D — validation overlay map keyed by tc_node.id. When
+   * present, each tree row shows a confidence chip. */
+  validationByNodeId?: Map<number, ValidationOverlay>;
 }
 
 export function TcTree({
@@ -87,6 +96,7 @@ export function TcTree({
   tree,
   onSelectNode,
   selectedNodeId,
+  validationByNodeId,
 }: TreeProps) {
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
@@ -99,6 +109,7 @@ export function TcTree({
             depth={0}
             onSelectNode={onSelectNode}
             selectedNodeId={selectedNodeId}
+            validationByNodeId={validationByNodeId}
           />
         </div>
       ))}
@@ -113,6 +124,7 @@ interface NodeProps {
   depth: number;
   onSelectNode?: (node: TcNodeTreeRead) => void;
   selectedNodeId?: number | null;
+  validationByNodeId?: Map<number, ValidationOverlay>;
 }
 
 function TcTreeNode({
@@ -122,7 +134,9 @@ function TcTreeNode({
   depth,
   onSelectNode,
   selectedNodeId,
+  validationByNodeId,
 }: NodeProps) {
+  const validation = validationByNodeId?.get(node.id);
   const qc = useQueryClient();
   // Default-expand modules and submodules; step nodes have no children
   const [expanded, setExpanded] = useState(node.kind !== "step");
@@ -283,6 +297,39 @@ function TcTreeNode({
                 {node.source_requirement_ids.length === 1 ? "" : "s"}
               </span>
             )}
+            {validation && (
+              <span
+                className={cn(
+                  "inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium",
+                  validation.status === "confirmed"
+                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+                    : validation.status === "partial"
+                      ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      : validation.status === "unresolved"
+                        ? "border-orange-500/40 bg-orange-500/10 text-orange-700 dark:text-orange-400"
+                        : validation.status === "unreachable"
+                          ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-400"
+                          : "border-muted bg-muted/30 text-muted-foreground",
+                )}
+                title={validation.reason ?? ""}
+              >
+                live{" "}
+                {validation.status === "confirmed"
+                  ? "✓"
+                  : validation.status === "partial"
+                    ? "~"
+                    : validation.status === "unresolved"
+                      ? "?"
+                      : validation.status === "unreachable"
+                        ? "✗"
+                        : "—"}
+                {validation.confidence !== null && (
+                  <span className="ml-1 font-mono opacity-80">
+                    {Math.round(validation.confidence * 100)}%
+                  </span>
+                )}
+              </span>
+            )}
           </div>
           {node.kind === "step" && node.narrative && (
             <p className="mt-0.5 line-clamp-1 text-xs text-muted-foreground">
@@ -380,6 +427,7 @@ function TcTreeNode({
               depth={depth + 1}
               onSelectNode={onSelectNode}
               selectedNodeId={selectedNodeId}
+              validationByNodeId={validationByNodeId}
             />
           ))}
         </div>

@@ -93,6 +93,14 @@ def _require_node(
 
 def _node_to_dict(node: TcNode) -> dict[str, Any]:
     """Flat dict matching ``TcNodeRead`` (no children)."""
+    fp = node.frozen_path
+    has_frozen = isinstance(fp, dict) and bool(
+        fp.get("segments") or fp.get("steps"),
+    )
+    fp_version = (
+        fp.get("version") if isinstance(fp, dict) and has_frozen
+        else None
+    )
     return {
         "id": node.id,
         "project_id": node.project_id,
@@ -112,6 +120,8 @@ def _node_to_dict(node: TcNode) -> dict[str, Any]:
         "selectable_default": node.selectable_default,
         "status": node.status,
         "source_requirement_ids": list(node.source_requirement_ids or []),
+        "has_frozen_path": has_frozen,
+        "frozen_path_version": fp_version,
         "created_at": node.created_at,
         "updated_at": node.updated_at,
         "reviewed_at": node.reviewed_at,

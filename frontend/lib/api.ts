@@ -398,6 +398,195 @@ export interface PlanReadDetail {
   updated_at: string;
 }
 
+// ── Phase A.5 — AppMap (mindmap) ──────────────────────────────────
+
+export interface AppMapField {
+  label: string;
+  role: "textbox" | "combobox" | "checkbox" | "textarea";
+  required: boolean;
+}
+
+export interface AppMapCreateFlow {
+  entity: string;
+  section_path: string[];
+  trigger_label: string;
+  submit_label: string;
+  fields: AppMapField[];
+  list_has_search: boolean;
+  has_permission_tree: boolean;
+}
+
+export interface AppMapModule {
+  name: string;
+  sections: string[];
+  landing_url: string;
+  notes: string;
+}
+
+export interface AppMapRead {
+  target_url: string;
+  landing_url: string;
+  landing_title: string;
+  modules: AppMapModule[];
+  create_flows: AppMapCreateFlow[];
+  cross_cutting_notes: string[];
+  pages_scouted: number;
+  scout_depth: string;
+  scout_version: number;
+  reasoning: string;
+}
+
+// ── Phase C.3 — TC versioning ─────────────────────────────────────
+
+export type TcVersionSource =
+  | "brd_initial"
+  | "app_map_refined"
+  | "manual";
+
+export interface TcVersionSummary {
+  id: number;
+  version_number: number;
+  source: TcVersionSource;
+  label: string;
+  created_at: string | null;
+  notes: Record<string, unknown> | null;
+}
+
+export interface TcVersionsListResponse {
+  current_tc_version_id: number | null;
+  versions: TcVersionSummary[];
+}
+
+export type TcChangeKind =
+  | "kept"
+  | "rewritten"
+  | "added"
+  | "flagged_missing";
+
+export interface TcNodeSnapshotRead {
+  id: number;
+  original_tc_node_id: number | null;
+  parent_snapshot_id: number | null;
+  kind: "module" | "submodule" | "step";
+  ordinal: number;
+  depth: number;
+  title: string;
+  description_md: string | null;
+  action_type: string | null;
+  target_hint: string | null;
+  narrative: string | null;
+  expected: string | null;
+  change_kind: TcChangeKind;
+  change_reason: string | null;
+  selectable_default: boolean;
+  /** Phase D — live-UI dry-run probe result. NULL when validation
+   * hasn't run yet for this version. */
+  validation_status?: ValidationStatus;
+  validation_confidence?: number | null;
+  validation_reason?: string | null;
+  validation_at?: string | null;
+}
+
+export interface TcVersionDetail {
+  id: number;
+  plan_id: number;
+  version_number: number;
+  source: TcVersionSource;
+  label: string;
+  created_at: string | null;
+  notes: Record<string, unknown> | null;
+  snapshots: TcNodeSnapshotRead[];
+}
+
+export interface TcRefinementSubmoduleSummary {
+  submodule_id: number;
+  title: string;
+  step_count: number;
+  kept: number;
+  rewritten: number;
+  added: number;
+  flagged_missing: number;
+  confidence: number;
+  error: string | null;
+}
+
+export interface TcRefinementResponse {
+  plan_id: number;
+  version_id: number;
+  version_number: number;
+  submodule_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  submodule_summaries: TcRefinementSubmoduleSummary[];
+}
+
+// ── Phase D — validation ──────────────────────────────────────────
+
+export type ValidationStatus =
+  | "pending"
+  | "confirmed"
+  | "partial"
+  | "unresolved"
+  | "unreachable"
+  | "skipped";
+
+export interface ValidationSubmoduleSummary {
+  submodule_snapshot_id: number;
+  title: string;
+  confirmed: number;
+  partial: number;
+  unresolved: number;
+  unreachable: number;
+  skipped: number;
+  confidence: number;
+}
+
+export interface TcValidationResponse {
+  plan_id: number;
+  version_id: number;
+  total_probed: number;
+  total_seconds: number;
+  error_message: string | null;
+  cancelled: boolean;
+  submodules: ValidationSubmoduleSummary[];
+}
+
+// ── Phase E — Sub-flow modules library ────────────────────────────
+
+export interface SubFlowModuleSummary {
+  id: number;
+  project_id: number;
+  name: string;
+  description: string | null;
+  target_url_pattern: string | null;
+  tags: string[];
+  segments: number;
+  steps: number;
+  step_snapshot_count: number;
+  source_plan_id: number | null;
+  source_submodule_tc_node_id: number | null;
+  source_run_id: number | null;
+  frozen_path_version: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface SubFlowModuleStepSnapshot {
+  ordinal: number;
+  title: string;
+  description_md: string | null;
+  action_type: string | null;
+  target_hint: string | null;
+  narrative: string | null;
+  expected: string | null;
+  data_needs_json: unknown;
+}
+
+export interface SubFlowModuleDetail extends SubFlowModuleSummary {
+  frozen_segments: Record<string, unknown>;
+  step_snapshots: SubFlowModuleStepSnapshot[];
+}
+
 export interface HeadingSuggestionsResponse {
   suggestions: string[];
   document_count: number;
@@ -406,7 +595,12 @@ export interface HeadingSuggestionsResponse {
 
 // ── Agent Runs ────────────────────────────────────────────────────
 
-export type AgentKind = "brd_to_frd" | "frd_to_tc" | "execute" | "reporter";
+export type AgentKind =
+  | "brd_to_frd"
+  | "frd_to_tc"
+  | "execute"
+  | "reporter"
+  | "recon";
 export type AgentStatus =
   | "queued"
   | "running"
@@ -497,6 +691,14 @@ export interface ExecuteRunRequest {
    *   SAP GUI for HTML in legacy frames).
    * Ignored when mode isn't "agentic". */
   agent_strategy?: "hybrid" | "vision_only";
+  /** Phase H — pre-execution Scout → Refine → Activate orchestrator.
+   * - ``auto`` (default for agentic): runs preflight when the plan
+   *   isn't already pinned to an app_map_refined version.
+   * - ``force``: always re-scout + re-refine + re-activate.
+   * - ``skip``: never run preflight (legacy / debugging path).
+   * Scripted + replay modes default to ``skip`` server-side since
+   * they don't need a UI-grounded plan to function. */
+  preflight?: "auto" | "force" | "skip";
   /** Headed Chromium window position + size, in screen pixels. The
    * frontend computes these from ``window.screen.availWidth/Height`` so
    * the browser tiles to the left and the live presenter popup fits on
@@ -601,6 +803,13 @@ export interface ReportSubGoal {
   started_at_turn?: number | null;
   ended_at_turn?: number | null;
   max_turns?: number | null;
+  /** Phase B — distinguishes a sub-goal walked by the deterministic
+   * frozen-path replay from one driven by the agentic loop.
+   * - "frozen": entire sub-goal walked deterministically
+   * - "agentic": entire sub-goal driven by the agent loop
+   * - "frozen_then_agentic": replay attempted + failed, agentic recovered */
+  source?: "frozen" | "agentic" | "frozen_then_agentic" | null;
+  frozen_step_count?: number | null;
 }
 
 export interface ReportStepRead {
@@ -874,6 +1083,12 @@ export interface TcNodeRead {
   selectable_default: boolean;
   status: TcNodeStatus;
   source_requirement_ids: number[];
+  /** Phase E — when true, the submodule has a frozen v1/v2 path and
+   * is eligible for "Save as module". */
+  has_frozen_path: boolean;
+  /** Frozen-path version on this node (1 = legacy whole-submodule,
+   * 2 = per-sub-goal segments). NULL when has_frozen_path is false. */
+  frozen_path_version: number | null;
   // Timestamps
   created_at: string;
   updated_at: string;
@@ -1163,6 +1378,131 @@ export const api = {
       { method: "POST" },
     ),
 
+  /** Phase A.5 — load the current AppMap for the plan's target_url.
+   * Returns 404 (handled as null) when no map exists yet. */
+  getAppMap: (projectId: number, planId: number) =>
+    apiFetch<AppMapRead>(
+      `/api/projects/${projectId}/plans/${planId}/app-map`,
+    ),
+
+  /** Phase A.5 — clear the AppMap so the next agentic run rebuilds
+   * it. The actual rebuild happens inside the next run after auth. */
+  clearAppMap: (projectId: number, planId: number) =>
+    apiFetch<void>(
+      `/api/projects/${projectId}/plans/${planId}/app-map`,
+      { method: "DELETE" },
+    ),
+
+  /** Phase C.3 — list all TC versions for a plan (newest first). */
+  listTcVersions: (projectId: number, planId: number) =>
+    apiFetch<TcVersionsListResponse>(
+      `/api/projects/${projectId}/plans/${planId}/tc-versions`,
+    ),
+
+  /** Phase C.3 — fetch one TC version with its full snapshot tree. */
+  getTcVersion: (projectId: number, planId: number, versionId: number) =>
+    apiFetch<TcVersionDetail>(
+      `/api/projects/${projectId}/plans/${planId}/tc-versions/${versionId}`,
+    ),
+
+  /** Phase C.3 — activate a version (pass versionId=0 to clear). */
+  activateTcVersion: (
+    projectId: number, planId: number, versionId: number,
+  ) =>
+    apiFetch<{ current_tc_version_id: number | null; version_number?: number }>(
+      `/api/projects/${projectId}/plans/${planId}/tc-versions/${versionId}/activate`,
+      { method: "PUT" },
+    ),
+
+  /** Phase C.2 — kick off TC refinement from the cached AppMap.
+   * Returns the new version_id + per-submodule change counts. */
+  refineFromAppMap: (projectId: number, planId: number) =>
+    apiFetch<TcRefinementResponse>(
+      `/api/projects/${projectId}/plans/${planId}/refine-from-app-map`,
+      { method: "POST" },
+    ),
+
+  /** Phase D — dry-run validate a TC version against the live UI.
+   * Opens a headless browser, logs in via auth_flow, probes each
+   * step's target_hint + expected text against the running app
+   * without dispatching actions. Writes per-snapshot validation
+   * status + confidence; returns per-submodule rollup. */
+  validateTcVersion: (
+    projectId: number, planId: number, versionId: number,
+  ) =>
+    apiFetch<TcValidationResponse>(
+      `/api/projects/${projectId}/plans/${planId}/tc-versions/${versionId}/validate`,
+      { method: "POST" },
+    ),
+
+  // ── Phase E — Sub-flow modules library ────────────────────────
+
+  listSubFlowModules: (projectId: number) =>
+    apiFetch<SubFlowModuleSummary[]>(
+      `/api/projects/${projectId}/sub-flow-modules`,
+    ),
+
+  getSubFlowModule: (projectId: number, moduleId: number) =>
+    apiFetch<SubFlowModuleDetail>(
+      `/api/projects/${projectId}/sub-flow-modules/${moduleId}`,
+    ),
+
+  promoteToSubFlowModule: (
+    projectId: number,
+    payload: {
+      submodule_tc_node_id: number;
+      name: string;
+      description?: string;
+      target_url_pattern?: string | null;
+      tags?: string[];
+      source_run_id?: number | null;
+    },
+  ) =>
+    apiFetch<{
+      module_id: number;
+      name: string;
+      segments: number;
+      steps: number;
+    }>(
+      `/api/projects/${projectId}/sub-flow-modules/promote`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  importSubFlowModule: (
+    projectId: number,
+    moduleId: number,
+    payload: { plan_id: number; parent_module_tc_node_id?: number | null },
+  ) =>
+    apiFetch<{
+      new_submodule_id: number;
+      parent_module_id: number;
+      steps_created: number;
+    }>(
+      `/api/projects/${projectId}/sub-flow-modules/${moduleId}/import`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  updateSubFlowModule: (
+    projectId: number,
+    moduleId: number,
+    payload: {
+      name?: string;
+      description?: string;
+      target_url_pattern?: string | null;
+      tags?: string[];
+    },
+  ) =>
+    apiFetch<{ ok: boolean }>(
+      `/api/projects/${projectId}/sub-flow-modules/${moduleId}`,
+      { method: "PATCH", body: JSON.stringify(payload) },
+    ),
+
+  deleteSubFlowModule: (projectId: number, moduleId: number) =>
+    apiFetch<void>(
+      `/api/projects/${projectId}/sub-flow-modules/${moduleId}`,
+      { method: "DELETE" },
+    ),
+
   /** γ.1 — Resolve a runtime test-case dispute. Action accept /
    * reject / edit; optional user_note; optional apply_to_test_case
    * to annotate the TC node's description. Writes a high-confidence
@@ -1263,6 +1603,30 @@ export const api = {
   cancelAgentRun: (projectId: number, runId: number) =>
     apiFetch<AgentRunRead>(
       `/api/projects/${projectId}/agent-runs/${runId}/cancel`,
+      { method: "POST" },
+    ),
+  /**
+   * Phase K.1 — strict stop. Writes status='cancelled' to the DB
+   * immediately and emits the cancelled event. The runner thread
+   * may keep going briefly (Python can't kill OS threads safely)
+   * but the system considers the run terminal from this call.
+   * Use when the cooperative ``cancelAgentRun`` doesn't take effect
+   * within ~10s (stuck inside an LLM call, browser wait, or HITL
+   * block).
+   */
+  forceCancelAgentRun: (projectId: number, runId: number) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/cancel?force=true`,
+      { method: "POST" },
+    ),
+  /**
+   * Phase K.2 — manual orphan reaper. Cancels runs stuck in non-
+   * terminal status with no completed_at (left over from a process
+   * restart / crash). Server also runs this automatically at boot.
+   */
+  reapOrphanedRuns: (projectId: number, staleAfterSeconds = 60) =>
+    apiFetch<{ reaped: number[]; count: number }>(
+      `/api/projects/${projectId}/agent-runs/reap-orphans?stale_after_seconds=${staleAfterSeconds}`,
       { method: "POST" },
     ),
   deleteAgentRun: (projectId: number, runId: number) =>

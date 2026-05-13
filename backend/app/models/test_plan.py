@@ -81,6 +81,20 @@ class TestPlan(Base):
         Integer, nullable=False, default=2, server_default="2",
     )
 
+    # Phase C.3 — TC version pointer. When NULL (default), the agent
+    # run materializes from the LIVE TcNode tree. When set to a
+    # TcVersion id, the run snapshots that version's tree and runs
+    # against it — letting the user pick between BRD-derived v1,
+    # app-map-refined v2, manually-edited v3, etc. at run-start. The
+    # live TcNode tree never gets touched by version-scoped runs.
+    current_tc_version_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey(
+            "test_plan_tc_versions.id", ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )
