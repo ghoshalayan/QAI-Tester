@@ -733,12 +733,22 @@ def run_form_fill(
     settle_ms: int = 600,
     max_validation_retries: int = 2,
     emit_event: Callable[[str, dict], None] | None = None,
+    vision_provider: Any = None,
 ) -> FormFillResult:
     """Orchestrated form fill — see module docstring.
 
     ``submit_label`` is fuzzy-matched against visible buttons in the
     form region; pass ``""`` to skip the submit phase (caller dispatches
     submit separately).
+
+    ``vision_provider`` (Phase U) — when supplied AND the DOM scanner
+    fails to match any of the requested fields (Solar's custom drawer
+    has no MUI / dialog class names, so the scanner returns 0 fields),
+    the routine falls back to ONE vision call that returns pixel
+    coordinates for each requested field. Fields are then filled by
+    clicking at the returned (x, y) and typing. Same fallback applies
+    to the Save button finder. Optional; when not supplied, the
+    routine fails with the same outcomes as before.
 
     The routine never raises — failures are recorded in the per-field
     outcomes + the submit_status field of the result.
@@ -846,6 +856,51 @@ def run_form_fill(
             used_keys.add(m["key"])
             matched.append((ff, m))
 
+    # Phase U — vision-coord fallback. When the DOM scanner failed to
+    # match ANY of the requested fields (Solar's custom drawer, an
+    # iframe we can't reach, shadow DOM) — fire ONE vision call that
+    # returns pixel coords for every requested label. Fill those via
+    # click+type. Only fires when:
+    #   - vision_provider is configured AND vision-capable
+    #   - matched is empty OR < 50% of requested fields matched
+    #   - the requested field is a simple text input
+    # Compound widgets (permission_tree, paginated_resource_table)
+    # are skipped — they need DOM key-tagging.
+    vision_coord_fields: dict[str, tuple[int, int]] = {}
+    vision_submit_coord: tuple[int, int] | None = None
+    miss_ratio = (
+        len(unmatched) / len(fields) if fields else 0.0
+    )
+    should_try_vl_fallback = (
+        vision_provider is not None
+        and unmatched
+        and miss_ratio >= 0.5
+    )
+    if should_try_vl_fallback:
+        try:
+            vl_labels = [
+                ff.label for ff in unmatched
+                if ff.role_hint not in (
+                    "permission_tree", "paginated_resource_table",
+                )
+            ]
+            vision_coord_fields, vision_submit_coord = (
+                _locate_form_fields_via_vision(
+                    page,
+                    labels=vl_labels,
+                    submit_label=submit_label or "Save",
+                    vision_provider=vision_provider,
+                )
+            )
+            _emit("form_fill_vl_fallback", {
+                "labels_requested": vl_labels[:10],
+                "labels_located": list(vision_coord_fields.keys())[:10],
+                "submit_located": vision_submit_coord is not None,
+            })
+        except Exception as e:
+            logger.debug("VL fallback raised: %s", e)
+            vision_coord_fields = {}
+
     # 3) Fill each matched field with the right strategy. We handle
     # required-field MISSES with an immediate retry via coord-typing
     # fallback.
@@ -861,8 +916,53 @@ def run_form_fill(
             "attempts": outcome.attempts,
         })
 
-    # Record unmatched as misses.
+    # Phase U — coord-fill unmatched fields the VL locator found.
+    still_unmatched: list[FormField] = []
     for ff in unmatched:
+        coord = vision_coord_fields.get(ff.label)
+        if coord is None:
+            still_unmatched.append(ff)
+            continue
+        try:
+            page.mouse.click(coord[0], coord[1])
+            try:
+                page.wait_for_timeout(100)
+            except Exception:
+                pass
+            # Clear any pre-existing value before typing.
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            page.keyboard.type(ff.value, delay=20)
+            outcome = FieldOutcome(
+                label=ff.label,
+                role=ff.role_hint or "textbox",  # type: ignore[arg-type]
+                status="filled",
+                final_value=ff.value,
+                attempts=1,
+            )
+            outcome.error = (
+                f"VL-coord fallback @ ({coord[0]},{coord[1]})"
+            )
+        except Exception as e:
+            outcome = FieldOutcome(
+                label=ff.label,
+                role=ff.role_hint or "textbox",  # type: ignore[arg-type]
+                status="error",
+                error=f"VL-coord click/type failed: {e}",
+            )
+        result.fields.append(outcome)
+        _emit("form_fill_field", {
+            "label": ff.label,
+            "role": outcome.role,
+            "status": outcome.status,
+            "final_value": outcome.final_value[:120],
+            "error": outcome.error[:200] if outcome.error else "",
+            "attempts": outcome.attempts,
+            "via_vl_coord": True,
+        })
+
+    # Record still-unmatched as misses (VL also couldn't find them).
+    for ff in still_unmatched:
         result.fields.append(FieldOutcome(
             label=ff.label,
             role=ff.role_hint or "unknown",
@@ -884,6 +984,7 @@ def run_form_fill(
                 page,
                 submit_label=submit_label,
                 settle_ms=settle_ms,
+                vision_submit_coord=vision_submit_coord,
             )
             _emit("form_fill_submit_attempt", {
                 "attempt": attempt + 1,
@@ -2015,6 +2116,163 @@ def _fill_paginated_resource_table(
 # ── Submit + validation observer ─────────────────────────────────
 
 
+# Phase U — vision-coord fallback for form fields.
+#
+# Fires when the DOM scanner finds 0 fields OR fewer than the
+# requested set matched. One VL call returns {label: (x, y)} for
+# every requested label. The fill loop then clicks at each coord and
+# types the value — bypasses DOM resolution entirely. The fallback
+# does NOT support custom comboboxes / trees / paginated tables
+# (those need DOM-keyed JS); textbox + textarea + simple inputs only.
+
+
+_VL_LOCATE_FIELDS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "fields": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "x": {"type": ["integer", "null"]},
+                    "y": {"type": ["integer", "null"]},
+                    "confidence": {
+                        "type": "number", "minimum": 0.0, "maximum": 1.0,
+                    },
+                },
+                "required": ["label", "x", "y", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "submit_x": {"type": ["integer", "null"]},
+        "submit_y": {"type": ["integer", "null"]},
+        "submit_confidence": {
+            "type": "number", "minimum": 0.0, "maximum": 1.0,
+        },
+    },
+    "required": ["fields", "submit_x", "submit_y", "submit_confidence"],
+    "additionalProperties": False,
+}
+
+
+_VL_LOCATE_FIELDS_SYSTEM_PROMPT = (
+    "You are a UI element locator. The agent is filling a form on a "
+    "screenshot. The DOM scanner failed (custom-styled drawer, shadow "
+    "DOM, iframe, etc.). Your ONE job: return pixel coordinates for "
+    "the CENTER of each input field matching the requested labels, "
+    "plus the Save / Submit button.\n\n"
+    "Rules:\n"
+    "1. (x, y) are in the screenshot's pixel space — the same space "
+    "page.mouse.click expects.\n"
+    "2. For each requested field, find the INPUT box (textbox / "
+    "textarea / dropdown / checkbox) associated with that label. "
+    "Return the center of the INPUT, NOT the label text.\n"
+    "3. If you can't see a field's input, set x=null, y=null, "
+    "confidence=0.0 for that entry.\n"
+    "4. submit_x / submit_y point at the primary Save / Submit / "
+    "Create button at the bottom of the form. Null when not visible.\n"
+    "5. confidence: 0.95+ when the field is unambiguous; 0.6-0.8 "
+    "when uncertain; <0.5 when guessing.\n"
+    "Output strict JSON only."
+)
+
+
+def _locate_form_fields_via_vision(
+    page: "Page",
+    *,
+    labels: list[str],
+    submit_label: str,
+    vision_provider: Any,
+) -> tuple[dict[str, tuple[int, int]], tuple[int, int] | None]:
+    """Phase U — fallback vision call. Returns ``(label_coords,
+    submit_coord_or_None)``.
+
+    Single LLM call covers ALL requested labels + the Save button.
+    Empty dict + None when the call fails or the provider can't see
+    images.
+    """
+    if vision_provider is None or not getattr(
+        vision_provider, "supports_vision", False,
+    ):
+        return {}, None
+    if not labels:
+        return {}, None
+    try:
+        from app.agents.page_intel import (  # noqa: PLC0415
+            capture_screenshot_for_vision,
+        )
+        from app.llm.base import ChatMessage  # noqa: PLC0415
+    except Exception:
+        return {}, None
+    try:
+        # downscale=False — we need pixel-accurate coords; downscaling
+        # would shift the returned (x, y) relative to the live viewport.
+        shot = capture_screenshot_for_vision(page, downscale=False)
+    except Exception:
+        return {}, None
+
+    user_text = (
+        "FIELDS TO LOCATE (return coords for each in the same order):\n"
+        + "\n".join(f"  - {lab!r}" for lab in labels)
+        + f"\n\nSUBMIT BUTTON LABEL: {submit_label!r}\n\n"
+        "Return JSON with one entry per field and the submit coords."
+    )
+    try:
+        result = vision_provider.chat_structured(
+            messages=[
+                ChatMessage(
+                    role="system",
+                    content=_VL_LOCATE_FIELDS_SYSTEM_PROMPT,
+                ),
+                ChatMessage(role="user", content=user_text, image=shot),
+            ],
+            schema=_VL_LOCATE_FIELDS_SCHEMA,
+            schema_name="form_field_coords",
+            temperature=0.1,
+            max_output_tokens=800,
+        )
+    except Exception as e:
+        logger.warning(
+            "vision-coord field locator failed: %s: %s",
+            type(e).__name__, e,
+        )
+        return {}, None
+    parsed = result.parsed
+    if not isinstance(parsed, dict):
+        return {}, None
+
+    coords: dict[str, tuple[int, int]] = {}
+    for entry in (parsed.get("fields") or []):
+        if not isinstance(entry, dict):
+            continue
+        lab = str(entry.get("label") or "").strip()
+        x = entry.get("x")
+        y = entry.get("y")
+        conf = entry.get("confidence", 0.0)
+        if not lab or not isinstance(x, int) or not isinstance(y, int):
+            continue
+        try:
+            conf_f = float(conf)
+        except (TypeError, ValueError):
+            conf_f = 0.0
+        if conf_f < 0.5:
+            continue
+        coords[lab] = (x, y)
+
+    submit_coord: tuple[int, int] | None = None
+    sx = parsed.get("submit_x")
+    sy = parsed.get("submit_y")
+    sconf = parsed.get("submit_confidence", 0.0)
+    try:
+        sconf_f = float(sconf)
+    except (TypeError, ValueError):
+        sconf_f = 0.0
+    if isinstance(sx, int) and isinstance(sy, int) and sconf_f >= 0.5:
+        submit_coord = (sx, sy)
+    return coords, submit_coord
+
+
 _FIND_PRIMARY_SUBMIT_JS = r"""
 (opts) => {
   // Phase I.2 — find the most likely SUBMIT BUTTON, distinguishing
@@ -2209,6 +2467,7 @@ def _submit_and_observe(
     *,
     submit_label: str,
     settle_ms: int,
+    vision_submit_coord: tuple[int, int] | None = None,
 ) -> tuple[bool, str, list[dict[str, Any]]]:
     """Click the submit button matching ``submit_label``, then watch
     for inline aria-invalid feedback. Returns
@@ -2266,6 +2525,21 @@ def _submit_and_observe(
             clicked = True
         except Exception:
             pass
+    # Phase U — vision-coord fallback for Save. When neither the JS
+    # scorer nor the role-based locator found Save (custom-styled
+    # drawer, shadow DOM, etc.), use the coords the form-locator VL
+    # call returned. The locator was called ONCE per fill_form
+    # invocation; we reuse its submit_coord here instead of firing
+    # another VL call.
+    if not clicked and vision_submit_coord is not None:
+        try:
+            page.mouse.click(
+                vision_submit_coord[0],
+                vision_submit_coord[1],
+            )
+            clicked = True
+        except Exception:
+            pass
     # Note: deliberately NO get_by_text fallback here — that's exactly
     # what mis-fires on form-title headings. If both methods above
     # failed, we'd rather report "submit not found" than click the wrong
@@ -2273,7 +2547,14 @@ def _submit_and_observe(
     if not clicked:
         return (
             False,
-            f"submit click failed: no button matching {submit_label!r}",
+            (
+                f"submit click failed: no button matching {submit_label!r}"
+                + (
+                    " (vision-coord fallback also unavailable)"
+                    if vision_submit_coord is None
+                    else ""
+                )
+            ),
             [],
         )
 

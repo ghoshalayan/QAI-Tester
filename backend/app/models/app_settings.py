@@ -83,6 +83,67 @@ class AppSettings(Base):
     # Required when provider == 'openai_compat'; ignored otherwise
     base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
+    # ── Migration 0025 — per-tier provider (cheap / fallback) ─────
+    # Each tier has independent (provider, model, api_key, base_url)
+    # so the operator can mix: e.g. strong=OpenAI GPT-5, cheap=
+    # OpenRouter DeepSeek, fallback_strong=Gemini 2.5 Pro.
+    # When NULL, the tier's credentials fall back to the primary tier
+    # if the providers match (keeps single-provider setups working
+    # without re-entering keys per tier).
+    cheap_provider: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    cheap_api_key: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    cheap_base_url: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+
+    fallback_strong_provider: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    fallback_strong_model: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+    )
+    fallback_strong_api_key: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    fallback_strong_base_url: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    fallback_strong_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    fallback_strong_output_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    fallback_strong_cached_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+
+    fallback_cheap_provider: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+    )
+    fallback_cheap_model: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+    )
+    fallback_cheap_api_key: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    fallback_cheap_base_url: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    fallback_cheap_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    fallback_cheap_output_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    fallback_cheap_cached_input_price_per_m: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+
     # AI-Mode toggle. When True, every read-side endpoint transforms
     # run summary counts and per-row statuses to a deterministic
     # 80-90% pass rate — purely cosmetic, real data is never modified.
@@ -120,7 +181,7 @@ class AppSettings(Base):
     __table_args__ = (
         CheckConstraint("id = 1", name="app_settings_singleton"),
         CheckConstraint(
-            "provider IN ('gemini', 'openai', 'openai_compat')",
+            "provider IN ('gemini', 'openai', 'openai_compat', 'openrouter')",
             name="app_settings_provider_valid",
         ),
     )

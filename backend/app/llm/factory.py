@@ -17,7 +17,14 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 _lock = threading.Lock()
-_cache: tuple[tuple, LLMProvider] | None = None  # (cache_key, instance)
+# Migration 0025 — per-tier providers can use different (provider,
+# model, key) combos so the single-entry cache from v1 isn't enough.
+# Switch to a dict keyed on the cache_key tuple. Eviction is implicit
+# via :func:`invalidate_cache` (called on settings save).
+_cache: dict[tuple, LLMProvider] = {}
+
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def build_provider(
@@ -37,6 +44,19 @@ def build_provider(
         return OpenAIProvider(
             api_key=api_key, model=model, base_url=base_url, is_compat=True,
         )
+    if provider == "openrouter":
+        # OpenRouter is OpenAI-API-compatible with a fixed endpoint.
+        # We surface it as its own provider value so the UI can show
+        # OpenRouter-specific model suggestions + skip the base_url
+        # field. The actual transport is the OpenAI SDK with
+        # base_url=https://openrouter.ai/api/v1.
+        effective_base_url = base_url or OPENROUTER_BASE_URL
+        return OpenAIProvider(
+            api_key=api_key,
+            model=model,
+            base_url=effective_base_url,
+            is_compat=True,
+        )
     raise ValueError(f"Unknown provider: {provider!r}")
 
 
@@ -47,20 +67,19 @@ def get_provider(
     base_url: str | None = None,
 ) -> LLMProvider:
     """Return the cached provider, rebuilding if any field changed."""
-    global _cache
     key = (provider, model, api_key, base_url)
     with _lock:
-        if _cache is not None and _cache[0] == key:
-            return _cache[1]
+        cached = _cache.get(key)
+        if cached is not None:
+            return cached
         instance = build_provider(provider, model, api_key, base_url)
-        _cache = (key, instance)
+        _cache[key] = instance
         return instance
 
 
 def invalidate_cache() -> None:
-    global _cache
     with _lock:
-        _cache = None
+        _cache.clear()
 
 
 def get_provider_from_db(db: "Session") -> LLMProvider:

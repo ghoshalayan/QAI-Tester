@@ -12,7 +12,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ProviderLiteral = Literal["gemini", "openai", "openai_compat"]
+ProviderLiteral = Literal[
+    "gemini", "openai", "openai_compat", "openrouter",
+]
 
 
 class AppSettingsRead(BaseModel):
@@ -45,6 +47,34 @@ class AppSettingsRead(BaseModel):
     # (safe over-bill default).
     strong_cached_input_price_per_m: float | None = None
     cheap_cached_input_price_per_m: float | None = None
+
+    # ── Migration 0025 — per-tier providers ────────────────────
+    # Each tier independently selects its (provider, model,
+    # api_key, base_url) so the operator can mix providers:
+    # e.g. strong=OpenAI GPT-5, cheap=OpenRouter, fallback_strong=
+    # Gemini 2.5. Read responses never echo the api_key; we expose
+    # ``<tier>_api_key_set`` so the UI shows "configured" without
+    # leaking the secret.
+    cheap_provider: ProviderLiteral | None = None
+    cheap_base_url: str | None = None
+    cheap_api_key_set: bool = False
+
+    fallback_strong_provider: ProviderLiteral | None = None
+    fallback_strong_model: str | None = None
+    fallback_strong_base_url: str | None = None
+    fallback_strong_api_key_set: bool = False
+    fallback_strong_input_price_per_m: float | None = None
+    fallback_strong_output_price_per_m: float | None = None
+    fallback_strong_cached_input_price_per_m: float | None = None
+
+    fallback_cheap_provider: ProviderLiteral | None = None
+    fallback_cheap_model: str | None = None
+    fallback_cheap_base_url: str | None = None
+    fallback_cheap_api_key_set: bool = False
+    fallback_cheap_input_price_per_m: float | None = None
+    fallback_cheap_output_price_per_m: float | None = None
+    fallback_cheap_cached_input_price_per_m: float | None = None
+
     updated_at: datetime | None = None
 
 
@@ -81,6 +111,43 @@ class AppSettingsWrite(BaseModel):
         default=None, ge=0, le=10_000,
     )
     cheap_cached_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+
+    # ── Migration 0025 — per-tier provider config ────────────────
+    # Each non-strong tier accepts its own (provider, model, api_key,
+    # base_url). Omit → leave unchanged. Empty string ("") for any
+    # field clears that field (disables the tier when applied to
+    # ``*_model``).
+    cheap_provider: ProviderLiteral | None = None
+    cheap_api_key: str | None = Field(default=None, max_length=512)
+    cheap_base_url: str | None = Field(default=None, max_length=512)
+
+    fallback_strong_provider: ProviderLiteral | None = None
+    fallback_strong_model: str | None = Field(default=None, max_length=128)
+    fallback_strong_api_key: str | None = Field(default=None, max_length=512)
+    fallback_strong_base_url: str | None = Field(default=None, max_length=512)
+    fallback_strong_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    fallback_strong_output_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    fallback_strong_cached_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+
+    fallback_cheap_provider: ProviderLiteral | None = None
+    fallback_cheap_model: str | None = Field(default=None, max_length=128)
+    fallback_cheap_api_key: str | None = Field(default=None, max_length=512)
+    fallback_cheap_base_url: str | None = Field(default=None, max_length=512)
+    fallback_cheap_input_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    fallback_cheap_output_price_per_m: float | None = Field(
+        default=None, ge=0, le=10_000,
+    )
+    fallback_cheap_cached_input_price_per_m: float | None = Field(
         default=None, ge=0, le=10_000,
     )
 

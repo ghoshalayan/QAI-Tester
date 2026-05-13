@@ -11,6 +11,7 @@ import {
   type Provider,
   type RunCallLog,
   type RunCost,
+  type Settings,
   type SettingsWrite,
   type TestConnectionResult,
 } from "@/lib/api";
@@ -33,9 +34,14 @@ const PROVIDER_OPTIONS: { value: Provider; label: string; hint: string }[] = [
   { value: "gemini", label: "Gemini", hint: "Google AI Studio" },
   { value: "openai", label: "OpenAI", hint: "platform.openai.com" },
   {
+    value: "openrouter",
+    label: "OpenRouter",
+    hint: "openrouter.ai — multi-model gateway (no base_url needed)",
+  },
+  {
     value: "openai_compat",
     label: "OpenAI-compatible",
-    hint: "Ollama, vLLM, LM Studio, OpenRouter, …",
+    hint: "Ollama, vLLM, LM Studio, self-hosted; requires base_url",
   },
 ];
 
@@ -58,6 +64,17 @@ const MODEL_SUGGESTIONS: Record<Provider, string[]> = {
     "gpt-5-mini",
     "o3-mini",
   ],
+  openrouter: [
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-chat",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-haiku-4.5",
+    "google/gemini-2.5-pro",
+    "openai/gpt-5",
+    "openai/gpt-5-mini",
+    "meta-llama/llama-4-405b-instruct",
+    "qwen/qwen-3-vision-72b",
+  ],
   openai_compat: [],
 };
 
@@ -68,9 +85,9 @@ export default function SettingsPage() {
     queryFn: api.getSettings,
   });
 
-  const [activeTab, setActiveTab] = useState<"models" | "cost" | "logs">(
-    "models",
-  );
+  const [activeTab, setActiveTab] = useState<
+    "models" | "tiers" | "cost" | "logs"
+  >("models");
 
   const [provider, setProvider] = useState<Provider>("gemini");
   const [model, setModel] = useState("");
@@ -91,7 +108,11 @@ export default function SettingsPage() {
   const providerChanged =
     !!settings?.provider && settings.provider !== provider;
   const apiKeyOnFile = !!settings?.api_key_set && !providerChanged;
+  // openai_compat REQUIRES a base_url (self-hosted endpoint).
+  // openrouter is also OpenAI-API-compatible but the factory has its
+  // base_url baked in, so the user doesn't have to supply one.
   const isCompat = provider === "openai_compat";
+  const needsBaseUrl = isCompat;
 
   const buildPayload = (): SettingsWrite => {
     const payload: SettingsWrite = { provider, model: model.trim() };
@@ -99,7 +120,7 @@ export default function SettingsPage() {
     // the user can disable an existing tier by blanking the field.
     payload.cheap_model = cheapModel.trim();
     if (apiKey.trim()) payload.api_key = apiKey.trim();
-    if (isCompat) payload.base_url = baseUrl.trim();
+    if (needsBaseUrl) payload.base_url = baseUrl.trim();
     return payload;
   };
 
@@ -178,7 +199,9 @@ export default function SettingsPage() {
   });
 
   const canTest =
-    !!model.trim() && (apiKey.trim() || apiKeyOnFile) && (!isCompat || baseUrl.trim());
+    !!model.trim()
+    && (apiKey.trim() || apiKeyOnFile)
+    && (!needsBaseUrl || baseUrl.trim());
   const canSave = canTest;
 
   if (isLoading) {
@@ -205,6 +228,7 @@ export default function SettingsPage() {
         {(
           [
             { id: "models", label: "Models Config" },
+            { id: "tiers", label: "Tiers & Fallbacks" },
             { id: "cost", label: "Cost Settings" },
             { id: "logs", label: "Cost Logs" },
           ] as const
@@ -581,8 +605,295 @@ export default function SettingsPage() {
         </>
       )}
 
+      {activeTab === "tiers" && (
+        <TiersAndFallbacksTab settings={settings ?? null} />
+      )}
       {activeTab === "cost" && <CostSettingsTab settings={settings ?? null} />}
       {activeTab === "logs" && <CostLogsTab />}
+    </div>
+  );
+}
+
+// ── Tiers & Fallbacks tab ───────────────────────────────────────
+//
+// Per-tier provider configuration. Each non-strong tier can pick its
+// own (provider, model, api_key, base_url). The factory falls back to
+// the primary tier's credentials when fields are blank AND the
+// providers match, so single-provider setups don't have to re-enter
+// keys per tier.
+function TiersAndFallbacksTab({
+  settings,
+}: {
+  settings: Settings | null;
+}) {
+  const qc = useQueryClient();
+
+  type TierKey = "cheap" | "fallback_strong" | "fallback_cheap";
+  type TierState = {
+    provider: Provider | "";
+    model: string;
+    apiKey: string;
+    baseUrl: string;
+  };
+  const [state, setState] = useState<Record<TierKey, TierState>>({
+    cheap: { provider: "", model: "", apiKey: "", baseUrl: "" },
+    fallback_strong: { provider: "", model: "", apiKey: "", baseUrl: "" },
+    fallback_cheap: { provider: "", model: "", apiKey: "", baseUrl: "" },
+  });
+
+  useEffect(() => {
+    if (!settings) return;
+    setState({
+      cheap: {
+        provider: (settings.cheap_provider ?? settings.provider) || "",
+        model: settings.cheap_model ?? "",
+        apiKey: "",
+        baseUrl: settings.cheap_base_url ?? "",
+      },
+      fallback_strong: {
+        provider: settings.fallback_strong_provider ?? "",
+        model: settings.fallback_strong_model ?? "",
+        apiKey: "",
+        baseUrl: settings.fallback_strong_base_url ?? "",
+      },
+      fallback_cheap: {
+        provider: settings.fallback_cheap_provider ?? "",
+        model: settings.fallback_cheap_model ?? "",
+        apiKey: "",
+        baseUrl: settings.fallback_cheap_base_url ?? "",
+      },
+    });
+  }, [settings]);
+
+  const saveMutation = useMutation({
+    mutationFn: () => {
+      const payload: SettingsWrite = {};
+      // Cheap (primary fallback tier — model goes on the existing
+      // cheap_model field; provider / key / base_url use the new
+      // *_provider / *_api_key / *_base_url fields).
+      payload.cheap_model = state.cheap.model.trim();
+      if (state.cheap.provider) payload.cheap_provider = state.cheap.provider;
+      if (state.cheap.apiKey.trim()) payload.cheap_api_key = state.cheap.apiKey.trim();
+      payload.cheap_base_url = state.cheap.baseUrl.trim();
+
+      payload.fallback_strong_model = state.fallback_strong.model.trim();
+      if (state.fallback_strong.provider)
+        payload.fallback_strong_provider = state.fallback_strong.provider;
+      if (state.fallback_strong.apiKey.trim())
+        payload.fallback_strong_api_key = state.fallback_strong.apiKey.trim();
+      payload.fallback_strong_base_url = state.fallback_strong.baseUrl.trim();
+
+      payload.fallback_cheap_model = state.fallback_cheap.model.trim();
+      if (state.fallback_cheap.provider)
+        payload.fallback_cheap_provider = state.fallback_cheap.provider;
+      if (state.fallback_cheap.apiKey.trim())
+        payload.fallback_cheap_api_key = state.fallback_cheap.apiKey.trim();
+      payload.fallback_cheap_base_url = state.fallback_cheap.baseUrl.trim();
+
+      return api.upsertSettings(payload);
+    },
+    onSuccess: () => {
+      toast.success("Tier configuration saved");
+      qc.invalidateQueries({ queryKey: ["settings"] });
+      setState((s) => ({
+        cheap: { ...s.cheap, apiKey: "" },
+        fallback_strong: { ...s.fallback_strong, apiKey: "" },
+        fallback_cheap: { ...s.fallback_cheap, apiKey: "" },
+      }));
+    },
+    onError: (e: Error) => {
+      toast.error("Save failed", {
+        description: e instanceof ApiError ? e.message : e.message,
+      });
+    },
+  });
+
+  if (!settings?.is_configured) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Per-tier providers</CardTitle>
+          <CardDescription>
+            Configure the primary (strong) provider in the{" "}
+            <strong>Models Config</strong> tab first. Per-tier providers
+            and fallbacks become available once a strong tier is saved.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Tiers & Fallbacks</CardTitle>
+        <CardDescription>
+          Each tier picks its own (provider, model). Blank fields fall
+          back to the primary tier's credentials when the providers
+          match. <strong>Cheap</strong> handles high-volume helper
+          calls. <strong>Fallback strong</strong> /{" "}
+          <strong>Fallback cheap</strong> fire only when the primary
+          tier raises (rate limit, network, 5xx).
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <PrimaryTierSummary settings={settings} />
+        {(
+          [
+            {
+              key: "cheap",
+              title: "Cheap tier",
+              blurb:
+                "Vision helpers, smart-pick, on-track, verifier. Skipped when blank.",
+            },
+            {
+              key: "fallback_strong",
+              title: "Fallback for strong",
+              blurb:
+                "Used only when the strong tier's call raises. Different provider recommended.",
+            },
+            {
+              key: "fallback_cheap",
+              title: "Fallback for cheap",
+              blurb:
+                "Used only when the cheap tier's call raises. Optional.",
+            },
+          ] as const
+        ).map((tier) => (
+          <TierEditor
+            key={tier.key}
+            title={tier.title}
+            blurb={tier.blurb}
+            state={state[tier.key]}
+            keySet={
+              tier.key === "cheap"
+                ? settings.cheap_api_key_set
+                : tier.key === "fallback_strong"
+                ? settings.fallback_strong_api_key_set
+                : settings.fallback_cheap_api_key_set
+            }
+            onChange={(next) =>
+              setState((s) => ({ ...s, [tier.key]: next }))
+            }
+          />
+        ))}
+      </CardContent>
+      <CardFooter className="justify-end">
+        <Button
+          onClick={() => saveMutation.mutate()}
+          disabled={saveMutation.isPending}
+        >
+          {saveMutation.isPending ? "Saving…" : "Save tier configuration"}
+        </Button>
+      </CardFooter>
+    </Card>
+  );
+}
+
+function PrimaryTierSummary({ settings }: { settings: Settings }) {
+  return (
+    <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+      <span className="font-medium text-foreground">Strong tier (primary):</span>{" "}
+      {settings.provider} · <span className="font-mono">{settings.model}</span>
+      {settings.base_url ? ` · ${settings.base_url}` : ""}
+      {" — edit in the Models Config tab."}
+    </div>
+  );
+}
+
+function TierEditor({
+  title,
+  blurb,
+  state,
+  keySet,
+  onChange,
+}: {
+  title: string;
+  blurb: string;
+  state: { provider: Provider | ""; model: string; apiKey: string; baseUrl: string };
+  keySet: boolean;
+  onChange: (
+    next: { provider: Provider | ""; model: string; apiKey: string; baseUrl: string },
+  ) => void;
+}) {
+  const needsBaseUrl = state.provider === "openai_compat";
+  return (
+    <div className="space-y-3 rounded-md border p-3">
+      <div>
+        <h4 className="text-sm font-medium">{title}</h4>
+        <p className="text-xs text-muted-foreground">{blurb}</p>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <Label className="text-xs">Provider</Label>
+          <select
+            value={state.provider}
+            onChange={(e) =>
+              onChange({ ...state, provider: e.target.value as Provider | "" })
+            }
+            className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+          >
+            <option value="">(inherit primary)</option>
+            {PROVIDER_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">Model</Label>
+          <Input
+            value={state.model}
+            onChange={(e) => onChange({ ...state, model: e.target.value })}
+            placeholder="(blank = tier disabled)"
+            list={
+              state.provider
+                ? `models-${title.replace(/\s+/g, "-")}-${state.provider}`
+                : undefined
+            }
+          />
+          {state.provider && MODEL_SUGGESTIONS[state.provider as Provider]?.length > 0 && (
+            <datalist
+              id={`models-${title.replace(/\s+/g, "-")}-${state.provider}`}
+            >
+              {MODEL_SUGGESTIONS[state.provider as Provider].map((m) => (
+                <option key={m} value={m} />
+              ))}
+            </datalist>
+          )}
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <Label className="text-xs">
+            API key {keySet ? <span className="text-emerald-600">· saved</span> : null}
+          </Label>
+          <Input
+            type="password"
+            value={state.apiKey}
+            onChange={(e) => onChange({ ...state, apiKey: e.target.value })}
+            placeholder={
+              keySet
+                ? "(leave blank to keep)"
+                : "(blank = inherit primary when provider matches)"
+            }
+            autoComplete="off"
+          />
+        </div>
+        {needsBaseUrl && (
+          <div className="space-y-1">
+            <Label className="text-xs">Base URL</Label>
+            <Input
+              value={state.baseUrl}
+              onChange={(e) =>
+                onChange({ ...state, baseUrl: e.target.value })
+              }
+              placeholder="https://your-endpoint/v1"
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }

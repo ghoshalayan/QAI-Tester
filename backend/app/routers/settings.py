@@ -52,6 +52,48 @@ def _to_read(row: AppSettings | None) -> AppSettingsRead:
         cheap_cached_input_price_per_m=getattr(
             row, "cheap_cached_input_price_per_m", None,
         ),
+        # ── Migration 0025 — per-tier provider config ────────
+        cheap_provider=getattr(row, "cheap_provider", None) or None,
+        cheap_base_url=getattr(row, "cheap_base_url", None),
+        cheap_api_key_set=bool(getattr(row, "cheap_api_key", "") or ""),
+        fallback_strong_provider=(
+            getattr(row, "fallback_strong_provider", None) or None
+        ),
+        fallback_strong_model=getattr(row, "fallback_strong_model", None),
+        fallback_strong_base_url=getattr(
+            row, "fallback_strong_base_url", None,
+        ),
+        fallback_strong_api_key_set=bool(
+            getattr(row, "fallback_strong_api_key", "") or "",
+        ),
+        fallback_strong_input_price_per_m=getattr(
+            row, "fallback_strong_input_price_per_m", None,
+        ),
+        fallback_strong_output_price_per_m=getattr(
+            row, "fallback_strong_output_price_per_m", None,
+        ),
+        fallback_strong_cached_input_price_per_m=getattr(
+            row, "fallback_strong_cached_input_price_per_m", None,
+        ),
+        fallback_cheap_provider=(
+            getattr(row, "fallback_cheap_provider", None) or None
+        ),
+        fallback_cheap_model=getattr(row, "fallback_cheap_model", None),
+        fallback_cheap_base_url=getattr(
+            row, "fallback_cheap_base_url", None,
+        ),
+        fallback_cheap_api_key_set=bool(
+            getattr(row, "fallback_cheap_api_key", "") or "",
+        ),
+        fallback_cheap_input_price_per_m=getattr(
+            row, "fallback_cheap_input_price_per_m", None,
+        ),
+        fallback_cheap_output_price_per_m=getattr(
+            row, "fallback_cheap_output_price_per_m", None,
+        ),
+        fallback_cheap_cached_input_price_per_m=getattr(
+            row, "fallback_cheap_cached_input_price_per_m", None,
+        ),
         updated_at=row.updated_at,
     )
 
@@ -64,6 +106,9 @@ def _validate_for_create(payload: AppSettingsWrite) -> None:
         raise HTTPException(400, "model is required for initial setup")
     if not payload.api_key:
         raise HTTPException(400, "api_key is required for initial setup")
+    # 'openai_compat' requires an explicit base_url. 'openrouter' is
+    # OpenAI-compatible too but the factory bakes in the default URL,
+    # so the user doesn't have to supply one.
     if payload.provider == "openai_compat" and not payload.base_url:
         raise HTTPException(
             400, "base_url is required when provider is 'openai_compat'",
@@ -276,6 +321,67 @@ def upsert_settings(payload: AppSettingsWrite, db: Session = Depends(get_db)):
             row.cheap_cached_input_price_per_m = (
                 payload.cheap_cached_input_price_per_m or None
             )
+
+        # ── Migration 0025 — per-tier provider config ────────────
+        # Each non-strong tier has independent (provider, model,
+        # api_key, base_url). NULL = preserve; empty string = clear.
+        # Cheap tier (model already handled above as ``cheap_model``).
+        if payload.cheap_provider is not None:
+            row.cheap_provider = payload.cheap_provider or None
+        if payload.cheap_api_key is not None:
+            row.cheap_api_key = payload.cheap_api_key or None
+        if payload.cheap_base_url is not None:
+            row.cheap_base_url = payload.cheap_base_url or None
+        # Fallback strong.
+        if payload.fallback_strong_provider is not None:
+            row.fallback_strong_provider = (
+                payload.fallback_strong_provider or None
+            )
+        if payload.fallback_strong_model is not None:
+            row.fallback_strong_model = (
+                payload.fallback_strong_model or None
+            )
+        if payload.fallback_strong_api_key is not None:
+            row.fallback_strong_api_key = (
+                payload.fallback_strong_api_key or None
+            )
+        if payload.fallback_strong_base_url is not None:
+            row.fallback_strong_base_url = (
+                payload.fallback_strong_base_url or None
+            )
+        for fld in (
+            "fallback_strong_input_price_per_m",
+            "fallback_strong_output_price_per_m",
+            "fallback_strong_cached_input_price_per_m",
+        ):
+            val = getattr(payload, fld, None)
+            if val is not None:
+                setattr(row, fld, val or None)
+        # Fallback cheap.
+        if payload.fallback_cheap_provider is not None:
+            row.fallback_cheap_provider = (
+                payload.fallback_cheap_provider or None
+            )
+        if payload.fallback_cheap_model is not None:
+            row.fallback_cheap_model = (
+                payload.fallback_cheap_model or None
+            )
+        if payload.fallback_cheap_api_key is not None:
+            row.fallback_cheap_api_key = (
+                payload.fallback_cheap_api_key or None
+            )
+        if payload.fallback_cheap_base_url is not None:
+            row.fallback_cheap_base_url = (
+                payload.fallback_cheap_base_url or None
+            )
+        for fld in (
+            "fallback_cheap_input_price_per_m",
+            "fallback_cheap_output_price_per_m",
+            "fallback_cheap_cached_input_price_per_m",
+        ):
+            val = getattr(payload, fld, None)
+            if val is not None:
+                setattr(row, fld, val or None)
 
     db.commit()
     db.refresh(row)

@@ -40,7 +40,11 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
 // ── Types ─────────────────────────────────────────────────────────
 
-export type Provider = "gemini" | "openai" | "openai_compat";
+export type Provider =
+  | "gemini"
+  | "openai"
+  | "openai_compat"
+  | "openrouter";
 
 export interface Settings {
   is_configured: boolean;
@@ -74,6 +78,34 @@ export interface Settings {
    * never under-bills). Set to ~50% of regular input for OpenAI. */
   strong_cached_input_price_per_m: number | null;
   cheap_cached_input_price_per_m: number | null;
+
+  /** Migration 0025 — per-tier provider config. Each non-strong tier
+   * can pick its own (provider, model, api_key, base_url). NULL on
+   * any field falls back to the primary (strong) tier's value when
+   * the providers match — keeps single-provider setups working
+   * without re-entering keys per tier. ``*_api_key`` is never echoed
+   * to the client; the ``*_api_key_set`` flag reflects whether the
+   * tier has a key configured. */
+  cheap_provider: Provider | null;
+  cheap_base_url: string | null;
+  cheap_api_key_set: boolean;
+
+  fallback_strong_provider: Provider | null;
+  fallback_strong_model: string | null;
+  fallback_strong_base_url: string | null;
+  fallback_strong_api_key_set: boolean;
+  fallback_strong_input_price_per_m: number | null;
+  fallback_strong_output_price_per_m: number | null;
+  fallback_strong_cached_input_price_per_m: number | null;
+
+  fallback_cheap_provider: Provider | null;
+  fallback_cheap_model: string | null;
+  fallback_cheap_base_url: string | null;
+  fallback_cheap_api_key_set: boolean;
+  fallback_cheap_input_price_per_m: number | null;
+  fallback_cheap_output_price_per_m: number | null;
+  fallback_cheap_cached_input_price_per_m: number | null;
+
   updated_at: string | null;
 }
 
@@ -93,6 +125,29 @@ export interface SettingsWrite {
   cheap_output_price_per_m?: number;
   strong_cached_input_price_per_m?: number;
   cheap_cached_input_price_per_m?: number;
+
+  /** Migration 0025 — per-tier provider fields. Send empty string ""
+   * to clear a field (disables the tier when applied to ``*_model``);
+   * omit to preserve. */
+  cheap_provider?: Provider;
+  cheap_api_key?: string;
+  cheap_base_url?: string;
+
+  fallback_strong_provider?: Provider;
+  fallback_strong_model?: string;
+  fallback_strong_api_key?: string;
+  fallback_strong_base_url?: string;
+  fallback_strong_input_price_per_m?: number;
+  fallback_strong_output_price_per_m?: number;
+  fallback_strong_cached_input_price_per_m?: number;
+
+  fallback_cheap_provider?: Provider;
+  fallback_cheap_model?: string;
+  fallback_cheap_api_key?: string;
+  fallback_cheap_base_url?: string;
+  fallback_cheap_input_price_per_m?: number;
+  fallback_cheap_output_price_per_m?: number;
+  fallback_cheap_cached_input_price_per_m?: number;
 }
 
 /** One line in the cost breakdown — tier × direction.

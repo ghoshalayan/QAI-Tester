@@ -3397,6 +3397,7 @@ def _dispatch_fill_form(
     submodule_run_id: int | None = None,
     submodule_step_id: int | None = None,
     turn_idx: int | None = None,
+    vision_provider: LLMProvider | None = None,
 ) -> dict[str, Any]:
     """Phase F — dispatch the bundled fill_form routine.
 
@@ -3492,6 +3493,11 @@ def _dispatch_fill_form(
         fields=fields,
         submit_label=submit_label,
         emit_event=_decorated_emit,
+        # Phase U — vision-coord fallback. When the DOM scanner finds
+        # 0 fields (Solar's custom drawer) the routine asks this VL
+        # provider to return pixel coords for each requested label +
+        # the Save button, then types/clicks at those coords.
+        vision_provider=vision_provider,
     )
 
     filled = result.filled_count
@@ -3722,6 +3728,7 @@ def _execute_tool_call(
     submodule_run_id: int | None = None,
     submodule_step_id: int | None = None,
     turn_idx: int | None = None,
+    vision_provider: LLMProvider | None = None,
 ) -> dict[str, Any]:
     """Execute one action tool. Returns a dict with status / narration /
     error / extracted_text. Meta tools never come here.
@@ -3789,6 +3796,9 @@ def _execute_tool_call(
             submodule_run_id=submodule_run_id,
             submodule_step_id=submodule_step_id,
             turn_idx=turn_idx,
+            # Phase U — forward the vision provider so form_fill can
+            # fall back to coord-typing when the DOM scanner misses.
+            vision_provider=vision_provider,
         )
 
     # Wrapped action tools — go through the existing dispatcher.
@@ -6495,6 +6505,18 @@ def run_agent_for_goal(
                 submodule_run_id=submodule_run_id,
                 submodule_step_id=submodule_step_id,
                 turn_idx=turn_idx,
+                # Phase U — pass the cheap provider (or strong if no
+                # cheap configured) for fill_form's vision-coord
+                # fallback. Cheap-tier is fine — locator is a small
+                # structured JSON task, not a complex reasoning one.
+                vision_provider=(
+                    cheap_provider if (
+                        cheap_provider is not None
+                        and getattr(
+                            cheap_provider, "supports_vision", False,
+                        )
+                    ) else provider
+                ),
             )
 
         # Phase J.4 — entity-creation tracking. When fill_form returns
