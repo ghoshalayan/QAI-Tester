@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 AgentKind = Literal[
     "brd_to_frd", "frd_to_tc", "execute", "reporter", "recon",
+    # Phase W' — user-driven recording session. Captures clicks/types
+    # into per-submodule chunks of ``tc_nodes.frozen_path``.
+    "record",
 ]
 AgentStatus = Literal[
     "queued", "running", "paused", "completed", "failed", "cancelled",

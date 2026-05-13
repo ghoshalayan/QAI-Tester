@@ -27,10 +27,11 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -377,7 +378,189 @@ def list_tree(
     return _build_tree(nodes, from_root_id=None)
 
 
+# ── Manual create (Phase W support) ──────────────────────────────
+
+
+class TcNodeCreateRequest(BaseModel):
+    """Minimal payload for adding a node manually.
+
+    Most TcNodes come from the BRD → FRD → TC generation pipeline.
+    This endpoint exists for Phase W (Read mode): the operator wants
+    to record a flow but the plan has no submodules yet. Creates a
+    module + submodule pair (or just the submodule under an
+    existing module).
+    """
+    title: str = Field(..., min_length=1, max_length=512)
+    kind: Literal["module", "submodule"] = "submodule"
+    parent_id: int | None = None
+    description_md: str | None = None
+
+
+@router.post("", response_model=TcNodeTreeRead, status_code=status.HTTP_201_CREATED)
+def create_node(
+    project_id: int,
+    plan_id: int,
+    payload: TcNodeCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """Create a single TcNode under the plan.
+
+    Validation:
+    - ``kind="submodule"`` requires ``parent_id`` pointing at an
+      existing module on this plan. If no modules exist on the plan
+      AND parent_id is null, we auto-create a "Recorded flows"
+      module to host the submodule. This is the fast path for the
+      Read-mode operator.
+    - ``kind="module"`` ignores ``parent_id``; modules are roots.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(400, "title is required")
+
+    if payload.kind == "module":
+        parent = None
+        depth = 0
+        path = title
+    else:
+        parent: TcNode | None = None
+        if payload.parent_id is not None:
+            parent = db.execute(
+                select(TcNode).where(
+                    TcNode.id == payload.parent_id,
+                    TcNode.plan_id == plan.id,
+                    TcNode.kind == "module",
+                ),
+            ).scalar_one_or_none()
+            if parent is None:
+                raise HTTPException(
+                    404,
+                    f"parent module {payload.parent_id} not found on "
+                    f"plan {plan_id}",
+                )
+        else:
+            # Auto-create-or-find a "Recorded flows" module so the
+            # operator doesn't have to make a module first when all
+                # they want is a place to attach one recording.
+            parent = db.execute(
+                select(TcNode).where(
+                    TcNode.plan_id == plan.id,
+                    TcNode.kind == "module",
+                    TcNode.title == "Recorded flows",
+                ),
+            ).scalar_one_or_none()
+            if parent is None:
+                parent_ordinal = db.execute(
+                    select(func.coalesce(func.max(TcNode.ordinal), -1) + 1)
+                    .where(
+                        TcNode.plan_id == plan.id,
+                        TcNode.kind == "module",
+                    ),
+                ).scalar_one()
+                parent = TcNode(
+                    project_id=project_id,
+                    plan_id=plan.id,
+                    parent_id=None,
+                    kind="module",
+                    ordinal=int(parent_ordinal or 0),
+                    depth=0,
+                    path_cached="Recorded flows",
+                    title="Recorded flows",
+                    description_md=(
+                        "Auto-created to host manually-added "
+                        "submodules used for Read-mode recordings."
+                    ),
+                )
+                db.add(parent)
+                db.flush()
+        depth = 1
+        path = f"{parent.path_cached or parent.title} > {title}"
+
+    # Pick the next ordinal under this parent.
+    sibling_ord = db.execute(
+        select(func.coalesce(func.max(TcNode.ordinal), -1) + 1)
+        .where(
+            TcNode.plan_id == plan.id,
+            TcNode.parent_id == (parent.id if parent else None),
+        ),
+    ).scalar_one()
+
+    node = TcNode(
+        project_id=project_id,
+        plan_id=plan.id,
+        parent_id=parent.id if parent else None,
+        kind=payload.kind,
+        ordinal=int(sibling_ord or 0),
+        depth=depth,
+        path_cached=path,
+        title=title,
+        description_md=(payload.description_md or "").strip() or None,
+        selectable_default=True,
+        status="draft",
+        source_requirement_ids=[],
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+
+    # Return the new node as a tree-read with empty children. The
+    # frontend's list-tree call will pick up the new node on next
+    # invalidate.
+    return TcNodeTreeRead(
+        **TcNodeRead.model_validate(node).model_dump(),
+        children=[],
+    )
+
+
 # ── Parametric routes ────────────────────────────────────────────
+
+
+@router.get("/{node_id}/recording")
+def get_node_recording(
+    project_id: int,
+    plan_id: int,
+    node_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase Y.4 — return the user-actions recording (if any) saved
+    on this submodule's ``frozen_path``. Returns ``{has_recording:
+    false}`` when nothing is saved.
+
+    Lets the operator browse what was captured without exporting the
+    whole tree. Frontend uses this for the "View captured actions"
+    panel.
+    """
+    plan = _require_plan(db, project_id, plan_id)
+    node = db.execute(
+        select(TcNode).where(
+            TcNode.id == node_id,
+            TcNode.plan_id == plan.id,
+        ),
+    ).scalar_one_or_none()
+    if node is None:
+        raise HTTPException(404, f"node {node_id} not found")
+
+    fp = node.frozen_path if isinstance(node.frozen_path, dict) else None
+    if not fp or fp.get("recording_kind") != "user_actions":
+        return {
+            "node_id": node_id,
+            "kind": node.kind,
+            "title": node.title,
+            "has_recording": False,
+        }
+    actions = fp.get("actions") or []
+    return {
+        "node_id": node_id,
+        "kind": node.kind,
+        "title": node.title,
+        "has_recording": True,
+        "schema_version": fp.get("schema_version"),
+        "recorded_at": fp.get("recorded_at"),
+        "target_url": fp.get("target_url"),
+        "viewport": fp.get("viewport"),
+        "action_count": len(actions),
+        "actions": actions,
+    }
 
 
 @router.get("/{node_id}", response_model=TcNodeTreeRead)

@@ -59,6 +59,10 @@ def request_cancel(run_id: int) -> None:
     Wakes both the pause-waiter and any pending intervention-waiters so
     a single cancel drains every blocking primitive at once. Otherwise
     a step blocked on HITL would hold the run for the indefinite wait.
+
+    Phase W — also wakes the recording stop event so a cancelled
+    recording session closes its browser instead of hanging on the
+    operator's "Stop" button.
     """
     with _cancel_lock:
         _cancelled_runs.add(run_id)
@@ -70,6 +74,12 @@ def request_cancel(run_id: int) -> None:
         ev.set()
     # Wake every intervention waiter for this run.
     _drop_interventions(run_id)
+    # Wake any active recording session waiter.
+    try:
+        from app.services.submodule_recording import signal_stop  # noqa: PLC0415
+        signal_stop(run_id)
+    except Exception:
+        pass
 
 
 def _is_cancelled(run_id: int) -> bool:
@@ -731,6 +741,214 @@ def execute_frd_to_tc(run_id: int) -> None:
         _drop_cancel(run_id)
         _drop_pause(run_id)
         _drop_interventions(run_id)
+        db.close()
+
+
+def execute_recording(run_id: int) -> None:
+    """Phase W — background-task entry for a ``record`` agent run.
+
+    Opens a headed Playwright browser (start-maximized so the bottom
+    of the page isn't hidden by the Windows taskbar), injects the
+    capture JS, navigates to the plan's ``target_url``, and BLOCKS
+    until a stop-signal arrives (operator clicks Stop on the live
+    presenter). On stop, flushes the in-memory event buffer to the
+    submodule's ``frozen_path``.
+
+    Cancellation: the standard ``request_cancel`` / ``force_cancel``
+    paths work — cancel sets the stop event AND marks the run row.
+    """
+    from app.executor.browser import (  # noqa: PLC0415
+        browser_session, BrowserNotInstalledError,
+    )
+    from app.executor.recording_capture import (  # noqa: PLC0415
+        build_capture_init_script,
+    )
+    from app.models.tc_node import TcNode  # noqa: PLC0415
+    from app.models.test_plan import TestPlan  # noqa: PLC0415
+    from app.services.submodule_recording import (  # noqa: PLC0415
+        discard_buffer, finalize_to_submodule, init_buffer,
+        register_stop_event,
+    )
+    from app.config import settings as _app_settings  # noqa: PLC0415
+
+    db = SessionLocal()
+    try:
+        run = db.get(AgentRun, run_id)
+        if not run:
+            logger.warning("execute_recording: run %s not found", run_id)
+            return
+        if run.kind != "record":
+            logger.error(
+                "execute_recording called for run %s with kind=%r",
+                run.id, run.kind,
+            )
+            return
+        if run.status != "queued":
+            logger.warning(
+                "execute_recording: run %s in status %r, not queued",
+                run.id, run.status,
+            )
+            return
+        if _is_cancelled(run.id):
+            _mark_cancelled(db, run, "Cancelled before recording started")
+            return
+
+        run.status = "running"
+        run.started_at = _utcnow()
+        db.commit()
+
+        _emit_run_event(run, "started", {
+            "input": run.input_json,
+            "started_at": run.started_at.isoformat() if run.started_at else None,
+        })
+
+        input_data = run.input_json or {}
+        plan_id = input_data.get("plan_id")
+        module_id = input_data.get("module_id")
+        if not isinstance(plan_id, int) or plan_id <= 0:
+            _mark_failed(db, run, "input.plan_id must be a positive integer")
+            return
+        if not isinstance(module_id, int) or module_id <= 0:
+            _mark_failed(
+                db, run,
+                "input.module_id must be a positive integer "
+                "(recordings cover one module; submodule attribution "
+                "happens live)",
+            )
+            return
+
+        plan = db.get(TestPlan, plan_id)
+        if plan is None:
+            _mark_failed(db, run, f"plan {plan_id} not found")
+            return
+        target_url = (plan.target_url or "").strip()
+        if not target_url:
+            _mark_failed(
+                db, run,
+                "plan has no target_url; recording needs a URL to navigate to",
+            )
+            return
+
+        module = db.get(TcNode, module_id)
+        if (
+            module is None
+            or module.plan_id != plan.id
+            or module.kind != "module"
+        ):
+            _mark_failed(
+                db, run,
+                f"module {module_id} not found on plan {plan_id}",
+            )
+            return
+
+        # Initialise in-memory buffer + stop event BEFORE the JS
+        # starts POSTing. Order matters — the JS injection runs as
+        # part of the navigate, and the first /events POST can fire
+        # within ~200ms.
+        init_buffer(
+            run.id,
+            module_id=module.id,
+            target_url=target_url,
+        )
+        stop_event = register_stop_event(run.id)
+
+        # Backend origin for the JS to POST events to. Falls back to
+        # localhost:<settings.api_port> in dev. If a reverse proxy is
+        # in front, the operator must configure this in settings.
+        backend_origin = getattr(
+            _app_settings, "backend_origin_for_browser",
+            "http://localhost:8000",
+        )
+        init_script = build_capture_init_script(run.id, backend_origin)
+
+        try:
+            with browser_session(
+                headless=False,
+                speed="slow",
+                maximize=True,
+            ) as page:
+                # Inject the capture BEFORE navigating so the first
+                # page load is recorded too.
+                try:
+                    page.context.add_init_script(init_script)
+                except Exception as e:
+                    logger.warning(
+                        "recording: add_init_script failed: %s", e,
+                    )
+
+                try:
+                    page.goto(target_url, timeout=45_000)
+                except Exception as e:
+                    logger.warning(
+                        "recording: initial goto failed: %s", e,
+                    )
+
+                _emit_run_event(run, "recording_ready", {
+                    "run_id": run.id,
+                    "module_id": module.id,
+                    "module_title": module.title or "",
+                    "target_url": target_url,
+                })
+
+                # Block until Stop is signalled OR cancel fires.
+                # Poll every 500ms so the operator's Stop click
+                # propagates quickly.
+                while True:
+                    if stop_event.wait(0.5):
+                        break
+                    if _is_cancelled(run.id):
+                        break
+
+                # Capture the viewport for replay sanity check.
+                try:
+                    vp = page.viewport_size
+                    if vp:
+                        from app.services.submodule_recording import (  # noqa: PLC0415
+                            _buffer_meta, _buffer_lock,
+                        )
+                        with _buffer_lock:
+                            meta = _buffer_meta.get(run.id)
+                            if meta:
+                                meta["viewport"] = {
+                                    "width": int(vp.get("width") or 1920),
+                                    "height": int(vp.get("height") or 1040),
+                                }
+                except Exception:
+                    pass
+        except BrowserNotInstalledError as e:
+            _mark_failed(db, run, str(e))
+            discard_buffer(run.id)
+            return
+        except Exception as e:
+            logger.exception("recording browser session failed")
+            _mark_failed(db, run, f"{type(e).__name__}: {e}")
+            discard_buffer(run.id)
+            return
+
+        # If cancelled, drop the buffer instead of persisting.
+        if _is_cancelled(run.id):
+            discard_buffer(run.id)
+            _mark_cancelled(db, run, "Recording cancelled by user")
+            return
+
+        # Otherwise persist what we captured. Phase W' — the
+        # finalize call now iterates every populated submodule
+        # chunk and writes each to its respective frozen_path.
+        summary = finalize_to_submodule(db, run_id=run.id)
+        run.status = "completed"
+        run.completed_at = _utcnow()
+        run.output_summary_json = {
+            "kind": "record",
+            "module_id": module.id,
+            "event_count": summary.get("event_count", 0),
+            "saved": summary.get("saved", False),
+            "submodules": summary.get("submodules", []),
+            "reason": summary.get("reason", ""),
+        }
+        db.commit()
+        _emit_run_event(run, "recording_saved", summary)
+    finally:
+        _drop_cancel(run_id)
         db.close()
 
 

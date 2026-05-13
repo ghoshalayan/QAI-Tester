@@ -655,7 +655,10 @@ export type AgentKind =
   | "frd_to_tc"
   | "execute"
   | "reporter"
-  | "recon";
+  | "recon"
+  // Phase W — user-driven recording session. Captures clicks/types
+  // into the submodule's frozen_path for deterministic replay.
+  | "record";
 export type AgentStatus =
   | "queued"
   | "running"
@@ -1689,6 +1692,65 @@ export const api = {
       `/api/projects/${projectId}/agent-runs/${runId}`,
       { method: "DELETE" },
     ),
+  /** Phase W' — start a per-MODULE recording session. The browser
+   * opens maximized; submodule attribution happens live on the
+   * presenter via setActiveSubmodule. Returns AgentRunRead so the
+   * /live/<project>/<run.id> popup plumbing carries. */
+  startRecording: (
+    projectId: number,
+    payload: { plan_id: number; module_id: number },
+  ) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/start-recording`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  /** Phase W' — set which submodule subsequent captured events
+   * attribute to. Called when the operator clicks "Start chunk"
+   * on the live presenter after picking a submodule. */
+  setActiveSubmodule: (
+    projectId: number,
+    runId: number,
+    submoduleId: number,
+  ) =>
+    apiFetch<{
+      run_id: number;
+      active_submodule_id: number;
+      per_submodule_counts: Record<string, number>;
+    }>(
+      `/api/projects/${projectId}/agent-runs/${runId}/active-submodule`,
+      { method: "POST", body: JSON.stringify({ submodule_id: submoduleId }) },
+    ),
+  /** Phase W' — snapshot of the recording's per-submodule counts +
+   * currently-active submodule. Safe to poll every 2-3s. */
+  getRecordingState: (projectId: number, runId: number) =>
+    apiFetch<{
+      run_id: number;
+      module_id: number;
+      status: string;
+      exists: boolean;
+      active_submodule_id: number | null;
+      per_submodule_counts: Record<string, number>;
+    }>(
+      `/api/projects/${projectId}/agent-runs/${runId}/recording-state`,
+    ),
+  /** Phase W — signal end of recording. The browser closes and the
+   * captured events get persisted to the submodule's frozen_path. */
+  stopRecording: (projectId: number, runId: number) =>
+    apiFetch<{
+      run_id: number;
+      stop_delivered: boolean;
+      buffered_events: number;
+      note: string;
+    }>(
+      `/api/projects/${projectId}/agent-runs/${runId}/stop-recording`,
+      { method: "POST" },
+    ),
+  /** Phase W — discard an in-progress recording without persisting. */
+  discardRecording: (projectId: number, runId: number) =>
+    apiFetch<{ run_id: number; cancelled: boolean }>(
+      `/api/projects/${projectId}/agent-runs/${runId}/recording`,
+      { method: "DELETE" },
+    ),
   pauseAgentRun: (projectId: number, runId: number) =>
     apiFetch<AgentRunRead>(
       `/api/projects/${projectId}/agent-runs/${runId}/pause`,
@@ -1797,6 +1859,69 @@ export const api = {
   listTcNodes: (projectId: number, planId: number) =>
     apiFetch<TcNodeTreeRead[]>(
       `/api/projects/${projectId}/plans/${planId}/tc-nodes`,
+    ),
+  /** Manually create a single TcNode under a plan. Most TC trees
+   * come from the BRD→FRD→TC generation pipeline; this exists for
+   * Read mode — quickly add a submodule to attach a recording to.
+   * When ``parent_id`` is omitted on a submodule, the backend
+   * auto-creates a "Recorded flows" module to host it. */
+  createTcNode: (
+    projectId: number,
+    planId: number,
+    payload: {
+      title: string;
+      kind?: "module" | "submodule";
+      parent_id?: number | null;
+      description_md?: string;
+    },
+  ) =>
+    apiFetch<TcNodeTreeRead>(
+      `/api/projects/${projectId}/plans/${planId}/tc-nodes`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  /** Phase Y.4 — fetch the user-actions recording saved on a
+   * submodule's frozen_path. Returns ``{has_recording: false}``
+   * when nothing is saved on this node. */
+  getNodeRecording: (
+    projectId: number,
+    planId: number,
+    nodeId: number,
+  ) =>
+    apiFetch<{
+      node_id: number;
+      kind: string;
+      title: string;
+      has_recording: boolean;
+      schema_version?: number;
+      recorded_at?: string;
+      target_url?: string;
+      viewport?: { width: number; height: number };
+      action_count?: number;
+      actions?: Array<{
+        kind: string;
+        t?: number;
+        x?: number;
+        y?: number;
+        button?: number;
+        key?: string;
+        value?: string;
+        url?: string;
+        target?: {
+          tag?: string;
+          role?: string;
+          text?: string;
+          id?: string;
+          name?: string;
+          type?: string;
+          placeholder?: string;
+          aria_label?: string;
+          title?: string;
+          selector?: string;
+          rect?: { x: number; y: number; w: number; h: number } | null;
+        };
+      }>;
+    }>(
+      `/api/projects/${projectId}/plans/${planId}/tc-nodes/${nodeId}/recording`,
     ),
   getTcNode: (projectId: number, planId: number, nodeId: number) =>
     apiFetch<TcNodeTreeRead>(

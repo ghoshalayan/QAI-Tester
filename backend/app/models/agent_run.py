@@ -143,7 +143,7 @@ class AgentRun(Base):
     __table_args__ = (
         CheckConstraint(
             "kind IN ('brd_to_frd', 'frd_to_tc', 'execute', "
-            "'reporter', 'recon')",
+            "'reporter', 'recon', 'record')",
             name="agent_run_kind_valid",
         ),
         CheckConstraint(

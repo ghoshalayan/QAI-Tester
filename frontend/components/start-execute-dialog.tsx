@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bot,
+  Circle,
   Eye,
   EyeOff,
   Gauge,
@@ -59,6 +60,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
@@ -85,8 +87,14 @@ export function StartExecuteDialog({
   // Phase M — default to agentic + vision_only. The "Start" button
   // works with just a plan picked; everything else lives behind an
   // Advanced disclosure (closed by default) for power-user overrides.
-  const [mode, setMode] = useState<"scripted" | "agentic" | "replay">(
-    "agentic",
+  const [mode, setMode] = useState<
+    "scripted" | "agentic" | "replay" | "record"
+  >("agentic");
+  // Phase W' — when mode = "record", the operator picks which MODULE
+  // to record into. Submodule attribution happens live on the
+  // presenter (via Start-chunk button + searchable submodule combobox).
+  const [recordModuleId, setRecordModuleId] = useState<number | null>(
+    null,
   );
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // Phase 6 — within agentic mode, choose hybrid (DOM-first ladder)
@@ -118,6 +126,7 @@ export function StartExecuteDialog({
       setAgentStrategy("vision_only");
       setPreflight("auto");
       setAdvancedOpen(false);
+      setRecordModuleId(null);
     }
   }, [open, defaultPlanId]);
 
@@ -150,11 +159,25 @@ export function StartExecuteDialog({
       // launch flags entirely.
       const layout = computeWindowLayout(headless);
       const browserGeom = layout?.browser;
+      // Phase W' — record-mode branch: hits the start-recording
+      // endpoint with a MODULE id. Submodule attribution happens
+      // live on the presenter after the browser opens.
+      if (mode === "record") {
+        if (recordModuleId == null) {
+          throw new Error("Pick a module to record into first.");
+        }
+        return api.startRecording(projectId, {
+          plan_id: planId!,
+          module_id: recordModuleId,
+        });
+      }
       return api.startExecute(projectId, {
         plan_id: planId!,
         headless,
         speed,
-        mode,
+        // The backend's execute pipeline only knows
+        // scripted/agentic/replay; "record" never reaches here.
+        mode: mode as "scripted" | "agentic" | "replay",
         agent_strategy: agentStrategy,
         preflight,
         auto_adjust: autoAdjust,
@@ -225,7 +248,9 @@ export function StartExecuteDialog({
     planId !== null &&
     !!selectedPlan &&
     !!selectedPlan.target_url &&
-    !startMutation.isPending;
+    !startMutation.isPending &&
+    // Phase W' — record mode also requires a target module.
+    (mode !== "record" || recordModuleId !== null);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -301,6 +326,15 @@ export function StartExecuteDialog({
               </summary>
               <div className="space-y-4 border-t p-3">
                 <ModePicker value={mode} onChange={setMode} />
+
+                {mode === "record" && planId !== null && (
+                  <RecordModulePicker
+                    projectId={projectId}
+                    planId={planId}
+                    value={recordModuleId}
+                    onChange={setRecordModuleId}
+                  />
+                )}
 
                 {mode === "agentic" && (
                   <AgentStrategyPicker
@@ -607,6 +641,148 @@ function AgentStrategyPicker({
 }
 
 
+// Phase W — pick which submodule the recording attaches to.
+// Lists all module → submodule rows under the plan so the operator
+// sees the test-case hierarchy. Disabled rows = no module yet
+// (recordings can't attach to a module-level node).
+function RecordModulePicker({
+  projectId,
+  planId,
+  value,
+  onChange,
+}: {
+  projectId: number;
+  planId: number;
+  value: number | null;
+  onChange: (next: number | null) => void;
+}) {
+  const qc = useQueryClient();
+  const { data: nodes, isLoading } = useQuery({
+    queryKey: ["tc-nodes", projectId, planId],
+    queryFn: () => api.listTcNodes(projectId, planId),
+  });
+  // Top-level entries returned by listTcNodes are modules.
+  const modules = (nodes ?? []).filter((n) => n.kind === "module");
+
+  const [newTitle, setNewTitle] = useState("");
+  const [showInline, setShowInline] = useState(false);
+
+  const addMut = useMutation({
+    mutationFn: () =>
+      api.createTcNode(projectId, planId, {
+        title: newTitle.trim(),
+        kind: "module",
+      }),
+    onSuccess: (created) => {
+      qc.invalidateQueries({ queryKey: ["tc-nodes", projectId, planId] });
+      toast.success("Module added", {
+        description: `"${created.title}" ready to record into.`,
+      });
+      onChange(created.id);
+      setNewTitle("");
+      setShowInline(false);
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Could not add module", { description: msg });
+    },
+  });
+
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">
+        Read into module
+      </label>
+      {isLoading ? (
+        <Skeleton className="h-9 w-full" />
+      ) : modules.length === 0 && !showInline ? (
+        <div className="space-y-2">
+          <p className="text-xs text-amber-600">
+            This plan has no modules yet.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setShowInline(true)}
+          >
+            + Add a module
+          </Button>
+          <p className="text-[10px] text-muted-foreground">
+            Or generate the full Module → Submodule → Step tree via{" "}
+            <strong>Test Cases tab → Generate test cases</strong> (uses
+            your BRD / FRD).
+          </p>
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <select
+            value={value ?? ""}
+            onChange={(e) =>
+              onChange(e.target.value ? Number(e.target.value) : null)
+            }
+            className="h-9 flex-1 rounded-md border border-input bg-background px-2 text-sm"
+          >
+            <option value="">— pick a module —</option>
+            {modules.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.title || `Module #${m.id}`}
+                {m.children?.length
+                  ? ` · ${m.children.length} submodule${
+                      m.children.length === 1 ? "" : "s"
+                    }`
+                  : ""}
+              </option>
+            ))}
+          </select>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setShowInline((v) => !v)}
+            title="Add a new module"
+          >
+            {showInline ? "Cancel" : "+ New"}
+          </Button>
+        </div>
+      )}
+      {showInline && (
+        <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
+          <Input
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            placeholder="e.g. Administration"
+            className="h-8 flex-1 text-sm"
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newTitle.trim()) addMut.mutate();
+            }}
+          />
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => addMut.mutate()}
+            disabled={!newTitle.trim() || addMut.isPending}
+          >
+            {addMut.isPending ? "Adding…" : "Add"}
+          </Button>
+        </div>
+      )}
+      <p className="text-[11px] text-muted-foreground">
+        The browser opens maximized so the bottom of the page isn't
+        hidden by the taskbar. On the live presenter you'll pick a{" "}
+        <strong>submodule</strong> from a searchable list and click{" "}
+        <strong>Start chunk</strong>. Every click/type from that
+        moment attributes to that submodule. Switch submodules any
+        time. Click <strong>Stop reading</strong> when the whole
+        module is recorded — every populated submodule chunk
+        persists separately and replays automatically.
+      </p>
+    </div>
+  );
+}
+
+
 function PreflightPicker({
   value,
   onChange,
@@ -676,13 +852,15 @@ function ModePicker({
   value,
   onChange,
 }: {
-  value: "scripted" | "agentic" | "replay";
-  onChange: (next: "scripted" | "agentic" | "replay") => void;
+  value: "scripted" | "agentic" | "replay" | "record";
+  onChange: (
+    next: "scripted" | "agentic" | "replay" | "record",
+  ) => void;
 }) {
   return (
     <div className="space-y-2">
       <label className="text-sm font-medium">Run mode</label>
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-4 gap-2">
         <button
           type="button"
           onClick={() => onChange("scripted")}
@@ -700,6 +878,26 @@ function ModePicker({
           </span>
           <span className="text-[11px] text-muted-foreground">
             Rigid walker. AI patches only on failure. Cheapest.
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange("record")}
+          aria-pressed={value === "record"}
+          className={cn(
+            "flex flex-col items-start gap-1 rounded-md border p-3 text-left transition-colors",
+            value === "record"
+              ? "border-primary/50 bg-primary/10 text-primary"
+              : "hover:border-input hover:bg-muted/50",
+          )}
+        >
+          <span className="flex items-center gap-1.5 text-sm font-medium">
+            <Circle className="size-4 fill-rose-500 text-rose-500" />
+            Read
+          </span>
+          <span className="text-[11px] text-muted-foreground">
+            Open a browser, click/type yourself. Saved per
+            submodule; future agentic runs replay it.
           </span>
         </button>
         <button

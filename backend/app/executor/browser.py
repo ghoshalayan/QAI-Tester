@@ -92,6 +92,7 @@ def browser_session(
     default_timeout_ms: int = DEFAULT_TIMEOUT_MS,
     window_position: tuple[int, int] | None = DEFAULT_WINDOW_POSITION,
     window_size: tuple[int, int] | None = DEFAULT_WINDOW_SIZE,
+    maximize: bool = False,
 ) -> Iterator[Page]:
     """Yield a ready-to-drive Playwright Page; clean up on exit.
 
@@ -133,14 +134,24 @@ def browser_session(
         # the right. Headless launches ignore these flags entirely, so it's
         # safe to always pass them.
         launch_args: list[str] = []
-        if window_position is not None:
-            launch_args.append(
-                f"--window-position={window_position[0]},{window_position[1]}",
-            )
-        if window_size is not None:
-            launch_args.append(
-                f"--window-size={window_size[0]},{window_size[1]}",
-            )
+        if maximize:
+            # W.8 — recording mode: use --start-maximized which makes
+            # Chromium respect the Windows work area (i.e. the screen
+            # MINUS the taskbar). With explicit window-size + position
+            # the bottom of the browser drifts under the taskbar
+            # because Chromium ignores the work-area constraints on
+            # those flags. Drop the explicit position/size when
+            # maximizing — they conflict.
+            launch_args.append("--start-maximized")
+        else:
+            if window_position is not None:
+                launch_args.append(
+                    f"--window-position={window_position[0]},{window_position[1]}",
+                )
+            if window_size is not None:
+                launch_args.append(
+                    f"--window-size={window_size[0]},{window_size[1]}",
+                )
 
         try:
             browser = pw.chromium.launch(
@@ -161,10 +172,23 @@ def browser_session(
                 ) from e
             raise
 
-        context = browser.new_context(
-            viewport={"width": viewport_width, "height": viewport_height},
-            locale=locale,
-        )
+        # When --start-maximized, drop the fixed viewport so the page
+        # actually USES the full maximized area instead of letterboxing
+        # into the default 1280x720. Playwright's ``no_viewport=True``
+        # makes the page size track the OS window.
+        if maximize:
+            context = browser.new_context(
+                no_viewport=True,
+                locale=locale,
+            )
+        else:
+            context = browser.new_context(
+                viewport={
+                    "width": viewport_width,
+                    "height": viewport_height,
+                },
+                locale=locale,
+            )
         context.set_default_timeout(default_timeout_ms)
 
         page = context.new_page()

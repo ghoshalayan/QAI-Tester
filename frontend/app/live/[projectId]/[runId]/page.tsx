@@ -143,6 +143,27 @@ export default function LivePresenterPage() {
       toast.error("Force-stop failed", { description: msg });
     },
   });
+  // Phase W — stop a reading session. Triggers the backend's
+  // stop event so the browser closes and the captured actions
+  // get persisted to the submodule's frozen_path.
+  const stopRecordingMut = useMutation({
+    mutationFn: () => api.stopRecording(projectId, runId),
+    onSuccess: (resp) => {
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId, runId] });
+      toast.success("Reading stopped", {
+        description: `${resp.buffered_events} action${
+          resp.buffered_events === 1 ? "" : "s"
+        } captured — saving to the submodule.`,
+      });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Stop failed", { description: msg });
+    },
+  });
+  const isRecording =
+    run?.kind === "record" &&
+    (run?.status === "running" || run?.status === "queued");
 
   // Page title reflects status so the user can spot completion in the
   // taskbar/dock without focusing the popup.
@@ -165,28 +186,46 @@ export default function LivePresenterPage() {
         progress={progress?.message}
       />
 
-      <Controls
-        isPaused={isPaused}
-        isRunning={isRunning}
-        isTerminal={isTerminal}
-        pausePending={pauseMut.isPending}
-        resumePending={resumeMut.isPending}
-        cancelPending={cancelMut.isPending}
-        forceCancelPending={forceCancelMut.isPending}
-        onPause={() => pauseMut.mutate()}
-        onResume={() => resumeMut.mutate()}
-        onCancel={() => cancelMut.mutate()}
-        onForceCancel={() => {
-          if (
-            window.confirm(
-              "Force-stop will mark this run cancelled in the DB immediately. " +
-                "The worker thread may keep running for a few seconds. Continue?",
-            )
-          ) {
-            forceCancelMut.mutate();
-          }
-        }}
-      />
+      {isRecording && (
+        <RecordingControls
+          projectId={projectId}
+          runId={runId}
+          stopping={stopRecordingMut.isPending}
+          onStop={() => stopRecordingMut.mutate()}
+        />
+      )}
+
+      {/* Phase Y.2 — Pause/Stop/Force-stop bar is hidden for
+          record-kind runs; the RecordingControls bar above already
+          provides Start chunk / Stop reading. Two bars side-by-
+          side were confusing the operator (the lower Stop only
+          cancels the runner thread; the upper Stop reading saves
+          the buffer). For record runs the RecordingControls'
+          Stop reading IS the only correct way to end. */}
+      {!isRecording && (
+        <Controls
+          isPaused={isPaused}
+          isRunning={isRunning}
+          isTerminal={isTerminal}
+          pausePending={pauseMut.isPending}
+          resumePending={resumeMut.isPending}
+          cancelPending={cancelMut.isPending}
+          forceCancelPending={forceCancelMut.isPending}
+          onPause={() => pauseMut.mutate()}
+          onResume={() => resumeMut.mutate()}
+          onCancel={() => cancelMut.mutate()}
+          onForceCancel={() => {
+            if (
+              window.confirm(
+                "Force-stop will mark this run cancelled in the DB immediately. " +
+                  "The worker thread may keep running for a few seconds. Continue?",
+              )
+            ) {
+              forceCancelMut.mutate();
+            }
+          }}
+        />
+      )}
 
       {intervention && (
         <InterventionBanner
@@ -368,6 +407,313 @@ function Controls({
  * On mount we also fetch ``GET /intervention/open`` so a popup
  * reload picks up an in-flight prompt.
  */
+/**
+ * Phase W' — recording controls bar.
+ *
+ * Lives at the top of the live presenter while a kind="record" run
+ * is active. Provides:
+ *   - searchable submodule combobox (filter the active module's
+ *     children by typing)
+ *   - "+ Add new submodule" inline creator
+ *   - "Start chunk" button — commits the currently-selected submodule
+ *     as the active capture target; subsequent events attribute to it
+ *   - "Stop reading" button — ends the session, persists per-submodule
+ *     chunks to their respective frozen_paths
+ *
+ * Styled to match the existing Pause/Stop Controls bar (same flex
+ * layout, same button variants).
+ */
+function RecordingControls({
+  projectId,
+  runId,
+  stopping,
+  onStop,
+}: {
+  projectId: number;
+  runId: number;
+  stopping: boolean;
+  onStop: () => void;
+}) {
+  const qc = useQueryClient();
+
+  // Poll the buffer state every 2s so the operator sees the active
+  // submodule + per-chunk counters update as events stream in.
+  const { data: state } = useQuery({
+    queryKey: ["recording-state", projectId, runId],
+    queryFn: () => api.getRecordingState(projectId, runId),
+    refetchInterval: 2000,
+  });
+  const moduleId = state?.module_id ?? 0;
+  const activeSubmoduleId = state?.active_submodule_id ?? null;
+  const perSubmoduleCounts = state?.per_submodule_counts ?? {};
+
+  // Fetch the module's submodules (children) so we can filter +
+  // pick from them. Reuses listTcNodes; we filter client-side.
+  const { data: nodes } = useQuery({
+    queryKey: ["recording-module-children", projectId, runId, moduleId],
+    queryFn: async () => {
+      const planId = (await api.getAgentRun(projectId, runId)).input_json
+        ?.plan_id as number | undefined;
+      if (!planId) return [];
+      return api.listTcNodes(projectId, planId);
+    },
+    enabled: moduleId > 0,
+  });
+  const submodules = (nodes ?? [])
+    .filter((n) => n.id === moduleId)
+    .flatMap((m) => m.children ?? [])
+    .filter((c) => c.kind === "submodule");
+
+  const [query, setQuery] = useState("");
+  const [pickedId, setPickedId] = useState<number | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+
+  // Keep pickedId in sync with activeSubmoduleId on first load.
+  useEffect(() => {
+    if (pickedId === null && activeSubmoduleId !== null) {
+      setPickedId(activeSubmoduleId);
+    }
+  }, [activeSubmoduleId, pickedId]);
+
+  const filtered = submodules.filter((sm) =>
+    (sm.title || "").toLowerCase().includes(query.trim().toLowerCase()),
+  );
+
+  const startChunkMut = useMutation({
+    mutationFn: (submoduleId: number) =>
+      api.setActiveSubmodule(projectId, runId, submoduleId),
+    onSuccess: (resp) => {
+      qc.invalidateQueries({
+        queryKey: ["recording-state", projectId, runId],
+      });
+      const sm = submodules.find((s) => s.id === resp.active_submodule_id);
+      toast.success("Recording into " + (sm?.title ?? `#${resp.active_submodule_id}`));
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Could not switch chunk", { description: msg });
+    },
+  });
+
+  const findPlanIdFromState = () => {
+    // The state endpoint doesn't return plan_id, but we can read it
+    // from the agent-run query cache populated by the parent.
+    const cached = qc.getQueryData<{ input_json?: { plan_id?: number } }>([
+      "agent-run",
+      projectId,
+      runId,
+    ]);
+    return cached?.input_json?.plan_id ?? null;
+  };
+
+  const addSubmoduleMut = useMutation({
+    mutationFn: async () => {
+      const planId = findPlanIdFromState();
+      if (!planId) throw new Error("plan id unavailable");
+      return api.createTcNode(projectId, planId, {
+        title: newTitle.trim(),
+        kind: "submodule",
+        parent_id: moduleId,
+      });
+    },
+    onSuccess: (created) => {
+      qc.invalidateQueries({
+        queryKey: ["recording-module-children", projectId, runId, moduleId],
+      });
+      qc.invalidateQueries({ queryKey: ["tc-nodes", projectId] });
+      toast.success("Submodule added", {
+        description: `"${created.title}" — pick + Start chunk to record into it.`,
+      });
+      setPickedId(created.id);
+      setQuery("");
+      setNewTitle("");
+      setShowAdd(false);
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Could not add submodule", { description: msg });
+    },
+  });
+
+  const totalChunked = Object.values(perSubmoduleCounts).reduce(
+    (a, b) => a + b, 0,
+  );
+
+  // Phase Y.4 — quick way to inspect recorded actions on a
+  // submodule. Opens a console.log with the full payload + a toast
+  // summary; clicking the same button after the recording ends
+  // surfaces the saved actions immediately for verification.
+  const inspectMut = useMutation({
+    mutationFn: async (submoduleId: number) => {
+      const planId = findPlanIdFromState();
+      if (!planId) throw new Error("plan id unavailable");
+      return api.getNodeRecording(projectId, planId, submoduleId);
+    },
+    onSuccess: (data) => {
+      if (!data.has_recording) {
+        toast.message(`No saved actions yet for "${data.title}"`, {
+          description: "Buffer is in-memory until you click Stop reading.",
+        });
+        return;
+      }
+      // Log for full inspection; toast gives a summary.
+      // eslint-disable-next-line no-console
+      console.log("[recording]", data.title, data);
+      toast.success(`${data.title} — ${data.action_count} actions`, {
+        description: "Full payload printed to the browser console.",
+      });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Could not load recording", { description: msg });
+    },
+  });
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b bg-rose-50 px-3 py-2 text-sm dark:bg-rose-950/30">
+      <div className="flex items-center gap-2">
+        <span className="relative flex size-3">
+          <span
+            className={cn(
+              "absolute inset-0 rounded-full bg-rose-400 opacity-75",
+              activeSubmoduleId !== null && "animate-ping",
+            )}
+          />
+          <span
+            className={cn(
+              "relative inline-flex size-3 rounded-full",
+              activeSubmoduleId !== null ? "bg-rose-500" : "bg-gray-400",
+            )}
+          />
+        </span>
+        <span className="font-medium text-rose-700 dark:text-rose-300">
+          {activeSubmoduleId !== null
+            ? `Recording → ${
+                submodules.find((s) => s.id === activeSubmoduleId)?.title
+                  ?? `#${activeSubmoduleId}`
+              }`
+            : "Recording paused"}
+        </span>
+        <span className="text-xs text-rose-700/70 dark:text-rose-300/70">
+          {totalChunked} captured ·{" "}
+          {Object.keys(perSubmoduleCounts).length} submodule
+          {Object.keys(perSubmoduleCounts).length === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      <div className="ml-auto flex items-center gap-2">
+        <div className="relative">
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search submodules…"
+            className="h-8 w-52 rounded-md border border-input bg-background px-2 text-xs"
+          />
+          {(query || filtered.length > 0) && (
+            <div className="absolute right-0 top-full z-10 mt-1 max-h-48 w-64 overflow-y-auto rounded-md border bg-popover text-popover-foreground shadow-md">
+              {filtered.length === 0 ? (
+                <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                  No matches — use <strong>+ New</strong> to add.
+                </div>
+              ) : (
+                filtered.map((sm) => {
+                  const count = perSubmoduleCounts[String(sm.id)] ?? 0;
+                  return (
+                    <div
+                      key={sm.id}
+                      className={cn(
+                        "flex w-full items-center justify-between gap-1 px-2 py-1.5 text-xs hover:bg-muted",
+                        pickedId === sm.id && "bg-muted font-medium",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPickedId(sm.id);
+                          setQuery(sm.title);
+                        }}
+                        className="flex-1 text-left"
+                      >
+                        {sm.title}
+                        {count ? (
+                          <span className="ml-2 text-[10px] text-rose-600">
+                            ({count})
+                          </span>
+                        ) : null}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          inspectMut.mutate(sm.id);
+                        }}
+                        className="rounded px-1 py-0.5 text-[10px] text-muted-foreground hover:bg-background hover:text-foreground"
+                        title="Log the saved actions to the console"
+                      >
+                        View
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowAdd((v) => !v)}
+          className="rounded-md border border-input bg-background px-2 py-1 text-xs hover:bg-muted"
+        >
+          {showAdd ? "Cancel" : "+ New"}
+        </button>
+        <button
+          type="button"
+          onClick={() => pickedId !== null && startChunkMut.mutate(pickedId)}
+          disabled={pickedId === null || startChunkMut.isPending}
+          className="rounded-md border border-emerald-600 bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {startChunkMut.isPending ? "Switching…" : "▶ Start chunk"}
+        </button>
+        <button
+          type="button"
+          onClick={onStop}
+          disabled={stopping}
+          className="rounded-md bg-rose-600 px-3 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-60"
+        >
+          {stopping ? "Stopping…" : "⬛ Stop reading"}
+        </button>
+      </div>
+
+      {showAdd && (
+        <div className="flex w-full items-center gap-2 rounded-md border bg-background/60 p-2">
+          <input
+            type="text"
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            placeholder="New submodule title — e.g. Create Role"
+            className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs"
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newTitle.trim()) addSubmoduleMut.mutate();
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => addSubmoduleMut.mutate()}
+            disabled={!newTitle.trim() || addSubmoduleMut.isPending}
+            className="rounded-md border border-input bg-background px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
+          >
+            {addSubmoduleMut.isPending ? "Adding…" : "Add"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function HitlPromptArea({
   projectId,
   runId,
@@ -693,6 +1039,108 @@ function EventRow({ event }: { event: LiveEvent }) {
   // Phase H — preflight pass (Scout → Refine → Activate) that runs
   // BEFORE per-submodule execution so the agent reads a UI-grounded
   // test plan, not the BRD-derived baseline.
+  // Phase W — reading-session lifecycle events.
+  if (type === "recording_ready") {
+    return (
+      <Row
+        icon={
+          <span className="relative inline-flex size-3.5 items-center justify-center">
+            <span className="absolute inset-0 animate-ping rounded-full bg-rose-400 opacity-75" />
+            <span className="relative size-2 rounded-full bg-rose-500" />
+          </span>
+        }
+        label="reading · ready"
+        title="Browser open — click/type to capture"
+        sublabel={data.target_url as string | undefined}
+      />
+    );
+  }
+  if (type === "recording_saved") {
+    const count = typeof data.event_count === "number" ? data.event_count : "?";
+    const saved = !!data.saved;
+    return (
+      <Row
+        icon={
+          saved
+            ? <CheckCircle2 className="size-3.5 text-emerald-500" />
+            : <XCircle className="size-3.5 text-rose-500" />
+        }
+        label={saved ? "reading · saved" : "reading · save failed"}
+        title={`${count} action${count === 1 ? "" : "s"} captured`}
+        sublabel={data.reason as string | undefined}
+      />
+    );
+  }
+  // Replay-of-reading events (fired during agentic runs that
+  // find a saved reading on a submodule).
+  if (type === "submodule_recording_detected") {
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-rose-500" />}
+        label="replay · reading detected"
+        sublabel={`${data.action_count ?? "?"} captured actions to walk`}
+      />
+    );
+  }
+  if (type === "recording_replay_started") {
+    return (
+      <Row
+        icon={<Play className="size-3.5 text-emerald-500" />}
+        label="replay · started"
+        sublabel={`${data.action_count ?? "?"} actions`}
+      />
+    );
+  }
+  if (type === "recording_replay_action") {
+    const kind = (data.kind as string | undefined) ?? "?";
+    const txt = (data.target_text as string | undefined) ?? "";
+    const val = (data.value_preview as string | undefined) ?? "";
+    const desc = (data.description as string | undefined) ?? "";
+    const fallback =
+      kind === "type"
+        ? `"${val}" → ${txt || "(focused field)"}`
+        : (txt || kind);
+    return (
+      <Row
+        icon={<CircleDashed className="size-3.5 text-emerald-500" />}
+        label={`step ${(data.action_index as number ?? 0) + 1} · ${kind}`}
+        title={desc || fallback}
+        sublabel={desc ? fallback : undefined}
+      />
+    );
+  }
+  if (type === "recording_replay_step_failed") {
+    const desc = (data.description as string | undefined) ?? "";
+    const txt = (data.target_text as string | undefined) ?? "";
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-rose-500" />}
+        label={`step ${(data.action_index as number ?? 0) + 1} · ${data.kind ?? "?"} · FAILED`}
+        title={desc || txt || undefined}
+        sublabel={data.error as string | undefined}
+      />
+    );
+  }
+  if (type === "recording_replay_completed") {
+    const status = (data.status as string | undefined) ?? "completed";
+    const exec = data.actions_executed ?? "?";
+    const failed = data.actions_failed ?? 0;
+    return (
+      <Row
+        icon={
+          status === "completed"
+            ? <CheckCircle2 className="size-3.5 text-emerald-500" />
+            : status === "partial"
+            ? <AlertTriangle className="size-3.5 text-amber-500" />
+            : <XCircle className="size-3.5 text-rose-500" />
+        }
+        label={`replay · ${status}`}
+        title={`${exec} executed · ${failed} failed`}
+        sublabel={`${data.duration_s ?? "?"}s`}
+      />
+    );
+  }
+
   if (type === "preflight_started") {
     return (
       <Row

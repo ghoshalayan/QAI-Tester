@@ -1,0 +1,35 @@
+{"t": "2026-05-13T13:55:28.115358+00:00", "kind": "init", "module_id": 467, "target_url": "https://included-depot-emphasis-submission.trycloudflare.com/", "viewport": {"width": 1920, "height": 1040}}
+{"t": "2026-05-13T13:55:37.468889+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["navigate"]}
+{"t": "2026-05-13T13:55:39.475230+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["click"]}
+{"t": "2026-05-13T13:56:38.065814+00:00", "kind": "set_active_submodule", "submodule_id": 468}
+{"t": "2026-05-13T13:56:41.659325+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 1, "kinds": ["click"]}
+{"t": "2026-05-13T13:56:43.091299+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 2, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:45.230385+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 3, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:49.959789+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 4, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:52.014852+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 5, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:54.806728+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 6, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:57.518103+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 7, "kinds": ["type"]}
+{"t": "2026-05-13T13:56:58.653086+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 8, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:00.445403+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 9, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:02.842515+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 10, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:05.549815+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 11, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:08.089691+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 12, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:09.671229+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 13, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:11.142102+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 14, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:12.959363+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 15, "kinds": ["type"]}
+{"t": "2026-05-13T13:57:15.181602+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 17, "kinds": ["click", "click"]}
+{"t": "2026-05-13T13:57:18.793390+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 18, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:27.821108+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 19, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:34.209293+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 20, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:35.376683+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 21, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:36.897041+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 22, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:38.022339+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 24, "kinds": ["click", "click"]}
+{"t": "2026-05-13T13:57:46.137766+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 25, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:51.813185+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 26, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:53.501635+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 27, "kinds": ["click"]}
+{"t": "2026-05-13T13:57:54.787998+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 29, "kinds": ["click", "click"]}
+{"t": "2026-05-13T13:57:58.071481+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 31, "kinds": ["click", "click"]}
+{"t": "2026-05-13T13:58:00.459854+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 32, "kinds": ["click"]}
+{"t": "2026-05-13T13:58:03.472708+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 33, "kinds": ["click"]}
+{"t": "2026-05-13T13:58:07.092652+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 35, "kinds": ["click", "click"]}
+{"t": "2026-05-13T13:58:11.265812+00:00", "kind": "finalize", "saved": true, "event_count": 35, "submodules": [{"submodule_id": 468, "saved": true, "event_count": 35}], "module_id": 467}

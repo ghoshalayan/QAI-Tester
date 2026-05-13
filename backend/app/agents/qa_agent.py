@@ -7928,6 +7928,90 @@ def run_qa_agent_for_plan(
                             e,
                         )
 
+                # Phase W — user-recording replay. When the submodule
+                # has a saved ``user_actions`` recording on
+                # ``frozen_path``, walk it deterministically BEFORE
+                # firing any LLM. The agent loop after this picks up
+                # only verification + self-healing — not the bulk of
+                # the work. Zero LLM cost for the recorded steps.
+                recording_replay_outcome: dict[str, Any] | None = None
+                try:
+                    from app.services.submodule_recording import (  # noqa: PLC0415
+                        load_recording,
+                    )
+                    from app.agents.recording_replay import (  # noqa: PLC0415
+                        replay_recording,
+                    )
+                    rec = load_recording(submodule.frozen_path)
+                except Exception:
+                    rec = None
+                if rec is not None:
+                    _emit(emit_event, "submodule_recording_detected", {
+                        "step_id": row.id,
+                        "submodule_id": submodule.id,
+                        "action_count": len(rec.get("actions") or []),
+                    })
+                    try:
+                        rep = replay_recording(
+                            page,
+                            recording=rec,
+                            emit_event=emit_event,
+                            is_cancelled=is_cancelled,
+                            submodule_id=submodule.id,
+                        )
+                        recording_replay_outcome = {
+                            "status": rep.status,
+                            "actions_executed": rep.actions_executed,
+                            "actions_failed": rep.actions_failed,
+                            "duration_s": rep.duration_s,
+                        }
+                    except Exception as e:
+                        logger.exception(
+                            "recording replay raised on submodule %s",
+                            submodule.id,
+                        )
+                        recording_replay_outcome = {
+                            "status": "failed",
+                            "error": f"{type(e).__name__}: {e}",
+                        }
+                    # If the replay completed cleanly with no failures
+                    # AND the submodule has no LLM-extractable goal
+                    # signal, we can mark it passed immediately and
+                    # skip the agent loop entirely. Otherwise fall
+                    # through — the agent verifies + heals.
+                    if (
+                        recording_replay_outcome.get("status") == "completed"
+                        and recording_replay_outcome.get("actions_failed", 0) == 0
+                    ):
+                        row.status = "passed"
+                        row.completed_at = _utcnow()
+                        row.duration_ms = int(
+                            (
+                                recording_replay_outcome.get("duration_s", 0.0)
+                                * 1000
+                            ),
+                        )
+                        row.narration = (
+                            f"Recording replay completed cleanly — "
+                            f"{recording_replay_outcome['actions_executed']} "
+                            "actions, 0 failures."
+                        )
+                        row.details_json = _json_safe({
+                            "mode": "recording_replay",
+                            "replay": recording_replay_outcome,
+                        })
+                        counts["passed"] += 1
+                        db.commit()
+                        _emit(emit_event, "step_completed", {
+                            "step_id": row.id,
+                            "tc_node_id": row.tc_node_id,
+                            "ordinal": idx + 1,
+                            "total": len(rows),
+                            "status": row.status,
+                            "narration": row.narration,
+                        })
+                        continue
+
                 # Extract goal — single LLM call per submodule.
                 _emit(emit_event, "agent_goal_extracting", {
                     "step_id": row.id,

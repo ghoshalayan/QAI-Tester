@@ -390,6 +390,46 @@ OVERLAY_INIT_SCRIPT = r"""
         .replace(', 0 0 0 6px ' + ringColor, '');
     }, ttl);
   };
+
+  // ── Phase W — transient rect highlight for replay ────────────
+  // The recording-replay walker calls this BEFORE clicking the
+  // recorded element. Draws a green ring at (x, y, w, h) in
+  // viewport pixels and fades it out over ``duration`` ms. Used
+  // when we don't have a direct element reference (the replay
+  // resolves the element via the recorded selector, then asks
+  // the overlay to ring it at the resolved bbox).
+  window.__qaiHighlightRect = function(x, y, w, h, duration) {
+    const ttl = Math.max(200, Math.min(5000, duration || 1800));
+    const ring = document.createElement('div');
+    ring.style.position = 'fixed';
+    ring.style.left = (x - 4) + 'px';
+    ring.style.top = (y - 4) + 'px';
+    ring.style.width = (w + 8) + 'px';
+    ring.style.height = (h + 8) + 'px';
+    ring.style.border = '3px solid rgba(34, 197, 94, 0.95)';
+    ring.style.borderRadius = '6px';
+    ring.style.boxShadow =
+      '0 0 0 4px rgba(34, 197, 94, 0.25), ' +
+      '0 0 18px rgba(34, 197, 94, 0.5)';
+    ring.style.pointerEvents = 'none';
+    ring.style.zIndex = '2147483646';
+    ring.style.transition =
+      'opacity ' + ttl + 'ms ease-out, transform 250ms ease-out';
+    ring.style.opacity = '1';
+    ring.style.transform = 'scale(1)';
+    document.body.appendChild(ring);
+    // Brief pulse, then fade.
+    requestAnimationFrame(() => {
+      ring.style.transform = 'scale(1.04)';
+      requestAnimationFrame(() => {
+        ring.style.transform = 'scale(1)';
+        ring.style.opacity = '0';
+      });
+    });
+    setTimeout(() => {
+      try { ring.remove(); } catch (e) {}
+    }, ttl + 200);
+  };
 })();
 """
 

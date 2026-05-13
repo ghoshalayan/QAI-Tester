@@ -16,6 +16,7 @@ from app.routers import (
     documents,
     health,
     projects,
+    recordings,
     requirements,
     settings as settings_router,
     sub_flow_modules,
@@ -83,6 +84,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Phase Y.1 — permissive CORS for recording-event ingest.
+#
+# The JS injected into the recording browser runs at the TARGET app's
+# origin (e.g. some Cloudflare-tunnelled internal admin). It POSTs
+# captured events back to ``http://localhost:8000/api/recordings/
+# {run_id}/events``. The browser fires an OPTIONS preflight; the
+# global CORSMiddleware above only allows the qai frontend origin, so
+# OPTIONS returns 400 and the POST never fires — empty buffer, "0
+# captured" forever.
+#
+# We can't widen the global CORS without weakening every other
+# endpoint. Instead: a tiny ASGI middleware that intercepts requests
+# to ``/api/recordings/<id>/events`` and either (a) short-circuits
+# OPTIONS with a permissive 200, or (b) injects
+# ``Access-Control-Allow-Origin: *`` on the POST response BEFORE
+# CORSMiddleware sees it. ``add_middleware`` is a stack (last added
+# runs first), so registering this AFTER CORSMiddleware means it
+# fires FIRST and can hand back its own response.
+
+
+class _RecordingIngestCorsMiddleware:
+    """Permissive CORS for the recording-event ingest path only.
+
+    Any other path passes through to the global CORSMiddleware
+    unchanged.
+    """
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        path = scope.get("path") or ""
+        method = (scope.get("method") or "").upper()
+        is_recording_ingest = (
+            path.startswith("/api/recordings/")
+            and path.endswith("/events")
+        )
+        if not is_recording_ingest:
+            await self._app(scope, receive, send)
+            return
+
+        permissive_headers = [
+            (b"access-control-allow-origin", b"*"),
+            (b"access-control-allow-methods", b"POST, OPTIONS"),
+            (b"access-control-allow-headers", b"content-type"),
+            (b"access-control-max-age", b"3600"),
+            (b"vary", b"origin"),
+        ]
+
+        if method == "OPTIONS":
+            # Short-circuit preflight — bypass the strict global
+            # CORSMiddleware entirely.
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": permissive_headers + [
+                    (b"content-length", b"0"),
+                ],
+            })
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        # For POST, intercept the response and inject ACAO:* if the
+        # downstream handler didn't already set one. Keeps the
+        # browser happy when reading the response from a cross-
+        # origin XHR.
+        async def patched_send(message):
+            if message["type"] == "http.response.start":
+                existing = [
+                    (k, v) for (k, v) in (message.get("headers") or [])
+                    if k.lower() != b"access-control-allow-origin"
+                ]
+                message["headers"] = existing + permissive_headers
+            await send(message)
+
+        await self._app(scope, receive, patched_send)
+
+
+app.add_middleware(_RecordingIngestCorsMiddleware)
+
 app.mount(
     "/static/screenshots",
     StaticFiles(directory=settings.screenshots_dir),
@@ -103,6 +188,12 @@ app.include_router(agent_runs.router)
 app.include_router(requirements.router)
 app.include_router(tc_nodes.router)
 app.include_router(sub_flow_modules.router)
+# Phase W — recording ingest + lifecycle endpoints. ``public_router``
+# accepts JS-posted event batches at /api/recordings/{run_id}/events;
+# ``lifecycle_router`` exposes start / stop / discard under the
+# existing project-scoped agent-runs path.
+app.include_router(recordings.public_router)
+app.include_router(recordings.lifecycle_router)
 app.include_router(_debug.router)
 
 

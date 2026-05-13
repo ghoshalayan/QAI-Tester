@@ -353,10 +353,43 @@ _ENUMERATE_FIELDS_JS = r"""
 # AFTER submit attempt to know WHICH field to retry.
 _INVALID_FIELDS_JS = r"""
 () => {
-  const out = [];
+  // Phase V.2 — multi-strategy validation-error detection.
+  // Detects:
+  //   (a) aria-invalid="true" + aria-describedby chain (the
+  //       textbook accessible form pattern)
+  //   (b) Visible error text near each input via CSS class
+  //       heuristics (Mui-error, .error, .invalid, [class*="helper"
+  //       text-error"]) — covers Solar's UI which renders errors
+  //       as <p class="MuiFormHelperText-root Mui-error"> beneath
+  //       the input WITHOUT setting aria-invalid on the input
+  //   (c) Inline red text under a field (siblings within 80px below
+  //       the input with text-color #f44 / #d32 / class names
+  //       containing "error" / "danger" / "required")
   const VISIBLE = (el) => {
     const r = el.getBoundingClientRect();
     return r.width > 1 && r.height > 1;
+  };
+  const isHiddenStyle = (el) => {
+    const cs = getComputedStyle(el);
+    return cs.display === 'none' || cs.visibility === 'hidden' ||
+      parseFloat(cs.opacity) < 0.05;
+  };
+  const looksLikeError = (text) => {
+    if (!text) return false;
+    const t = text.toLowerCase();
+    return (
+      t.includes('required') ||
+      t.includes('invalid') ||
+      t.includes('must') ||
+      t.includes('cannot') ||
+      t.includes('only') && t.length < 120 ||
+      t.includes('please') && t.length < 120 ||
+      t.includes('error') ||
+      t.includes('exists') ||
+      t.includes('already') ||
+      t.includes('duplicate') ||
+      t.includes('format')
+    );
   };
   const labelOf = (el) => {
     let lab = el.getAttribute('aria-label')
@@ -370,36 +403,100 @@ _INVALID_FIELDS_JS = r"""
       if (lbl) return (lbl.innerText || lbl.textContent || '').trim().slice(0, 200);
     }
     let p = el.parentElement;
-    for (let i = 0; i < 4 && p; i++) {
+    for (let i = 0; i < 5 && p; i++) {
       if (p.tagName === 'LABEL') {
         return (p.innerText || p.textContent || '').trim().slice(0, 200);
+      }
+      // Stacked layout — label is a sibling of the input wrapper.
+      const sib = p.previousElementSibling;
+      if (sib && sib.tagName !== 'INPUT' && sib.tagName !== 'TEXTAREA') {
+        const t = (sib.innerText || sib.textContent || '').trim();
+        if (t && t.length <= 60) return t.slice(0, 200);
       }
       p = p.parentElement;
     }
     return '';
   };
-  const nodes = document.querySelectorAll(
+
+  const out = [];
+  const seen = new Set();
+
+  // Strategy (a) — aria-invalid + aria-describedby
+  const ariaNodes = document.querySelectorAll(
     '[aria-invalid="true"], [aria-invalid="grammar"], [aria-invalid="spelling"]',
   );
-  for (const el of nodes) {
-    if (!VISIBLE(el)) continue;
+  for (const el of ariaNodes) {
+    if (!VISIBLE(el) || isHiddenStyle(el)) continue;
     const label = labelOf(el);
     let errText = '';
     const desc = el.getAttribute('aria-describedby');
     if (desc) {
       for (const id of desc.split(/\s+/)) {
         const en = document.getElementById(id);
-        if (en && VISIBLE(en)) {
+        if (en && VISIBLE(en) && !isHiddenStyle(en)) {
           const t = (en.innerText || en.textContent || '').trim();
           if (t) { errText = t; break; }
         }
       }
     }
-    out.push({
-      label, error: errText,
-      key: el.getAttribute('data-qai-form-key') || '',
-    });
+    const key = el.getAttribute('data-qai-form-key') || '';
+    const dedup_key = key || label || '';
+    if (seen.has(dedup_key)) continue;
+    seen.add(dedup_key);
+    out.push({ label, error: errText, key });
   }
+
+  // Strategy (b) — Mui-error / .error / similar class names on a
+  // FormHelperText-style sibling. Walk every visible input and look
+  // up its surrounding form control for an error-styled helper text.
+  const inputs = document.querySelectorAll(
+    'input, textarea, [role=combobox], [role=textbox]',
+  );
+  for (const inp of inputs) {
+    if (!VISIBLE(inp) || isHiddenStyle(inp)) continue;
+    // Find the nearest form-control / wrapper.
+    let wrapper = inp.closest(
+      '.MuiFormControl-root, .ant-form-item, .form-group, ' +
+      '[class*="form-control"], [class*="field-wrapper"]',
+    );
+    if (!wrapper) wrapper = inp.parentElement;
+    if (!wrapper) continue;
+    // Look for an error-flagged helper text inside the wrapper.
+    const helper = wrapper.querySelector(
+      '.Mui-error, .ant-form-item-explain-error, ' +
+      '[class*="helper-text"][class*="error" i], ' +
+      '[class*="error-message" i], [class*="error-text" i], ' +
+      '[role=alert]',
+    );
+    let errText = '';
+    if (helper && VISIBLE(helper) && !isHiddenStyle(helper)) {
+      errText = (helper.innerText || helper.textContent || '').trim();
+    }
+    // If no explicit error class, look for sibling text within 80px
+    // below that LOOKS like an error message.
+    if (!errText) {
+      const r = inp.getBoundingClientRect();
+      const sibs = [...wrapper.querySelectorAll('p, span, div')]
+        .filter(s => s !== inp && VISIBLE(s) && !isHiddenStyle(s));
+      for (const s of sibs) {
+        const sr = s.getBoundingClientRect();
+        if (sr.top < r.bottom - 4 || sr.top > r.bottom + 80) continue;
+        const t = (s.innerText || s.textContent || '').trim();
+        if (t && t.length < 200 && looksLikeError(t)) {
+          errText = t;
+          break;
+        }
+      }
+    }
+    if (!errText) continue;
+    const label = labelOf(inp);
+    const key = inp.getAttribute('data-qai-form-key') || '';
+    const dedup_key = key || label || '';
+    if (seen.has(dedup_key)) continue;
+    seen.add(dedup_key);
+    out.push({ label, error: errText.slice(0, 240), key });
+  }
+
   return out;
 };
 """
@@ -878,10 +975,19 @@ def run_form_fill(
     )
     if should_try_vl_fallback:
         try:
+            # Phase X.1 — exclude dropdowns from the VL-coord path.
+            # The path types directly at the returned (x,y) via
+            # keyboard.type, which works for textbox / textarea / date
+            # / file but NOT for custom_combobox or native_select
+            # (those need click → wait for popup → click option /
+            # press Enter — see ``_fill_custom_combobox``). Send them
+            # back as ``miss`` so the agent's next turn dispatches a
+            # proper combobox interaction via the DOM path.
             vl_labels = [
                 ff.label for ff in unmatched
                 if ff.role_hint not in (
                     "permission_tree", "paginated_resource_table",
+                    "custom_combobox", "native_select",
                 )
             ]
             vision_coord_fields, vision_submit_coord = (
@@ -905,7 +1011,11 @@ def run_form_fill(
     # required-field MISSES with an immediate retry via coord-typing
     # fallback.
     for ff, info in matched:
-        outcome = _fill_one(page, ff, info, settle_ms=settle_ms)
+        outcome = _fill_one(
+            page, ff, info,
+            settle_ms=settle_ms,
+            emit_event=_emit,
+        )
         result.fields.append(outcome)
         _emit("form_fill_field", {
             "label": ff.label,
@@ -933,6 +1043,53 @@ def run_form_fill(
             page.keyboard.press("Control+A")
             page.keyboard.press("Delete")
             page.keyboard.type(ff.value, delay=20)
+            # Phase V.1 — REACT-COMPATIBLE INPUT EVENT DISPATCH.
+            # ``page.keyboard.type`` fires native key events, but
+            # React's controlled inputs track value via the synthetic
+            # event system and the native HTMLInputElement value
+            # setter. If we don't trigger the React setter manually,
+            # the form's internal state stays empty even though the
+            # input visually shows the typed text. Save stays
+            # disabled / validation rejects on submit.
+            #
+            # The fix: locate the focused element at (x, y), call the
+            # NATIVE value setter, then dispatch input + change events
+            # with bubbles=true. This nudges React (and MUI/AntD/
+            # Formik/RHF on top of it) to update controlled state.
+            try:
+                page.evaluate(
+                    """({x, y, value}) => {
+                        const el = document.elementFromPoint(x, y);
+                        if (!el) return false;
+                        // Locate the actual input — elementFromPoint
+                        // may land on a wrapper.
+                        const input =
+                          el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+                            ? el
+                            : el.querySelector('input, textarea')
+                              || el.closest('label, .MuiFormControl-root')?.querySelector('input, textarea');
+                        if (!input) return false;
+                        const proto = input.tagName === 'TEXTAREA'
+                          ? HTMLTextAreaElement.prototype
+                          : HTMLInputElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(
+                          proto, 'value',
+                        )?.set;
+                        if (setter) setter.call(input, value);
+                        else input.value = value;
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                        // Blur to commit the value — many forms only
+                        // run validation on blur.
+                        input.dispatchEvent(new Event('blur', {bubbles: true}));
+                        return true;
+                    }""",
+                    {"x": coord[0], "y": coord[1], "value": ff.value},
+                )
+            except Exception as e:
+                logger.debug(
+                    "VL-coord React event dispatch failed: %s", e,
+                )
             outcome = FieldOutcome(
                 label=ff.label,
                 role=ff.role_hint or "textbox",  # type: ignore[arg-type]
@@ -985,6 +1142,10 @@ def run_form_fill(
                 submit_label=submit_label,
                 settle_ms=settle_ms,
                 vision_submit_coord=vision_submit_coord,
+                # Phase X.3b — pass the VL provider so a fresh
+                # ``propose_click_coordinates`` call can fire if
+                # JS scorer + cached coord both miss.
+                vision_provider=vision_provider,
             )
             _emit("form_fill_submit_attempt", {
                 "attempt": attempt + 1,
@@ -1044,7 +1205,9 @@ def run_form_fill(
                     target_ff.value = new_value
 
                 retry_outcome = _fill_one(
-                    page, target_ff, target, settle_ms=settle_ms,
+                    page, target_ff, target,
+                    settle_ms=settle_ms,
+                    emit_event=_emit,
                 )
                 retry_outcome.attempts += 1
                 retry_outcome.error = (
@@ -1145,6 +1308,7 @@ def _fill_one(
     info: dict[str, Any],
     *,
     settle_ms: int,
+    emit_event: Callable[[str, dict], None] | None = None,
 ) -> FieldOutcome:
     """Dispatch to the per-role fill strategy + verify."""
     role: FieldRole = (
@@ -1191,7 +1355,9 @@ def _fill_one(
             )
         if role == "permission_tree":
             return _fill_permission_tree(
-                page, ff, info, settle_ms=settle_ms,
+                page, ff, info,
+                settle_ms=settle_ms,
+                emit_event=emit_event,
             )
         if role == "paginated_resource_table":
             return _fill_paginated_resource_table(
@@ -1560,6 +1726,7 @@ def _fill_permission_tree(
     info: dict[str, Any],
     *,
     settle_ms: int,
+    emit_event: Callable[[str, dict], None] | None = None,
 ) -> FieldOutcome:
     """Permission-tree strategy.
 
@@ -1690,22 +1857,62 @@ def _fill_permission_tree(
                 cascadable_parents.append(pr)
 
         parent_clicks_attempted = 0
+
+        def _emit_tree(action: str, pr_item: dict[str, Any], err: str = "") -> None:
+            # Phase X.4 — telemetry so the next run reveals which
+            # parents the cascade attempted + why it succeeded /
+            # failed. Silent before; from now on the live feed shows
+            # one ``permission_tree_parent_attempted`` per parent.
+            if emit_event is None:
+                return
+            try:
+                emit_event("permission_tree_parent_attempted", {
+                    "label": str(pr_item.get("label") or "")[:120],
+                    "key": str(pr_item.get("key") or "")[:80],
+                    "current_checked": bool(pr_item.get("checked")),
+                    "action": action,
+                    "error": err[:200] if err else "",
+                })
+            except Exception:
+                pass
+
         for pr in cascadable_parents:
             if bool(pr.get("checked")):
+                _emit_tree("skipped_already_checked", pr)
                 continue
             key = str(pr.get("key") or "")
             if not key:
+                _emit_tree("skipped_no_key", pr)
                 continue
             try:
                 loc = page.locator(f'[data-qai-tree-key="{key}"]')
                 loc.scroll_into_view_if_needed(timeout=1200)
                 try:
                     loc.check(timeout=1200)
-                except Exception:
-                    loc.click(timeout=1200)
+                    _emit_tree("checked_via_check", pr)
+                except Exception as e_check:
+                    try:
+                        loc.click(timeout=1200)
+                        _emit_tree("checked_via_click", pr)
+                    except Exception as e_click:
+                        _emit_tree(
+                            "failed",
+                            pr,
+                            err=(
+                                f"check={type(e_check).__name__}; "
+                                f"click={type(e_click).__name__}: "
+                                f"{str(e_click)[:120]}"
+                            ),
+                        )
+                        continue
                 parent_clicks_attempted += 1
                 page.wait_for_timeout(80)
-            except Exception:
+            except Exception as e:
+                _emit_tree(
+                    "failed",
+                    pr,
+                    err=f"{type(e).__name__}: {str(e)[:120]}",
+                )
                 continue
         # Re-enumerate to see what the cascade actually achieved.
         if parent_clicks_attempted > 0:
@@ -2444,7 +2651,45 @@ _FIND_PRIMARY_SUBMIT_JS = r"""
       best = el;
     }
   }
-  if (!best || bestScore < 30) return null;
+  // Phase X.3a — positional fallback. When the text-matching scorer
+  // returns nothing (button text doesn't match "save / create /
+  // submit / confirm / ok / apply" — e.g. Solar's "Add Role" or a
+  // locale-translated string), fall back to a PRIMARY-styled button
+  // in the drawer's bottom 30% (footer region). If exactly one,
+  // use it. If multiple, pick the rightmost (drawer footers put
+  // primary action bottom-right). Cancel buttons are usually NOT
+  // primary-styled (outlined / muted), so this won't pick them.
+  if (!best || bestScore < 30) {
+    const footerCutY = drawerRect.top + drawerRect.height * 0.7;
+    let primaryFooter = cands.filter(el => {
+      if (isDisabled(el)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.top < footerCutY) return false;
+      return isPrimary(el);
+    });
+    if (primaryFooter.length === 0) {
+      // No primary-styled candidate — relax to ANY non-disabled
+      // button in the bottom 30%. Last resort before giving up.
+      primaryFooter = cands.filter(el => {
+        if (isDisabled(el)) return false;
+        const r = el.getBoundingClientRect();
+        return r.top >= footerCutY;
+      });
+    }
+    if (primaryFooter.length === 1) {
+      best = primaryFooter[0];
+      bestScore = 25;
+    } else if (primaryFooter.length > 1) {
+      primaryFooter.sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (br.left + br.width) - (ar.left + ar.width);
+      });
+      best = primaryFooter[0];
+      bestScore = 25;
+    }
+  }
+  if (!best || bestScore < 25) return null;
   let key = best.getAttribute('data-qai-submit-key');
   if (!key) {
     key = 'qai-submit-' + Math.random().toString(36).slice(2, 9);
@@ -2468,6 +2713,7 @@ def _submit_and_observe(
     submit_label: str,
     settle_ms: int,
     vision_submit_coord: tuple[int, int] | None = None,
+    vision_provider: Any = None,
 ) -> tuple[bool, str, list[dict[str, Any]]]:
     """Click the submit button matching ``submit_label``, then watch
     for inline aria-invalid feedback. Returns
@@ -2540,6 +2786,41 @@ def _submit_and_observe(
             clicked = True
         except Exception:
             pass
+    # Phase X.3b — fresh VL fallback for Save. When the JS scorer
+    # AND the role locator AND the cached vision coord ALL failed,
+    # fire a dedicated VL call asking ONLY for the Save button.
+    # Decoupled from the form-locator's initial call so we don't lose
+    # Save just because the form locator's submit_confidence was low.
+    if not clicked and vision_provider is not None and getattr(
+        vision_provider, "supports_vision", False,
+    ):
+        try:
+            from app.agents.page_intel import (  # noqa: PLC0415
+                propose_click_coordinates,
+            )
+            coords = propose_click_coordinates(
+                vision_provider,
+                page,
+                target_hint=(
+                    submit_label
+                    or "Save / Submit / Create button at the "
+                    "bottom of the drawer (the primary action that "
+                    "persists the form)"
+                ),
+            )
+            if (
+                coords is not None
+                and getattr(coords, "confidence", 0.0) >= 0.5
+                and isinstance(getattr(coords, "x", None), int)
+                and isinstance(getattr(coords, "y", None), int)
+            ):
+                page.mouse.click(coords.x, coords.y)
+                clicked = True
+        except Exception as e:
+            logger.debug(
+                "fresh-VL Save fallback failed: %s: %s",
+                type(e).__name__, e,
+            )
     # Note: deliberately NO get_by_text fallback here — that's exactly
     # what mis-fires on form-title headings. If both methods above
     # failed, we'd rather report "submit not found" than click the wrong
@@ -2552,7 +2833,8 @@ def _submit_and_observe(
                 + (
                     " (vision-coord fallback also unavailable)"
                     if vision_submit_coord is None
-                    else ""
+                    and vision_provider is None
+                    else " (all fallbacks exhausted)"
                 )
             ),
             [],
@@ -2571,6 +2853,26 @@ def _submit_and_observe(
             invalids = [r for r in raw if isinstance(r, dict)]
     except Exception:
         invalids = []
+
+    # Phase X.2 — async-validation double-check. On Solar (and any
+    # React app that fires validation through useEffect / async
+    # form-resolver chain), inline errors render AFTER ``settle_ms``
+    # — the first scan declares clean, the agent calls
+    # mark_goal_complete, the operator sees a red error on screen.
+    # If the first scan is empty, wait another 1500ms and re-scan.
+    # Any errors found on the second pass are treated as if they had
+    # fired the first time → routed through the regenerator on retry.
+    if not invalids:
+        try:
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        try:
+            raw2 = page.evaluate(_INVALID_FIELDS_JS)
+            if isinstance(raw2, list):
+                invalids = [r for r in raw2 if isinstance(r, dict)]
+        except Exception:
+            invalids = []
 
     if invalids:
         names = ", ".join(
