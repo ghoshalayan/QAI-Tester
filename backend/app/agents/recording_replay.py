@@ -40,6 +40,14 @@ class ReplayResult:
     duration_s: float = 0.0
     error_message: str | None = None
     failed_action_indices: list[int] = field(default_factory=list)
+    # Phase Z.5 — first frame captured during trace playback, as a
+    # path RELATIVE to settings.screenshots_dir (e.g. "130/trace_
+    # step_469_start.png"). Caller sets this on
+    # ``execution_steps.screenshot_path`` so the report viewer shows
+    # the trace's opening frame. None when screenshotting was
+    # disabled or every capture attempt failed.
+    first_screenshot_relpath: str | None = None
+    screenshot_relpaths: list[str] = field(default_factory=list)
 
 
 def _label_for_target(target: dict[str, Any] | None) -> str:
@@ -547,6 +555,9 @@ def replay_recording(
     self_heal_callback: Callable[
         [dict[str, Any], "Page", int, str], bool,
     ] | None = None,
+    run_id: int | None = None,
+    step_id: int | None = None,
+    screenshot_every: int = 5,
 ) -> ReplayResult:
     """Walk a ``user_actions`` recording deterministically.
 
@@ -563,6 +574,17 @@ def replay_recording(
     not failed); return False / raise to let it count as a failure.
     Recording stays the source of truth — agent only heals *this
     one action*, doesn't redo the submodule.
+
+    ``run_id`` / ``step_id`` / ``screenshot_every`` (Phase Z.5):
+    when both ids are provided, captures a screenshot of the page
+    at trace start, after every Nth step (default 5), at the end,
+    AND at every failure point. Saved under
+    ``{screenshots_dir}/{run_id}/trace_step_{step_id}_{tag}.png``
+    relative to the static mount, emitted as
+    ``recording_replay_screenshot`` events the live presenter
+    renders inline. First captured frame is returned as
+    ``out.first_screenshot_relpath`` so the caller can set it on
+    ``execution_steps.screenshot_path``.
     """
     t0 = time.monotonic()
     out = ReplayResult()
@@ -573,11 +595,58 @@ def replay_recording(
         out.error_message = "recording.actions is not a list"
         return out
 
+    # Phase Z.5 — screenshot helper. Captures the page to
+    # ``{screenshots_dir}/{run_id}/trace_step_{step_id}_{tag}.png``
+    # and emits a ``recording_replay_screenshot`` event with the
+    # relative path so the live presenter can render a thumbnail.
+    # Disabled when run_id / step_id aren't provided (legacy call
+    # sites). All failures swallowed — screenshots are
+    # nice-to-have telemetry, not load-bearing.
+    screenshots_enabled = (
+        run_id is not None and step_id is not None
+    )
+    screenshots_root = None
+    if screenshots_enabled:
+        try:
+            from app.config import settings as _sx_settings  # noqa: PLC0415
+            screenshots_root = _sx_settings.screenshots_dir
+        except Exception:
+            screenshots_enabled = False
+
+    def _capture(tag: str, action_index: int | None = None) -> None:
+        if not screenshots_enabled or screenshots_root is None:
+            return
+        try:
+            rel = (
+                f"{run_id}/trace_step_{step_id}_"
+                f"{action_index if action_index is not None else 'na'}_"
+                f"{tag}.png"
+            )
+            abs_path = screenshots_root / rel
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(abs_path), full_page=False)
+            out.screenshot_relpaths.append(rel)
+            if out.first_screenshot_relpath is None:
+                out.first_screenshot_relpath = rel
+            _emit(emit_event, "recording_replay_screenshot", {
+                "submodule_id": submodule_id,
+                "action_index": action_index,
+                "tag": tag,
+                "path": rel,
+            })
+        except Exception as exc:
+            logger.debug(
+                "trace screenshot failed (%s) on submodule %s "
+                "action %s: %s",
+                tag, submodule_id, action_index, exc,
+            )
+
     _emit(emit_event, "recording_replay_started", {
         "submodule_id": submodule_id,
         "action_count": len(actions),
         "target_url": recording.get("target_url") or "",
     })
+    _capture("start", None)
 
     for idx, action in enumerate(actions):
         if is_cancelled and is_cancelled():
@@ -715,6 +784,25 @@ def replay_recording(
                 )
 
             out.actions_executed += 1
+            # Phase Z.5 — periodic + navigation-triggered screenshot.
+            # Captures whenever (idx+1) divides screenshot_every,
+            # AND whenever a navigation transition just landed (so
+            # the report shows the new screen the operator reached).
+            recorded_url_for_shot = (action.get("url") or "").strip()
+            next_url_for_shot = ""
+            if idx + 1 < len(actions):
+                _nx = actions[idx + 1]
+                if isinstance(_nx, dict):
+                    next_url_for_shot = (_nx.get("url") or "").strip()
+            triggered_nav = (
+                bool(recorded_url_for_shot) and bool(next_url_for_shot)
+                and recorded_url_for_shot != next_url_for_shot
+            )
+            if (
+                screenshot_every > 0
+                and ((idx + 1) % screenshot_every == 0 or triggered_nav)
+            ):
+                _capture("step", idx)
             # Phase W.8 — navigation-aware settle between actions.
             #
             # If the recording shows the NEXT action happened on a
@@ -808,6 +896,10 @@ def replay_recording(
                     "description": description,
                     "error": error_str,
                 })
+                # Phase Z.5 — failure-frame capture. The screenshot
+                # at the moment of failure is the most informative
+                # piece of the report.
+                _capture("fail", idx)
             # Continue on per-action failure — partial replay is
             # better than aborting the whole submodule.
 
@@ -815,6 +907,7 @@ def replay_recording(
         out.status = (
             "partial" if out.failed_action_indices else "completed"
         )
+    _capture("end", len(actions) - 1 if actions else None)
     out.duration_s = round(time.monotonic() - t0, 2)
     _emit(emit_event, "recording_replay_completed", {
         "submodule_id": submodule_id,

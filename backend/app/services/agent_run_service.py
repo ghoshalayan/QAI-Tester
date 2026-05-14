@@ -92,6 +92,53 @@ def _drop_cancel(run_id: int) -> None:
         _cancelled_runs.discard(run_id)
 
 
+# ── Force-pass registry ──────────────────────────────────────────
+#
+# Phase AA — operator force-pass shortcut (Ctrl+Shift+D on the live
+# presenter). The operator has visually verified the test passed and
+# is short-circuiting the remaining LLM/replay work. The run resolves
+# as ``completed`` with every test case marked ``passed``, NOT as
+# ``cancelled``. Distinct from request_cancel so reports + summaries
+# show 100% pass rather than "Cancelled mid-loop".
+
+_force_passed_runs: set[int] = set()
+_force_pass_lock = threading.Lock()
+
+
+def request_force_pass(run_id: int) -> None:
+    """Mark a run as force-passed by the operator.
+
+    Polled at the same safe checkpoints as cancellation. When the
+    runner sees this flag, it stops at the current submodule, marks
+    that submodule + every remaining submodule as ``passed``, and
+    completes the run cleanly. The narration records that this was
+    an operator decision (Ctrl+Shift+D), so reports/audits can tell
+    "automation-passed" from "operator-asserted-passed".
+
+    Idempotent. Also wakes pause / HITL waiters so the run can exit
+    its current blocking primitive immediately.
+    """
+    with _force_pass_lock:
+        _force_passed_runs.add(run_id)
+    # Wake pause waiters so the loop can observe the flag.
+    with _pause_lock:
+        ev = _resume_events.get(run_id)
+    if ev:
+        ev.set()
+    # Wake every HITL intervention waiter.
+    _drop_interventions(run_id)
+
+
+def _is_force_passed(run_id: int) -> bool:
+    with _force_pass_lock:
+        return run_id in _force_passed_runs
+
+
+def _drop_force_pass(run_id: int) -> None:
+    with _force_pass_lock:
+        _force_passed_runs.discard(run_id)
+
+
 # ── Pause registry ───────────────────────────────────────────────
 
 _paused_runs: set[int] = set()
@@ -1139,7 +1186,20 @@ def execute_run(run_id: int) -> None:
                     window_position=window_position,
                     window_size=window_size,
                     emit_event=lambda et, data: _emit_run_event(run, et, data),
-                    is_cancelled=lambda: _is_cancelled(run.id),
+                    # Phase AA — combine cancel + force-pass into the
+                    # single ``is_cancelled`` signal that the inner
+                    # loops (LLM turn loop, replay walker, etc.) all
+                    # poll. That way force-pass exits the in-flight
+                    # submodule's tight loop fast — same as cancel —
+                    # without plumbing a new callback through every
+                    # nested helper. The OUTER loop polls
+                    # ``is_force_passed`` separately to pick the
+                    # right finalisation branch (promote-to-passed
+                    # vs skip-cancelled).
+                    is_cancelled=lambda: (
+                        _is_cancelled(run.id) or _is_force_passed(run.id)
+                    ),
+                    is_force_passed=lambda: _is_force_passed(run.id),
                     is_paused=lambda: _is_paused(run.id),
                     wait_for_resume=lambda: _wait_until_resumed_or_cancelled(run.id),
                     wait_for_intervention=lambda step_id: request_intervention(run.id, step_id),
@@ -1248,6 +1308,7 @@ def execute_run(run_id: int) -> None:
 
     finally:
         _drop_cancel(run_id)
+        _drop_force_pass(run_id)
         _drop_pause(run_id)
         _drop_interventions(run_id)
         db.close()

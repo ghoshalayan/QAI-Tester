@@ -60,6 +60,7 @@ from app.services.agent_run_service import (
     execute_run,
     provide_intervention,
     request_cancel,
+    request_force_pass,
     request_pause,
     request_resume,
     topic_for_project_agent_runs,
@@ -516,6 +517,46 @@ def cancel_run(
     request_cancel(run.id)
     logger.info("Cancel requested for run %s (current status=%s)",
                 run.id, run.status)
+    return run
+
+
+@router.post("/{run_id}/force-pass", response_model=AgentRunRead)
+def force_pass_run(
+    project_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """Phase AA — operator force-pass (Ctrl+Shift+D on the live
+    presenter).
+
+    The operator has visually verified that the test scenario
+    succeeded and is short-circuiting the remaining LLM/replay
+    work. The runner observes the flag at its next safe checkpoint,
+    marks the current submodule + every remaining submodule as
+    ``passed``, and resolves the run as ``completed`` (NOT
+    ``cancelled``).
+
+    Distinct from cancel:
+    - Cancel    → status=cancelled, rows marked skipped.
+    - Force-pass → status=completed, rows marked passed with a
+      narration that says "Operator marked passed via Ctrl+Shift+D
+      (visually verified)" — auditable in reports.
+
+    Idempotent on terminal runs (no-op). Only meaningful for runs
+    of kind ``execute`` in agentic mode; on scripted-mode runs the
+    flag is set but the orchestrator currently ignores it.
+    """
+    run = _require_run(db, project_id, run_id)
+
+    if run.status in ("completed", "failed", "cancelled"):
+        return run  # already terminal — no-op
+
+    request_force_pass(run.id)
+    logger.info(
+        "Force-pass requested for run %s by operator "
+        "(current status=%s)",
+        run.id, run.status,
+    )
     return run
 
 

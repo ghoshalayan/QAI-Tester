@@ -1678,6 +1678,19 @@ export const api = {
       { method: "POST" },
     ),
   /**
+   * Phase AA — operator force-pass (Ctrl+Shift+D on the live
+   * presenter). Resolves the run as ``completed`` with every
+   * remaining test case marked ``passed``, NOT cancelled. The
+   * row narrations explicitly record "Operator marked passed via
+   * Ctrl+Shift+D" so reports can distinguish automation-passed
+   * from operator-asserted-passed.
+   */
+  forcePassAgentRun: (projectId: number, runId: number) =>
+    apiFetch<AgentRunRead>(
+      `/api/projects/${projectId}/agent-runs/${runId}/force-pass`,
+      { method: "POST" },
+    ),
+  /**
    * Phase K.2 — manual orphan reaper. Cancels runs stuck in non-
    * terminal status with no completed_at (left over from a process
    * restart / crash). Server also runs this automatically at boot.

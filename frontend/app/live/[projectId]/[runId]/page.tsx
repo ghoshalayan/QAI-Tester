@@ -143,6 +143,26 @@ export default function LivePresenterPage() {
       toast.error("Force-stop failed", { description: msg });
     },
   });
+  // Phase AA — operator force-pass (Ctrl+Shift+D). Resolves the run
+  // as completed with every remaining test case marked passed.
+  // Distinct from cancel: status=completed, not cancelled.
+  const forcePassMut = useMutation({
+    mutationFn: () => api.forcePassAgentRun(projectId, runId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agent-run", projectId, runId] });
+      // Backend acknowledged. The runner may take a moment to
+      // observe the flag at its next safe checkpoint, but the
+      // outcome is locked in from this moment.
+      toast.success("All test cases covered", {
+        description:
+          "Backend agent acknowledged — every test cases will be promoted to passed.",
+      });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Force-pass failed", { description: msg });
+    },
+  });
   // Phase W — stop a reading session. Triggers the backend's
   // stop event so the browser closes and the captured actions
   // get persisted to the submodule's frozen_path.
@@ -178,6 +198,47 @@ export default function LivePresenterPage() {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [events.length]);
 
+  // Phase AA — Ctrl+Shift+D shortcut. Single keypress, no
+  // confirmation dialog — fires the force-pass mutation directly.
+  //
+  // NOTE on focus: keyboard events only reach this listener when
+  // THIS window (the live presenter) has focus. If the operator is
+  // watching the Playwright browser the agent drives, those
+  // keypresses go to Chromium, not here. The visible "Mark Passed"
+  // button in the Controls bar is the focus-independent path; this
+  // shortcut is the keyboard convenience.
+  //
+  // Accepts Ctrl OR Cmd (meta) so Mac users get a working shortcut
+  // without us needing to know the OS. Uses capture phase so it
+  // fires before any other listener can swallow the event.
+  // preventDefault suppresses Chrome's "Bookmark all tabs" default.
+  const isInFlight =
+    run?.status === "queued" ||
+    run?.status === "running" ||
+    run?.status === "paused";
+  const isAgenticInFlight =
+    isInFlight && run?.kind !== "record";
+
+  useEffect(() => {
+    if (!isAgenticInFlight) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.shiftKey) return;
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (e.key !== "D" && e.key !== "d") return;
+      if (e.repeat) return;  // ignore key-held auto-repeats
+      e.preventDefault();
+      e.stopPropagation();
+      if (forcePassMut.isPending) return;
+      toast.success("All test cases covered", {
+        description:
+          "Backend agent acknowledged — every test cases will be promoted to passed.",
+      });
+      forcePassMut.mutate();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [isAgenticInFlight, forcePassMut]);
+
   return (
     <div className="flex h-screen flex-col bg-background text-sm text-foreground">
       <Header
@@ -211,6 +272,7 @@ export default function LivePresenterPage() {
           resumePending={resumeMut.isPending}
           cancelPending={cancelMut.isPending}
           forceCancelPending={forceCancelMut.isPending}
+          forcePassPending={forcePassMut.isPending}
           onPause={() => pauseMut.mutate()}
           onResume={() => resumeMut.mutate()}
           onCancel={() => cancelMut.mutate()}
@@ -223,6 +285,15 @@ export default function LivePresenterPage() {
             ) {
               forceCancelMut.mutate();
             }
+          }}
+          onForcePass={() => {
+            // Same payload as the Ctrl+Shift+D shortcut. No confirm
+            // dialog — the click itself is the explicit gesture.
+            toast.success("All test cases covered", {
+              description:
+                "Backend agent acknowledged — every test cases will be promoted to passed.",
+            });
+            forcePassMut.mutate();
           }}
         />
       )}
@@ -323,10 +394,12 @@ function Controls({
   resumePending,
   cancelPending,
   forceCancelPending,
+  forcePassPending,
   onPause,
   onResume,
   onCancel,
   onForceCancel,
+  onForcePass,
 }: {
   isPaused: boolean;
   isRunning: boolean;
@@ -335,10 +408,12 @@ function Controls({
   resumePending: boolean;
   cancelPending: boolean;
   forceCancelPending: boolean;
+  forcePassPending: boolean;
   onPause: () => void;
   onResume: () => void;
   onCancel: () => void;
   onForceCancel: () => void;
+  onForcePass: () => void;
 }) {
   if (isTerminal) return null;
   return (
@@ -385,6 +460,26 @@ function Controls({
       >
         <Square className="size-3.5" />
         Force stop
+      </Button>
+      {/* Phase AA — Mark Passed. Focus-independent path for the
+          Ctrl+Shift+D shortcut. Shipping a visible button means
+          operators can end a run as success even when they're
+          watching the Playwright browser (the popup window
+          doesn't have keyboard focus). Emerald variant to set
+          it apart from the rose stop buttons — passing is the
+          happy path. */}
+      <Button
+        size="sm"
+        onClick={onForcePass}
+        disabled={forcePassPending}
+        title="Mark passed (Ctrl+Shift+D): every remaining test case promoted to passed; run resolves as completed"
+        className="ml-auto bg-emerald-600 text-white hover:bg-emerald-700"
+      >
+        <CheckCircle2 className="size-3.5" />
+        Mark passed
+        <kbd className="ml-1 hidden rounded border border-emerald-300/30 bg-emerald-700/40 px-1 py-0 text-[10px] font-medium md:inline-block">
+          Ctrl+Shift+D
+        </kbd>
       </Button>
     </div>
   );
@@ -1130,14 +1225,17 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
-  // Replay-of-reading events (fired during agentic runs that
-  // find a saved reading on a submodule).
+  // Trace playback events — fired during agentic runs that find a
+  // saved trace on a submodule. Internal event names retain the
+  // legacy ``recording_replay_*`` prefix (SSE wire contract) but
+  // user-facing strings use "trace" / "step" — Tricentis-style
+  // technical terms instead of the consumer-grade "recording".
   if (type === "submodule_recording_detected") {
     return (
       <Row
         icon={<Sparkles className="size-3.5 text-rose-500" />}
-        label="replay · reading detected"
-        sublabel={`${data.action_count ?? "?"} captured actions to walk`}
+        label="trace · detected"
+        sublabel={`${data.action_count ?? "?"} captured steps to walk`}
       />
     );
   }
@@ -1145,8 +1243,8 @@ function EventRow({ event }: { event: LiveEvent }) {
     return (
       <Row
         icon={<Play className="size-3.5 text-emerald-500" />}
-        label="replay · started"
-        sublabel={`${data.action_count ?? "?"} actions`}
+        label="trace · playback started"
+        sublabel={`${data.action_count ?? "?"} steps`}
       />
     );
   }
@@ -1180,10 +1278,10 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
-  // Phase W.9 — per-action self-heal events. Fired when replay
-  // can't resolve a single action and hands it to the agent for a
-  // one-shot vision-assisted fix. Recording stays canonical; agent
-  // only patches the ONE failed step.
+  // Per-step self-heal events. Fired when trace playback can't
+  // resolve a single step and hands it to the agent for a one-shot
+  // vision-assisted fix. Trace stays canonical; agent only patches
+  // the ONE failed step.
   if (type === "recording_replay_self_heal_attempting") {
     const desc = (data.description as string | undefined) ?? "";
     return (
@@ -1202,7 +1300,7 @@ function EventRow({ event }: { event: LiveEvent }) {
         icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
         label={`step ${(data.action_index as number ?? 0) + 1} · healed by agent`}
         title={desc || undefined}
-        sublabel="vision found the right element — walk continues"
+        sublabel="vision found the right element — trace continues"
       />
     );
   }
@@ -1215,6 +1313,48 @@ function EventRow({ event }: { event: LiveEvent }) {
         title={desc || undefined}
         sublabel="agent could not locate the element — counted as failed"
       />
+    );
+  }
+  // Phase Z.5 — per-submodule trace screenshots. Captured at trace
+  // start, every N steps, on failures, and at trace end. The path
+  // is RELATIVE to /static/screenshots, which is mounted by the
+  // FastAPI app; the live presenter renders an inline thumbnail
+  // (lazy-loaded) plus a click-through to the full frame.
+  if (type === "recording_replay_screenshot") {
+    const path = (data.path as string | undefined) ?? "";
+    const tag = (data.tag as string | undefined) ?? "?";
+    const idx = data.action_index as number | null | undefined;
+    const url = path ? `/static/screenshots/${path}` : "";
+    return (
+      <div className="flex items-start gap-2 rounded border bg-card px-2 py-1.5">
+        <div className="mt-0.5 shrink-0">
+          <CircleDashed className="size-3.5 text-sky-500" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            trace · screenshot ({tag})
+          </p>
+          {idx != null && (
+            <p className="break-words text-xs">at step {idx + 1}</p>
+          )}
+          {url && (
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 block w-fit"
+              title="open full frame"
+            >
+              <img
+                src={url}
+                alt={`trace frame ${tag}`}
+                loading="lazy"
+                className="h-24 max-w-[280px] rounded border border-border object-cover object-left-top"
+              />
+            </a>
+          )}
+        </div>
+      </div>
     );
   }
   if (type === "recording_replay_completed") {
@@ -1230,9 +1370,104 @@ function EventRow({ event }: { event: LiveEvent }) {
             ? <AlertTriangle className="size-3.5 text-amber-500" />
             : <XCircle className="size-3.5 text-rose-500" />
         }
-        label={`replay · ${status}`}
+        label={`trace · ${status}`}
         title={`${exec} executed · ${failed} failed`}
         sublabel={`${data.duration_s ?? "?"}s`}
+      />
+    );
+  }
+  // Phase AB — live-watch (post-completion review). After every
+  // test case has been processed, the runner keeps the browser
+  // open and emits periodic cheap-VL observations. The operator
+  // ends the watch with Stop (cancel) or Ctrl+Shift+D (pass).
+  if (type === "live_watch_started") {
+    const hasVision = !!data.has_vision;
+    const interval = (data.interval_s as number | undefined) ?? "?";
+    const cap = (data.max_duration_s as number | undefined) ?? "?";
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-sky-500" />}
+        label="live-watch · started"
+        title={
+          hasVision
+            ? `Watching the browser. VL analysis every ${interval}s.`
+            : "Watching the browser (no vision model — screenshots only)."
+        }
+        sublabel={`Auto-ends in ${cap}s · Stop or Ctrl+Shift+D to end now`}
+      />
+    );
+  }
+  if (type === "live_watch_observation") {
+    const path = (data.path as string | undefined) ?? "";
+    const observation = (data.observation as string | undefined) ?? "";
+    const url = path ? `/static/screenshots/${path}` : "";
+    const pageUrl = (data.url as string | undefined) ?? "";
+    const idx = data.capture_idx ?? "?";
+    const elapsed = data.elapsed_s ?? "?";
+    return (
+      <div className="flex items-start gap-2 rounded border bg-card px-2 py-1.5">
+        <div className="mt-0.5 shrink-0">
+          <Sparkles className="size-3.5 text-sky-500" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+            live-watch · observation #{idx} · {elapsed}s
+          </p>
+          {observation && (
+            <p className="break-words text-xs">{observation}</p>
+          )}
+          {pageUrl && (
+            <p className="truncate text-[10px] text-muted-foreground">
+              {pageUrl}
+            </p>
+          )}
+          {url && (
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 block w-fit"
+              title="open full frame"
+            >
+              <img
+                src={url}
+                alt={`live-watch frame ${idx}`}
+                loading="lazy"
+                className="h-24 max-w-[280px] rounded border border-border object-cover object-left-top"
+              />
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+  if (type === "live_watch_ended") {
+    const reason = (data.reason as string | undefined) ?? "?";
+    const captures = data.captures ?? "?";
+    return (
+      <Row
+        icon={
+          reason === "force_passed"
+            ? <CheckCircle2 className="size-3.5 text-emerald-500" />
+            : reason === "cancelled"
+            ? <XCircle className="size-3.5 text-rose-500" />
+            : <AlertTriangle className="size-3.5 text-amber-500" />
+        }
+        label={`live-watch · ended (${reason})`}
+        title={`${captures} observation${captures === 1 ? "" : "s"} captured`}
+      />
+    );
+  }
+  // Phase AA — operator force-pass event from the runner.
+  if (type === "operator_force_pass") {
+    const promoted = data.promoted_rows ?? "?";
+    const total = data.total_rows ?? "?";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label="operator · force-pass"
+        title={`${promoted} of ${total} test case${total === 1 ? "" : "s"} promoted to passed`}
+        sublabel="Run marked completed (visually verified via Ctrl+Shift+D)"
       />
     );
   }

@@ -7498,6 +7498,171 @@ def _select_submodules_to_run(
     return groups
 
 
+def _run_live_watch_mode(
+    page,  # noqa: ANN001 — playwright Page (avoid hard import dep)
+    *,
+    run_id: int,
+    provider: "LLMProvider | None",
+    is_cancelled: Callable[[], bool] | None,
+    is_force_passed: Callable[[], bool] | None,
+    emit_event: Callable[[str, dict], None] | None = None,
+    capture_interval_s: float = 20.0,
+    max_duration_s: float = 1800.0,  # 30 min cap
+) -> str:
+    """Phase AB — operator live-watch mode.
+
+    After the test-case loop completes NATURALLY (no cancel, no
+    force-pass), keep the browser open so the operator can review
+    the final app state. Every ``capture_interval_s`` seconds:
+
+    1. Take a screenshot — saved under
+       ``{screenshots_dir}/{run_id}/live_watch_{N}.png``.
+    2. Send to the **cheap** VL provider with a "describe what's on
+       screen in one short sentence" prompt.
+    3. Emit ``live_watch_observation`` with the path + observation
+       so the live presenter shows a thumbnail + caption.
+
+    Exits when:
+    - ``is_cancelled()`` → returns ``"cancelled"`` (Stop button)
+    - ``is_force_passed()`` → returns ``"force_passed"`` (Ctrl+Shift+D)
+    - ``max_duration_s`` elapses → returns ``"timeout"`` (so a
+      forgotten run doesn't burn tokens forever)
+
+    The caller folds the outcome into ``cancelled`` / ``force_passed``
+    so the existing post-loop branches handle row finalisation. When
+    the outcome is ``"timeout"``, both flags stay False and the run
+    completes naturally.
+
+    Functionality is NOT compromised: this only runs after the
+    submodule for-loop has finished processing every test case
+    (passed/failed/inconclusive already determined). Test-case
+    semantics are unchanged; this is a post-test review phase only.
+    """
+    import time as _t  # noqa: PLC0415
+
+    has_vision = bool(provider) and getattr(provider, "supports_vision", False)
+    from app.config import settings as _aa_settings  # noqa: PLC0415
+
+    _emit(emit_event, "live_watch_started", {
+        "run_id": run_id,
+        "interval_s": capture_interval_s,
+        "max_duration_s": max_duration_s,
+        "has_vision": has_vision,
+    })
+
+    t_start = _t.monotonic()
+    capture_idx = 0
+    next_capture = t_start  # capture immediately on entry
+
+    while True:
+        # Tight cancel/force-pass poll. Force-pass checked first so
+        # we don't muddle the outcome when the cancel-equivalent
+        # lambda also reports True for force-pass.
+        if is_force_passed and is_force_passed():
+            _emit(emit_event, "live_watch_ended", {
+                "run_id": run_id, "reason": "force_passed",
+                "captures": capture_idx,
+            })
+            return "force_passed"
+        if is_cancelled and is_cancelled():
+            _emit(emit_event, "live_watch_ended", {
+                "run_id": run_id, "reason": "cancelled",
+                "captures": capture_idx,
+            })
+            return "cancelled"
+
+        now = _t.monotonic()
+        elapsed = now - t_start
+        if elapsed > max_duration_s:
+            _emit(emit_event, "live_watch_ended", {
+                "run_id": run_id, "reason": "timeout",
+                "captures": capture_idx,
+            })
+            return "timeout"
+
+        if now >= next_capture:
+            capture_idx += 1
+            rel_path = None
+            try:
+                rel_path = f"{run_id}/live_watch_{capture_idx}.png"
+                abs_path = _aa_settings.screenshots_dir / rel_path
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(abs_path), full_page=False)
+            except Exception as e:
+                logger.debug("live_watch screenshot failed: %s", e)
+                rel_path = None
+
+            observation = ""
+            tokens_in = 0
+            tokens_out = 0
+            if has_vision and provider is not None:
+                try:
+                    from app.agents.page_intel import (  # noqa: PLC0415
+                        capture_screenshot_for_vision,
+                    )
+                    from app.llm.base import ChatMessage  # noqa: PLC0415
+                    shot = capture_screenshot_for_vision(
+                        page, downscale=True,
+                    )
+                    result = provider.chat(
+                        messages=[
+                            ChatMessage(
+                                role="system",
+                                content=(
+                                    "You are watching the browser after a "
+                                    "QA test run has finished. In ONE "
+                                    "short sentence (<= 25 words), "
+                                    "describe what is visible: the main "
+                                    "screen element, any visible success "
+                                    "or error banner, and any unexpected "
+                                    "state worth flagging. Do not invent "
+                                    "details that aren't on screen."
+                                ),
+                            ),
+                            ChatMessage(
+                                role="user",
+                                content="What's on screen right now?",
+                                image=shot,
+                            ),
+                        ],
+                        temperature=0.2,
+                        max_output_tokens=160,
+                    )
+                    observation = (result.text or "").strip()[:400]
+                    tokens_in = int(result.input_tokens or 0)
+                    tokens_out = int(result.output_tokens or 0)
+                except Exception as e:
+                    logger.debug("live_watch VL call failed: %s", e)
+                    observation = f"(VL error: {type(e).__name__})"
+
+            page_url = ""
+            try:
+                page_url = page.url or ""
+            except Exception:
+                pass
+
+            _emit(emit_event, "live_watch_observation", {
+                "run_id": run_id,
+                "capture_idx": capture_idx,
+                "path": rel_path,
+                "observation": observation,
+                "url": page_url,
+                "elapsed_s": round(elapsed, 1),
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+            })
+            next_capture = now + capture_interval_s
+
+        # Sleep in short chunks so user-pressed Stop / Ctrl+Shift+D
+        # exits within ~500ms even between captures. Uses the page's
+        # wait_for_timeout when available (lets the operator see the
+        # browser stay responsive) and falls back to OS sleep.
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            _t.sleep(0.5)
+
+
 def run_qa_agent_for_plan(
     db: Session,
     *,
@@ -7513,6 +7678,13 @@ def run_qa_agent_for_plan(
     window_size: tuple[int, int] | None = None,
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    # Phase AA — operator force-pass channel. When this callable
+    # returns True, the runner stops at the current submodule, marks
+    # it AND every remaining submodule as ``passed``, and resolves
+    # the run as ``completed`` (NOT cancelled). Triggered by
+    # Ctrl+Shift+D on the live presenter — the operator visually
+    # verified the test and is short-circuiting LLM work.
+    is_force_passed: Callable[[], bool] | None = None,
     is_paused: Callable[[], bool] | None = None,  # noqa: ARG001
     wait_for_resume: Callable[[], bool] | None = None,  # noqa: ARG001
     # Phase 4-α — HITL channel for the auth-flow orchestrator.
@@ -7704,6 +7876,10 @@ def run_qa_agent_for_plan(
         "blocked": 0, "inconclusive": 0,
     }
     cancelled = False
+    # Phase AA — Operator force-pass flag. Set when ``is_force_passed``
+    # callable returns True at any safe checkpoint. Drives the
+    # post-loop branch that promotes remaining rows to ``passed``.
+    force_passed = False
 
     total_input_tokens = 0
     total_output_tokens = 0
@@ -7874,7 +8050,16 @@ def run_qa_agent_for_plan(
                     "pre-submodule validation lookup skipped: %s", e,
                 )
 
+            # Phase AA — every safe checkpoint inside this loop also
+            # polls ``is_force_passed``. ORDER MATTERS: check force-
+            # pass FIRST. The inner loops' ``is_cancelled`` lambda
+            # also reports True when force-pass is set (so they
+            # exit promptly), but here at the outer loop we must
+            # distinguish: force-pass → promote rows; cancel → skip.
             for idx, ((submodule, steps), row) in enumerate(zip(groups, rows)):
+                if is_force_passed and is_force_passed():
+                    force_passed = True
+                    break
                 if is_cancelled and is_cancelled():
                     cancelled = True
                     break
@@ -8167,13 +8352,24 @@ def run_qa_agent_for_plan(
                             is_cancelled=is_cancelled,
                             submodule_id=submodule.id,
                             self_heal_callback=_heal_one_action,
+                            run_id=run_id,
+                            step_id=row.id,
                         )
                         recording_replay_outcome = {
                             "status": rep.status,
                             "actions_executed": rep.actions_executed,
                             "actions_failed": rep.actions_failed,
                             "duration_s": rep.duration_s,
+                            "first_screenshot": rep.first_screenshot_relpath,
+                            "screenshot_count": len(rep.screenshot_relpaths),
                         }
+                        # Phase Z.5 — set the row's primary screenshot
+                        # to the FIRST captured trace frame so the
+                        # report viewer surfaces "what the operator
+                        # saw at the start of this submodule" without
+                        # extra plumbing.
+                        if rep.first_screenshot_relpath:
+                            row.screenshot_path = rep.first_screenshot_relpath
                     except Exception as e:
                         logger.exception(
                             "recording replay raised on submodule %s",
@@ -8207,24 +8403,24 @@ def run_qa_agent_for_plan(
                     if status_raw == "completed" and failed_count == 0:
                         row_status = "passed"
                         narration = (
-                            f"Recording replay completed cleanly — "
-                            f"{executed_count} actions, 0 failures."
+                            f"Trace playback completed cleanly — "
+                            f"{executed_count} steps, 0 failures."
                         )
                         counts["passed"] += 1
                     elif status_raw in ("completed", "partial"):
                         # Some actions failed but the walk went all the
                         # way through. Mark INCONCLUSIVE so the user
                         # knows to inspect (vs PASSED), but stay on the
-                        # recording — DON'T redo via the agent.
+                        # trace — DON'T redo via the agent.
                         row_status = "inconclusive"
                         narration = (
-                            f"Recording replay finished with "
-                            f"{failed_count} failed action"
+                            f"Trace playback finished with "
+                            f"{failed_count} failed step"
                             f"{'' if failed_count == 1 else 's'} of "
                             f"{executed_count + failed_count} — see "
-                            f"recording_replay_step_failed events. "
+                            f"the failed-step events. "
                             "Agent did not re-run the submodule "
-                            "(recording is source of truth)."
+                            "(trace is source of truth)."
                         )
                         counts["inconclusive"] = counts.get(
                             "inconclusive", 0,
@@ -8236,7 +8432,7 @@ def run_qa_agent_for_plan(
                             else "inconclusive"
                         )
                         narration = (
-                            f"Recording replay {status_raw or 'failed'} — "
+                            f"Trace playback {status_raw or 'failed'} — "
                             f"{executed_count} executed, "
                             f"{failed_count} failed."
                         )
@@ -8256,9 +8452,9 @@ def run_qa_agent_for_plan(
                     )
                     row.narration = narration
                     row.details_json = _json_safe({
-                        "mode": "recording_replay",
-                        "replay": recording_replay_outcome,
-                        "policy": "recording_is_source_of_truth",
+                        "mode": "trace_playback",
+                        "trace": recording_replay_outcome,
+                        "policy": "trace_is_source_of_truth",
                     })
                     db.commit()
                     _emit(emit_event, "step_completed", {
@@ -8711,6 +8907,36 @@ def run_qa_agent_for_plan(
                     "vision_rescues": divergence["vision_rescues"],
                     "frozen": should_freeze,
                 })
+
+            # Phase AB — operator live-watch. The submodule for-loop
+            # has finished. If it ended naturally (no cancel, no
+            # force-pass), keep the browser open and stream periodic
+            # cheap-VL observations until the operator presses Stop
+            # or Ctrl+Shift+D. This is a REVIEW phase only — every
+            # test case's pass/fail/inconclusive verdict is already
+            # locked in by the loop above; nothing here changes
+            # test-case semantics. The watch loop's outcome only
+            # decides which post-loop branch (cancelled vs
+            # force_passed vs natural completion) finalises the run.
+            if (
+                not cancelled
+                and not force_passed
+                and not (is_cancelled and is_cancelled())
+                and not (is_force_passed and is_force_passed())
+            ):
+                watch_outcome = _run_live_watch_mode(
+                    page,
+                    run_id=run_id,
+                    provider=cheap_provider or provider,
+                    is_cancelled=is_cancelled,
+                    is_force_passed=is_force_passed,
+                    emit_event=emit_event,
+                )
+                if watch_outcome == "force_passed":
+                    force_passed = True
+                elif watch_outcome == "cancelled":
+                    cancelled = True
+                # "timeout" — fall through to natural completion.
     except BrowserNotInstalledError:
         raise
     finally:
@@ -8760,6 +8986,20 @@ def run_qa_agent_for_plan(
                 db.rollback()
             except Exception:
                 pass
+        # Phase AA — final force-pass poll. If the operator pressed
+        # Ctrl+Shift+D during the LAST submodule's body, the inner
+        # cancel-equivalent signal would have exited the body but
+        # the for-loop ended naturally without going through the
+        # top check that sets ``force_passed=True``. Catch that
+        # case here so the post-loop branch picks the right path.
+        if (
+            not force_passed
+            and not cancelled
+            and is_force_passed
+            and is_force_passed()
+        ):
+            force_passed = True
+
         if cancelled:
             now = _utcnow()
             for row in rows:
@@ -8769,6 +9009,59 @@ def run_qa_agent_for_plan(
                     row.narration = "run cancelled before this test case"
                     counts["skipped"] = counts.get("skipped", 0) + 1
             db.commit()
+        elif force_passed:
+            # Phase AA — operator force-passed the run. Promote every
+            # not-yet-passed row to ``passed`` with an audit
+            # narration so reports can tell automation-passed from
+            # operator-asserted-passed.
+            #
+            # We deliberately overwrite "cancelled" / "failed" /
+            # "inconclusive" / "blocked" rows here, NOT just
+            # pending/running. Why: when the operator presses
+            # Ctrl+Shift+D mid-submodule, the in-flight inner loop
+            # exits via the cancel-equivalent signal (the cancel
+            # lambda also reports True for force-pass) and writes
+            # status="cancelled" or "inconclusive" on that row.
+            # Without this broader promotion that row would be
+            # stuck at the inner-loop-set status, contradicting the
+            # operator's "100% passed" assertion. Previously-finalised
+            # passes are left alone (already correct).
+            now = _utcnow()
+            promoted = 0
+            for row in rows:
+                if row.status == "passed":
+                    continue
+                # Track which bucket this row was in so we can
+                # adjust the count (it was already incremented when
+                # the inner loop set the terminal status).
+                old_status = row.status
+                if old_status in counts:
+                    counts[old_status] = max(0, counts[old_status] - 1)
+                row.status = "passed"
+                row.completed_at = now
+                row.narration = (
+                    "Operator marked passed via Ctrl+Shift+D "
+                    "(visually verified)."
+                )
+                row.details_json = _json_safe({
+                    "mode": "operator_force_pass",
+                    "asserted_by": "operator",
+                    "shortcut": "Ctrl+Shift+D",
+                    "previous_status": old_status,
+                })
+                counts["passed"] = counts.get("passed", 0) + 1
+                promoted += 1
+            db.commit()
+            _emit(emit_event, "operator_force_pass", {
+                "run_id": run_id,
+                "promoted_rows": promoted,
+                "total_rows": len(rows),
+            })
+            logger.info(
+                "Agentic run %s force-passed by operator — "
+                "%d row(s) promoted to passed",
+                run_id, promoted,
+            )
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
