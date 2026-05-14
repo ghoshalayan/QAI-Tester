@@ -7938,13 +7938,93 @@ def run_qa_agent_for_plan(
                 try:
                     from app.services.submodule_recording import (  # noqa: PLC0415
                         load_recording,
+                        RECORDING_KIND_USER_ACTIONS,
                     )
                     from app.agents.recording_replay import (  # noqa: PLC0415
                         replay_recording,
                     )
-                    rec = load_recording(submodule.frozen_path)
-                except Exception:
+                    # Phase W.6.b — refresh the submodule row before
+                    # reading frozen_path. The ORM expires attributes
+                    # on commit, but expiration triggers a SELECT on
+                    # next access. If a prior db.refresh / db.merge
+                    # tampered with the identity-map copy, we want a
+                    # *guaranteed* fresh read here so a recording
+                    # written between preflight and now isn't missed.
+                    try:
+                        db.refresh(submodule, attribute_names=["frozen_path"])
+                    except Exception as _refresh_exc:
+                        logger.debug(
+                            "frozen_path refresh failed for sub %s: %s",
+                            submodule.id, _refresh_exc,
+                        )
+                    fp_for_check = submodule.frozen_path
+                    logger.info(
+                        "qa_agent: submodule %s (idx=%d) frozen_path "
+                        "type=%s kind=%s actions=%s",
+                        submodule.id, idx, type(fp_for_check).__name__,
+                        (
+                            fp_for_check.get("recording_kind")
+                            if isinstance(fp_for_check, dict) else None
+                        ),
+                        (
+                            len(fp_for_check.get("actions") or [])
+                            if isinstance(fp_for_check, dict)
+                            and isinstance(fp_for_check.get("actions"), list)
+                            else "N/A"
+                        ),
+                    )
+                    rec = load_recording(fp_for_check)
+                except Exception as _rec_exc:
+                    logger.warning(
+                        "load_recording raised on submodule %s: %s",
+                        submodule.id, _rec_exc,
+                    )
                     rec = None
+                # Phase W.6 — diagnostic event so the operator can see
+                # in the live feed WHY a submodule does/doesn't trigger
+                # recording replay. Fires for EVERY submodule on the
+                # replay path, with the actual state of frozen_path.
+                # Hot signal when only one submodule replays and the
+                # rest fall through to the LLM loop: shows whether
+                # frozen_path was wiped (None), overwritten by an
+                # agent_freeze, or simply has no actions.
+                try:
+                    fp = submodule.frozen_path
+                    if isinstance(fp, dict):
+                        fp_kind = (
+                            str(fp.get("recording_kind") or "agent_freeze")
+                        )
+                        fp_actions = (
+                            len(fp.get("actions") or [])
+                            if isinstance(fp.get("actions"), list) else 0
+                        )
+                    else:
+                        fp_kind = None
+                        fp_actions = 0
+                    _emit(emit_event, "submodule_recording_check", {
+                        "step_id": row.id,
+                        "submodule_id": submodule.id,
+                        "title": (submodule.title or "")[:160],
+                        "has_frozen_path": isinstance(fp, dict),
+                        "recording_kind": fp_kind,
+                        "action_count": fp_actions,
+                        "will_replay": rec is not None,
+                        "skip_reason": (
+                            None if rec is not None
+                            else "no_frozen_path"
+                            if not isinstance(fp, dict)
+                            else (
+                                "wrong_kind"
+                                if fp_kind != RECORDING_KIND_USER_ACTIONS
+                                else "empty_actions"
+                            )
+                        ),
+                    })
+                except Exception as _diag_exc:
+                    logger.debug(
+                        "submodule_recording_check emit failed: %s",
+                        _diag_exc,
+                    )
                 if rec is not None:
                     _emit(emit_event, "submodule_recording_detected", {
                         "step_id": row.id,
@@ -7952,12 +8032,141 @@ def run_qa_agent_for_plan(
                         "action_count": len(rec.get("actions") or []),
                     })
                     try:
+                        # Phase W.9 — per-action self-heal callback.
+                        # Built once per submodule; closes over the
+                        # cheap_provider so vision tokens stay on the
+                        # cheap tier. When replay can't resolve a
+                        # single action, this is called with the
+                        # recorded target metadata and a screenshot;
+                        # success means ONE action got fixed, the walk
+                        # continues from the next recorded step.
+                        # Recording stays canonical.
+                        # Prefer the cheap tier for heal calls — but
+                        # only if it supports vision. Many cheap tiers
+                        # are text-only; in that case fall through to
+                        # the strong provider so heal still works.
+                        heal_provider = None
+                        if (
+                            cheap_provider is not None
+                            and getattr(
+                                cheap_provider, "supports_vision", False,
+                            )
+                        ):
+                            heal_provider = cheap_provider
+                        elif (
+                            provider is not None
+                            and getattr(
+                                provider, "supports_vision", False,
+                            )
+                        ):
+                            heal_provider = provider
+
+                        def _heal_one_action(
+                            action: dict[str, Any],
+                            heal_page,  # noqa: ANN001 — playwright Page
+                            action_idx: int,
+                            error_str: str,
+                        ) -> bool:
+                            if heal_provider is None:
+                                logger.debug(
+                                    "heal skipped (no vision-capable "
+                                    "provider) on submodule %s action %d "
+                                    "(orig err: %s)",
+                                    submodule.id, action_idx, error_str,
+                                )
+                                return False
+                            from app.agents.page_intel import (  # noqa: PLC0415
+                                propose_click_coordinates,
+                            )
+                            from app.agents.recording_replay import (  # noqa: PLC0415
+                                describe_action,
+                            )
+                            # Heal is conservative — only fire when the
+                            # recorded action has a semantic anchor
+                            # (text / aria / placeholder). For purely
+                            # decorative recorder noise (stray SVG
+                            # icon clicks with no label, generic
+                            # wrappers), there's no reliable way to
+                            # tell the VL "find THIS element"; trying
+                            # would just click somewhere arbitrary and
+                            # break the page state for the actions
+                            # that follow. Letting these count as
+                            # failed is the safe choice.
+                            tgt = action.get("target") or {}
+                            has_anchor = bool(
+                                (tgt.get("text") or "").strip()
+                                or (tgt.get("aria_label") or "").strip()
+                                or (tgt.get("placeholder") or "").strip()
+                                or (tgt.get("name") or "").strip()
+                                or (tgt.get("id") or "").strip()
+                            )
+                            if not has_anchor:
+                                logger.info(
+                                    "heal: skipping submodule %s action "
+                                    "%d — no semantic anchor (recorder "
+                                    "captured a decorative element); "
+                                    "orig err: %s",
+                                    submodule.id, action_idx, error_str,
+                                )
+                                return False
+                            hint = describe_action(action)
+                            logger.info(
+                                "heal: attempting submodule %s action %d "
+                                "(%s) — replay error was: %s",
+                                submodule.id, action_idx, hint, error_str,
+                            )
+                            try:
+                                coord = propose_click_coordinates(
+                                    heal_provider,
+                                    heal_page,
+                                    target_hint=hint,
+                                )
+                            except Exception as e:
+                                logger.info(
+                                    "heal: vision pick failed on submodule "
+                                    "%s action %d: %s",
+                                    submodule.id, action_idx, e,
+                                )
+                                return False
+                            # Bumped from 0.4 to 0.6 — a low-confidence
+                            # heal that misclicks elsewhere does more
+                            # damage to subsequent actions than a clean
+                            # "this action failed" count.
+                            if (
+                                coord.confidence < 0.6
+                                or coord.x <= 0 or coord.y <= 0
+                            ):
+                                logger.info(
+                                    "heal: vision confidence %.2f too low "
+                                    "for action %d (%s)",
+                                    coord.confidence, action_idx, hint,
+                                )
+                                return False
+                            kind = str(action.get("kind") or "")
+                            try:
+                                heal_page.mouse.click(coord.x, coord.y)
+                                heal_page.wait_for_timeout(150)
+                                if kind == "type":
+                                    value = str(action.get("value") or "")
+                                    heal_page.keyboard.press("Control+A")
+                                    heal_page.keyboard.press("Delete")
+                                    heal_page.keyboard.type(value, delay=15)
+                                return True
+                            except Exception as e:
+                                logger.info(
+                                    "heal: click/type at "
+                                    "(%d,%d) failed for action %d: %s",
+                                    coord.x, coord.y, action_idx, e,
+                                )
+                                return False
+
                         rep = replay_recording(
                             page,
                             recording=rec,
                             emit_event=emit_event,
                             is_cancelled=is_cancelled,
                             submodule_id=submodule.id,
+                            self_heal_callback=_heal_one_action,
                         )
                         recording_replay_outcome = {
                             "status": rep.status,
@@ -7974,43 +8183,93 @@ def run_qa_agent_for_plan(
                             "status": "failed",
                             "error": f"{type(e).__name__}: {e}",
                         }
-                    # If the replay completed cleanly with no failures
-                    # AND the submodule has no LLM-extractable goal
-                    # signal, we can mark it passed immediately and
-                    # skip the agent loop entirely. Otherwise fall
-                    # through — the agent verifies + heals.
-                    if (
-                        recording_replay_outcome.get("status") == "completed"
-                        and recording_replay_outcome.get("actions_failed", 0) == 0
-                    ):
-                        row.status = "passed"
-                        row.completed_at = _utcnow()
-                        row.duration_ms = int(
-                            (
-                                recording_replay_outcome.get("duration_s", 0.0)
-                                * 1000
-                            ),
-                        )
-                        row.narration = (
+                    # Phase W.7 — recording IS the source of truth.
+                    # When the operator captured a user_actions
+                    # recording for this submodule, we accept the
+                    # replay outcome AS-IS and skip the agent's "redo
+                    # from scratch" loop. The agent loop was the old
+                    # fall-through for partial replays; it caused
+                    # confusion ("AI took over from my recording") and
+                    # threw away the deterministic walk in favour of
+                    # an LLM re-derivation of the same goal. The user's
+                    # rule: if a recording exists, USE it; agent
+                    # narrates failures via recording_replay_step_failed
+                    # rather than re-running the submodule.
+                    status_raw = (
+                        recording_replay_outcome.get("status") or ""
+                    )
+                    failed_count = int(
+                        recording_replay_outcome.get("actions_failed") or 0,
+                    )
+                    executed_count = int(
+                        recording_replay_outcome.get("actions_executed") or 0,
+                    )
+                    if status_raw == "completed" and failed_count == 0:
+                        row_status = "passed"
+                        narration = (
                             f"Recording replay completed cleanly — "
-                            f"{recording_replay_outcome['actions_executed']} "
-                            "actions, 0 failures."
+                            f"{executed_count} actions, 0 failures."
                         )
-                        row.details_json = _json_safe({
-                            "mode": "recording_replay",
-                            "replay": recording_replay_outcome,
-                        })
                         counts["passed"] += 1
-                        db.commit()
-                        _emit(emit_event, "step_completed", {
-                            "step_id": row.id,
-                            "tc_node_id": row.tc_node_id,
-                            "ordinal": idx + 1,
-                            "total": len(rows),
-                            "status": row.status,
-                            "narration": row.narration,
-                        })
-                        continue
+                    elif status_raw in ("completed", "partial"):
+                        # Some actions failed but the walk went all the
+                        # way through. Mark INCONCLUSIVE so the user
+                        # knows to inspect (vs PASSED), but stay on the
+                        # recording — DON'T redo via the agent.
+                        row_status = "inconclusive"
+                        narration = (
+                            f"Recording replay finished with "
+                            f"{failed_count} failed action"
+                            f"{'' if failed_count == 1 else 's'} of "
+                            f"{executed_count + failed_count} — see "
+                            f"recording_replay_step_failed events. "
+                            "Agent did not re-run the submodule "
+                            "(recording is source of truth)."
+                        )
+                        counts["inconclusive"] = counts.get(
+                            "inconclusive", 0,
+                        ) + 1
+                    else:
+                        # status == "failed" / "cancelled" / unknown.
+                        row_status = (
+                            "cancelled" if status_raw == "cancelled"
+                            else "inconclusive"
+                        )
+                        narration = (
+                            f"Recording replay {status_raw or 'failed'} — "
+                            f"{executed_count} executed, "
+                            f"{failed_count} failed."
+                        )
+                        if row_status == "cancelled":
+                            counts["cancelled"] = counts.get(
+                                "cancelled", 0,
+                            ) + 1
+                        else:
+                            counts["inconclusive"] = counts.get(
+                                "inconclusive", 0,
+                            ) + 1
+                    row.status = row_status
+                    row.completed_at = _utcnow()
+                    row.duration_ms = int(
+                        (recording_replay_outcome.get("duration_s") or 0.0)
+                        * 1000,
+                    )
+                    row.narration = narration
+                    row.details_json = _json_safe({
+                        "mode": "recording_replay",
+                        "replay": recording_replay_outcome,
+                        "policy": "recording_is_source_of_truth",
+                    })
+                    db.commit()
+                    _emit(emit_event, "step_completed", {
+                        "step_id": row.id,
+                        "tc_node_id": row.tc_node_id,
+                        "ordinal": idx + 1,
+                        "total": len(rows),
+                        "status": row.status,
+                        "narration": row.narration,
+                    })
+                    continue
 
                 # Extract goal — single LLM call per submodule.
                 _emit(emit_event, "agent_goal_extracting", {

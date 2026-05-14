@@ -30,7 +30,9 @@ from app.services.submodule_recording import (
     buffer_size,
     buffer_state,
     discard_buffer,
+    init_buffer,
     push_events,
+    register_stop_event,
     set_active_submodule,
     signal_stop,
 )
@@ -118,7 +120,11 @@ class StartRecordingRequest(BaseModel):
 
 
 class SetActiveSubmoduleRequest(BaseModel):
-    submodule_id: int
+    # Phase W' — None parks the recording (operator hit "Pause
+    # chunk"): captured events are dropped until another submodule is
+    # picked. Lets one recording session collect multiple submodule
+    # chunks without ending the whole browser session.
+    submodule_id: int | None = None
 
 
 @lifecycle_router.post("/start-recording")
@@ -181,6 +187,21 @@ def start_recording(
     db.commit()
     db.refresh(run)
 
+    # Initialise the in-memory buffer + stop event SYNCHRONOUSLY,
+    # before spawning the worker thread. Otherwise the UI sees
+    # status="running" the moment this returns and the operator can
+    # click "Start chunk" before the worker thread has called
+    # init_buffer — which fails with "recording run not currently
+    # active" (the buffer dict has no entry yet). Doing it here
+    # closes that race; the worker's init_buffer call becomes a
+    # harmless re-init.
+    init_buffer(
+        run.id,
+        module_id=payload.module_id,
+        target_url=target_url,
+    )
+    register_stop_event(run.id)
+
     # Spawn in a daemon thread (FastAPI BackgroundTasks would tie
     # the task to the request lifetime; recordings outlive the
     # request).
@@ -216,19 +237,20 @@ def set_recording_active_submodule(
             404,
             f"recording run {run_id} not found on project {project_id}",
         )
-    # Verify the submodule belongs to the module this run is recording.
     module_id = int((run.input_json or {}).get("module_id") or 0)
-    sm = db.get(TcNode, payload.submodule_id)
-    if (
-        sm is None
-        or sm.kind != "submodule"
-        or (module_id and sm.parent_id != module_id)
-    ):
-        raise HTTPException(
-            400,
-            f"submodule {payload.submodule_id} is not under the "
-            f"module {module_id} this recording is scoped to",
-        )
+    # submodule_id == None → park the recording (Pause chunk).
+    if payload.submodule_id is not None:
+        sm = db.get(TcNode, payload.submodule_id)
+        if (
+            sm is None
+            or sm.kind != "submodule"
+            or (module_id and sm.parent_id != module_id)
+        ):
+            raise HTTPException(
+                400,
+                f"submodule {payload.submodule_id} is not under the "
+                f"module {module_id} this recording is scoped to",
+            )
     ok = set_active_submodule(run_id, payload.submodule_id)
     state = buffer_state(run_id)
     if not ok:

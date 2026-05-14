@@ -135,62 +135,405 @@ def _emit(emit_event, t: str, d: dict) -> None:
         pass
 
 
+# Strings whose ``target.text`` carries no semantic value — usually
+# the literal "on" off-state of a checkbox, or empty / whitespace.
+# When the recorded text is in this set, text-based disambiguation
+# can't help and we should fall back to coordinates / role.
+_NON_SEMANTIC_TEXTS: set[str] = {
+    "", "on", "off", " ", " ",
+}
+
+
+def _looks_generic_selector(sel: str) -> bool:
+    """Return True when the recorded CSS selector is the kind that
+    matches many elements on the page (no #id anchor, no attribute
+    selector, no nth-of-type). E.g. ``button.p-ripple.p-button`` or
+    ``span.layout-menuitem-text.ng-star-inserted``. Triggers the
+    text-disambiguation path."""
+    if not sel:
+        return True
+    s = sel.strip()
+    # ID-anchored selectors are usually unique.
+    if "#" in s:
+        return False
+    # Attribute selectors or nth-of-type usually narrow to one.
+    if "[" in s and "=" in s:
+        return False
+    if ":nth" in s or ":first-of-type" in s or ":last-of-type" in s:
+        return False
+    # Pure-class / pure-tag selectors are the dangerous ones.
+    return True
+
+
+def _scope_of(page: "Page", target: dict[str, Any]) -> Any:
+    """Return a Playwright Locator scoped to the recorded container
+    or component anchor — for sub-page lookups. Falls back to the
+    page itself when no anchor is present (legacy recordings)."""
+    anchor = target.get("component_anchor")
+    if isinstance(anchor, dict):
+        sel = (anchor.get("selector") or "").strip()
+        if sel:
+            try:
+                scope = page.locator(sel).first
+                if scope.count() > 0:
+                    return scope
+            except Exception:
+                pass
+    container = target.get("container")
+    if isinstance(container, dict):
+        sel = (container.get("selector") or "").strip()
+        if sel:
+            try:
+                scope = page.locator(sel).first
+                if scope.count() > 0:
+                    return scope
+            except Exception:
+                pass
+        cname = (container.get("accessible_name") or "").strip()
+        crole = (container.get("role") or "").strip()
+        ctag = (container.get("tag") or "").strip()
+        if cname and crole:
+            try:
+                scope = page.get_by_role(
+                    crole, name=cname,  # type: ignore[arg-type]
+                ).first
+                if scope.count() > 0:
+                    return scope
+            except Exception:
+                pass
+        if cname and ctag:
+            try:
+                scope = page.locator(ctag).filter(has_text=cname).first
+                if scope.count() > 0:
+                    return scope
+            except Exception:
+                pass
+    return page
+
+
 def _resolve_target(
     page: "Page", target: dict[str, Any] | None,
 ) -> Any | None:
-    """Try the recorded selector strategies in priority order.
+    """Resolve a recorded target metadata object to a Playwright
+    Locator pointing at the SPECIFIC element the operator clicked.
 
-    Returns a Playwright Locator (first match) or None. Falls back
-    to bbox + text matching when selectors don't resolve."""
+    Strategy order (Tricentis-grade — most specific → least):
+
+    Z.2 — framework-aware strategies (require enriched fingerprint
+    from Phase Z.1 recorder; legacy recordings skip these):
+
+    0a. **formControlName** — `[formcontrolname="email"]` — unique
+        within a single form, robust to Angular class-hash churn.
+    0b. **Component anchor + accessible name** — find the recorded
+        anchor element, narrow search within its subtree to the
+        named control. Mirrors Tosca's Module-bound replay.
+    0c. **Container scope + accessible name** — when no component
+        anchor was recorded, scope to the nearest semantic container
+        (form / dialog / section / nav) and find by name there.
+    0d. **Label association** — `page.get_by_label(labelText)` —
+        Playwright's built-in label-for / aria-labelledby walker.
+
+    Legacy strategies (fallback for old recordings or when Z.2 misses):
+
+    1.  **#id selector** — recorded ``#name`` style IDs are usually
+        unique.
+    2.  **aria-label** — strong semantic anchor.
+    3.  **Selector + text filter** — generic CSS classes
+        disambiguated by visible text.
+    4.  **Role + text** — when target.role is recorded.
+    5.  **Tag-inferred role + text** — button/a/input tag → ARIA role.
+    6.  **Visible text alone** — for unique-enough strings.
+    7.  **Placeholder** — for input fields.
+    8.  **Generic selector ``.first``** — last resort.
+    """
     if not isinstance(target, dict):
         return None
-    # Strategy 1 — recorded selector.
+
     sel = (target.get("selector") or "").strip()
-    if sel and not sel.startswith("BUTTON[") and not sel.startswith("DIV["):
+    text = (target.get("text") or "").strip()
+    text_is_semantic = (
+        text and text.lower() not in _NON_SEMANTIC_TEXTS and len(text) <= 80
+    )
+    role = (target.get("role") or "").strip().lower()
+    tag = (target.get("tag") or "").strip().lower()
+    aria = (target.get("aria_label") or "").strip()
+    placeholder = (target.get("placeholder") or "").strip()
+
+    # Z.1 fingerprint fields (empty on legacy recordings).
+    accessible_name = (target.get("accessible_name") or "").strip()
+    form_control = (target.get("form_control") or "").strip()
+    label_text = (target.get("label_text") or "").strip()
+
+    # ── Z.2 — Framework-aware strategies ─────────────────────────
+
+    # 0a. formControlName — uniquely identifies an Angular form
+    # control within its form. Survives class rename.
+    if form_control:
+        try:
+            loc = page.locator(
+                f'[formcontrolname="{form_control}"]',
+            ).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+        try:
+            loc = page.locator(
+                f'[ng-reflect-name="{form_control}"]',
+            ).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # Scope to the recorded component anchor / container for the
+    # next two strategies. ``_scope_of`` falls back to ``page`` when
+    # no anchor was recorded so legacy recordings still work.
+    scope = _scope_of(page, target)
+    has_scope = scope is not page
+
+    # 0b. Component anchor + accessible name. The accessible name is
+    # the same string a screen reader announces — far more stable
+    # than visible text (it includes aria-labels, label-for, etc.).
+    if has_scope and accessible_name:
+        if role:
+            try:
+                loc = scope.get_by_role(
+                    role, name=accessible_name,  # type: ignore[arg-type]
+                ).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
+        if tag in ("button", "a", "input", "textarea", "select"):
+            inferred = {
+                "button": "button", "a": "link",
+                "input": "textbox", "textarea": "textbox",
+                "select": "combobox",
+            }.get(tag, "")
+            if inferred:
+                try:
+                    loc = scope.get_by_role(
+                        inferred, name=accessible_name,  # type: ignore[arg-type]
+                    ).first
+                    if loc.count() > 0:
+                        return loc
+                except Exception:
+                    pass
+        try:
+            loc = scope.get_by_text(accessible_name, exact=False).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # 0c. Label association — for form inputs, Playwright's built-in
+    # label resolver handles <label for=>, wrapping <label>, and
+    # aria-labelledby in one go.
+    if label_text:
+        try:
+            loc = page.get_by_label(label_text, exact=True).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+        try:
+            loc = page.get_by_label(label_text).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # ── 1. #id selector (most reliable when present) ─────────────
+    if sel.startswith("#") and " " not in sel and "," not in sel:
         try:
             loc = page.locator(sel).first
             if loc.count() > 0:
                 return loc
         except Exception:
             pass
-    # Strategy 2 — role + text.
-    role = (target.get("role") or "").strip()
-    text = (target.get("text") or "").strip()
-    if role and text:
+
+    # ── 2. aria-label exact match ─────────────────────────────────
+    if aria:
+        try:
+            loc = page.get_by_label(aria, exact=True).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+        try:
+            loc = page.locator(f'[aria-label="{aria}"]').first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # ── 3. Recorded selector + text disambiguation ────────────────
+    # The hot path for generic Angular/PrimeNG class selectors:
+    # narrow to elements whose visible text matches the recording.
+    # When a container scope is available (Z.2 recordings), search
+    # within it first — "find the Save button in the Add Role
+    # Dialog" is far less ambiguous than "find any Save button on
+    # the page".
+    if sel and text_is_semantic:
+        if has_scope:
+            try:
+                loc = scope.locator(sel).filter(has_text=text).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
+        try:
+            loc = page.locator(sel).filter(has_text=text).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # ── 4. Role + text ────────────────────────────────────────────
+    if role and text_is_semantic:
+        if has_scope:
+            try:
+                loc = scope.get_by_role(
+                    role, name=text,  # type: ignore[arg-type]
+                ).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
         try:
             loc = page.get_by_role(role, name=text).first  # type: ignore[arg-type]
             if loc.count() > 0:
                 return loc
         except Exception:
             pass
-    # Strategy 3 — visible text only.
-    if text and len(text) <= 80:
+
+    # ── 5. Tag → role inference + text ────────────────────────────
+    inferred_role = None
+    if tag == "button":
+        inferred_role = "button"
+    elif tag == "a":
+        inferred_role = "link"
+    elif tag in ("input", "textarea"):
+        ttype = (target.get("type") or "").strip().lower()
+        inferred_role = (
+            "checkbox" if ttype == "checkbox"
+            else "radio" if ttype == "radio"
+            else "textbox"
+        )
+    if inferred_role and text_is_semantic:
+        try:
+            loc = page.get_by_role(
+                inferred_role, name=text,  # type: ignore[arg-type]
+            ).first
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            pass
+
+    # ── 6. Visible text alone (only for non-generic strings) ─────
+    # Search container-scoped first so we don't get cross-form text
+    # collisions (e.g. two "Email" labels on the page).
+    if text_is_semantic:
+        if has_scope:
+            try:
+                loc = scope.get_by_text(text, exact=False).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
         try:
             loc = page.get_by_text(text, exact=False).first
             if loc.count() > 0:
                 return loc
         except Exception:
             pass
-    # Strategy 4 — placeholder match.
-    placeholder = (target.get("placeholder") or "").strip()
+
+    # ── 6b. ng-reflect-* attribute lookup ────────────────────────
+    # Phase Z.3 — Angular's data-binding hints (``ng-reflect-X``)
+    # are stable across class-hash churn and often carry semantic
+    # value: router-link target, value binding, model name, etc.
+    # Match on whichever recorded reflect attr has a value.
+    ng_reflect = target.get("ng_reflect")
+    if isinstance(ng_reflect, dict):
+        for k, v in ng_reflect.items():
+            if not k or not v:
+                continue
+            try:
+                v_esc = str(v).replace('"', '\\"')
+                attr_name = f"ng-reflect-{k}"
+                attr_sel = f'[{attr_name}="{v_esc}"]'
+                if has_scope:
+                    loc = scope.locator(attr_sel).first
+                    if loc.count() > 0:
+                        return loc
+                loc = page.locator(attr_sel).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                continue
+
+    # ── 7. Placeholder match for inputs ──────────────────────────
     if placeholder:
+        if has_scope:
+            try:
+                loc = scope.get_by_placeholder(placeholder).first
+                if loc.count() > 0:
+                    return loc
+            except Exception:
+                pass
         try:
             loc = page.get_by_placeholder(placeholder).first
             if loc.count() > 0:
                 return loc
         except Exception:
             pass
-    # Strategy 5 — aria-label.
-    aria = (target.get("aria_label") or "").strip()
-    if aria:
+
+    # ── 7b. Sibling-index disambiguation ─────────────────────────
+    # Z.3 — when the recorded element was, say, "the 3rd input in
+    # this form", and other strategies couldn't pin it down, use
+    # the recorded position-within-parent. Only fires when we have
+    # both a recorded sibling_index AND a scope to constrain to.
+    sibling_index = target.get("sibling_index")
+    if (
+        has_scope
+        and isinstance(sibling_index, int)
+        and sibling_index >= 0
+        and tag
+    ):
         try:
-            loc = page.locator(
-                f'[aria-label="{aria}"]',
-            ).first
-            if loc.count() > 0:
-                return loc
+            siblings = scope.locator(tag)
+            if siblings.count() > sibling_index:
+                return siblings.nth(sibling_index)
         except Exception:
             pass
+
+    # ── 8. Bare selector ``.first`` (LAST resort) ────────────────
+    # Only reached when nothing more specific resolved. Skip when
+    # the selector is BUTTON[...] / DIV[...] legacy bracket syntax
+    # (always wrong on Playwright).
+    #
+    # When NO semantic text was available (icons, SVGs, layout
+    # wrappers, checkboxes with text="on"), we accept the bare
+    # ``.first`` match — it lets Playwright's actionability check
+    # run on the click and is usually correct for these cases (the
+    # operator's recorded click landed on whatever .first matches
+    # too, because there was no semantic anchor to differentiate).
+    # When text WAS semantic but Strategy 3's text-filter found
+    # nothing, returning bare ``.first`` would pick the wrong
+    # element (the original sub-472 bug) — so we return None
+    # instead and let the caller use coordinates.
+    if sel and not sel.startswith("BUTTON[") and not sel.startswith("DIV["):
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                if not text_is_semantic:
+                    return loc
+                if not _looks_generic_selector(sel):
+                    return loc
+        except Exception:
+            pass
+
     return None
 
 
@@ -201,6 +544,9 @@ def replay_recording(
     emit_event: Callable[[str, dict], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     submodule_id: int | None = None,
+    self_heal_callback: Callable[
+        [dict[str, Any], "Page", int, str], bool,
+    ] | None = None,
 ) -> ReplayResult:
     """Walk a ``user_actions`` recording deterministically.
 
@@ -208,6 +554,15 @@ def replay_recording(
     target_url. The first action's URL is checked against the
     current URL as a sanity-check; mismatch is logged but doesn't
     abort.
+
+    ``self_heal_callback`` (Phase W.9): when a single action raises,
+    the callback is invoked as ``cb(action, page, idx, error_str)``
+    and given a chance to perform an equivalent action via a
+    different strategy (typically a VL-assisted re-resolution).
+    Return True to mark the action as healed (counted as executed,
+    not failed); return False / raise to let it count as a failure.
+    Recording stays the source of truth — agent only heals *this
+    one action*, doesn't redo the submodule.
     """
     t0 = time.monotonic()
     out = ReplayResult()
@@ -312,9 +667,26 @@ def replay_recording(
                         page.keyboard.press("Delete")
                         page.keyboard.type(value, delay=15)
                 else:
-                    raise RuntimeError(
-                        f"type with no resolved target ({target_text!r})",
-                    )
+                    # Coordinate fallback for types — recorded x,y
+                    # focuses the input, then we type via keyboard.
+                    # The previous behaviour raised here; that was
+                    # the dominant cause of cascading "type with no
+                    # resolved target" failures when one earlier
+                    # click missed and the subsequent inputs
+                    # therefore weren't reachable by selector.
+                    x = action.get("x")
+                    y = action.get("y")
+                    if isinstance(x, int) and isinstance(y, int):
+                        page.mouse.click(x, y)
+                        page.wait_for_timeout(120)
+                        page.keyboard.press("Control+A")
+                        page.keyboard.press("Delete")
+                        page.keyboard.type(value, delay=15)
+                    else:
+                        raise RuntimeError(
+                            f"type with no resolved target "
+                            f"({target_text!r}) and no coords recorded",
+                        )
             elif kind == "key":
                 key = str(action.get("key") or "")
                 if key:
@@ -343,23 +715,99 @@ def replay_recording(
                 )
 
             out.actions_executed += 1
-            # Small pacing so the highlight is visible to the
-            # operator + the page can settle between actions.
+            # Phase W.8 — navigation-aware settle between actions.
+            #
+            # If the recording shows the NEXT action happened on a
+            # DIFFERENT URL than the current one, the action we just
+            # performed triggered a navigation. Wait for the new
+            # page to settle before the next action — otherwise the
+            # next selector resolves on the OLD DOM and fails.
+            #
+            # We use ``domcontentloaded`` rather than ``networkidle``
+            # because the latter blocks on long-polling XHRs (which
+            # are common in admin apps) and would balloon the
+            # per-step time.
+            recorded_url = (action.get("url") or "").strip()
+            next_url = ""
+            if idx + 1 < len(actions):
+                next_action = actions[idx + 1]
+                if isinstance(next_action, dict):
+                    next_url = (next_action.get("url") or "").strip()
+            navigation_likely = (
+                bool(recorded_url) and bool(next_url)
+                and recorded_url != next_url
+            )
             try:
-                page.wait_for_timeout(450)
+                if navigation_likely:
+                    try:
+                        page.wait_for_load_state(
+                            "domcontentloaded", timeout=4_000,
+                        )
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(600)
+                else:
+                    page.wait_for_timeout(450)
             except Exception:
                 pass
         except Exception as e:
-            out.actions_failed += 1
-            out.failed_action_indices.append(idx)
-            _emit(emit_event, "recording_replay_step_failed", {
-                "submodule_id": submodule_id,
-                "action_index": idx,
-                "kind": kind,
-                "target_text": target_text,
-                "description": description,
-                "error": f"{type(e).__name__}: {str(e)[:200]}",
-            })
+            error_str = f"{type(e).__name__}: {str(e)[:200]}"
+            # Phase W.9 — give the agent ONE shot to heal this
+            # single action before counting it as a failure. The
+            # callback receives the recorded action, the page, the
+            # index, and the error string; it should perform the
+            # equivalent action via its own strategy (typically
+            # vision-assisted) and return True on success. Recording
+            # stays canonical — we only let the agent fix the ONE
+            # broken step, not redo the submodule.
+            healed = False
+            if self_heal_callback is not None:
+                _emit(emit_event, "recording_replay_self_heal_attempting", {
+                    "submodule_id": submodule_id,
+                    "action_index": idx,
+                    "kind": kind,
+                    "description": description,
+                    "error": error_str,
+                })
+                try:
+                    healed = bool(
+                        self_heal_callback(action, page, idx, error_str),
+                    )
+                except Exception as heal_exc:
+                    logger.debug(
+                        "self_heal_callback raised on idx %d: %s",
+                        idx, heal_exc,
+                    )
+                    healed = False
+                _emit(
+                    emit_event,
+                    "recording_replay_self_healed" if healed
+                    else "recording_replay_self_heal_failed",
+                    {
+                        "submodule_id": submodule_id,
+                        "action_index": idx,
+                        "kind": kind,
+                        "description": description,
+                    },
+                )
+            if healed:
+                out.actions_executed += 1
+                # Settle briefly after a healed action too.
+                try:
+                    page.wait_for_timeout(450)
+                except Exception:
+                    pass
+            else:
+                out.actions_failed += 1
+                out.failed_action_indices.append(idx)
+                _emit(emit_event, "recording_replay_step_failed", {
+                    "submodule_id": submodule_id,
+                    "action_index": idx,
+                    "kind": kind,
+                    "target_text": target_text,
+                    "description": description,
+                    "error": error_str,
+                })
             # Continue on per-action failure — partial replay is
             # better than aborting the whole submodule.
 

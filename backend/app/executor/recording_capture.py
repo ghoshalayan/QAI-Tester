@@ -147,6 +147,246 @@ _CAPTURE_TEMPLATE = r"""
       h: Math.round(r.height),
     };
   }
+  // ── Phase Z.1 — Tricentis-grade fingerprint capture ──────────
+  //
+  // The basic ``selector + rect`` capture was too fragile on Angular
+  // and PrimeNG apps: the recorded selectors (``button.p-ripple``,
+  // ``span.layout-menuitem-text.ng-star-inserted``) match dozens of
+  // elements at replay, and the recorder picks the first one — wrong.
+  //
+  // Tricentis Tosca solves this with a richer per-element fingerprint
+  // that's framework-aware and semantically anchored. We mirror it:
+  //
+  //   - **accessibleName**     The element's computed accessible
+  //                            name (ARIA spec) — the single string
+  //                            screen readers would announce. Stable
+  //                            across class-hash churn.
+  //   - **componentAnchor**    Walks up to the nearest ancestor with
+  //                            a stable identifier (id / data-testid
+  //                            / formControlName / aria-label) and
+  //                            captures THAT. Replay can locate the
+  //                            anchor first, then narrow within.
+  //   - **container**          Nearest semantic container (form,
+  //                            dialog, section, [role=…]) — gives
+  //                            replay a scope to constrain text-only
+  //                            lookups to.
+  //   - **labelText**          Visible label associated with an
+  //                            input via <label for=>, aria-
+  //                            labelledby, or wrapping <label>.
+  //   - **siblingIndex**       Index among same-tag siblings of the
+  //                            parent. Lets replay say "the 3rd
+  //                            button in this form" when text-based
+  //                            matching is ambiguous.
+  //   - **ngReflect**          Compact dump of ng-reflect-* attrs
+  //                            (Angular's data-binding hints) —
+  //                            framework-specific anchor when CSS
+  //                            classes are useless.
+  //   - **formControl**        formControlName / [ng-reflect-name]
+  //                            value. The Angular FORMS API name is
+  //                            usually unique within a form scope.
+  //
+  // Every field is BEST-EFFORT and may be empty. Replay falls back
+  // through them in priority order.
+
+  function isHashedClass(c) {
+    // Match common build-hash patterns: css-XXX, Mui[Word], _ngcontent-*,
+    // *-c123, _xyzABC (Tailwind JIT), bem__hash, etc.
+    if (!c) return true;
+    if (/^css-/.test(c)) return true;
+    if (/^Mui[A-Z]/.test(c)) return true;
+    if (/^_ngcontent/.test(c)) return true;
+    if (/^_nghost/.test(c)) return true;
+    if (/^ng-star-inserted$/.test(c)) return true;
+    if (/^ng-tns-/.test(c)) return true;
+    if (/^p-element$/.test(c)) return true;
+    return false;
+  }
+
+  function computeAccessibleName(el) {
+    // Subset of the ARIA accessible-name algorithm. Good enough to
+    // anchor replay; not 100% spec-compliant.
+    if (!el) return "";
+    // 1) aria-labelledby — concatenate referenced elements' text.
+    const labelledBy = attr(el, "aria-labelledby");
+    if (labelledBy) {
+      const parts = labelledBy.split(/\s+/)
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(e => (e.innerText || e.textContent || "").trim())
+        .filter(Boolean);
+      if (parts.length) return parts.join(" ").slice(0, 120);
+    }
+    // 2) aria-label
+    const ariaLabel = attr(el, "aria-label");
+    if (ariaLabel) return ariaLabel.slice(0, 120);
+    // 3) <label for="id"> association
+    if (el.id) {
+      try {
+        const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+        if (lab) {
+          const t = (lab.innerText || lab.textContent || "").trim();
+          if (t) return t.slice(0, 120);
+        }
+      } catch (e) {}
+    }
+    // 4) Wrapping <label>
+    let p = el.parentElement;
+    let depth = 0;
+    while (p && depth < 3) {
+      if ((p.tagName || "").toLowerCase() === "label") {
+        const t = (p.innerText || p.textContent || "").trim();
+        if (t) return t.slice(0, 120);
+      }
+      p = p.parentElement;
+      depth++;
+    }
+    // 5) title attribute
+    const title = attr(el, "title");
+    if (title) return title.slice(0, 120);
+    // 6) alt for images
+    const alt = attr(el, "alt");
+    if (alt) return alt.slice(0, 120);
+    // 7) placeholder for inputs
+    const placeholder = attr(el, "placeholder");
+    if (placeholder) return placeholder.slice(0, 120);
+    // 8) Text content (last resort)
+    const text = (el.innerText || el.textContent || "").trim();
+    return text.slice(0, 120);
+  }
+
+  function stableAnchorSelector(el) {
+    // Return a stable CSS selector if THIS element has one; empty
+    // string otherwise. Doesn't walk up — caller does that.
+    if (!el) return "";
+    if (el.id && /^[A-Za-z_][\w-]*$/.test(el.id)) {
+      // Bail on common framework-generated ids like ``pn_id_3``,
+      // ``mat-input-7``, ``cdk-overlay-12`` — those rotate.
+      if (!/^(pn_id_|mat-|cdk-|mui-|radix-)/.test(el.id)) {
+        return "#" + el.id;
+      }
+    }
+    const testId = attr(el, "data-testid")
+      || attr(el, "data-test")
+      || attr(el, "data-cy");
+    if (testId) return '[data-testid="' + testId.replace(/"/g, '\\"') + '"]';
+    const formControl = attr(el, "formcontrolname")
+      || attr(el, "ng-reflect-name");
+    if (formControl) {
+      return '[formcontrolname="' + formControl.replace(/"/g, '\\"') + '"]';
+    }
+    const ariaLabel = attr(el, "aria-label");
+    if (ariaLabel) {
+      return '[aria-label="' + ariaLabel.replace(/"/g, '\\"') + '"]';
+    }
+    return "";
+  }
+
+  function findComponentAnchor(el) {
+    // Walk up until we find an element with a stable selector.
+    // Returns null if no anchor within 8 levels (whole page is the
+    // anchor — useless for replay narrowing).
+    let cur = el;
+    let depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 8) {
+      const sel = stableAnchorSelector(cur);
+      if (sel) {
+        return {
+          selector: sel,
+          tag: (cur.tagName || "").toLowerCase(),
+          role: attr(cur, "role"),
+          accessible_name: computeAccessibleName(cur),
+          depth_from_target: depth,
+        };
+      }
+      cur = cur.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  function findContainer(el) {
+    // Nearest semantic container: form / dialog / section / nav /
+    // main / aside / [role="dialog"|"form"|"region"|"main"|"navigation"].
+    const CONTAINER_TAGS = new Set([
+      "form", "dialog", "section", "nav", "main", "aside", "fieldset",
+    ]);
+    const CONTAINER_ROLES = new Set([
+      "dialog", "form", "region", "main", "navigation", "tabpanel",
+      "alertdialog", "search",
+    ]);
+    let cur = el && el.parentElement;
+    let depth = 0;
+    while (cur && cur.nodeType === 1 && depth < 12) {
+      const tag = (cur.tagName || "").toLowerCase();
+      const role = (attr(cur, "role") || "").toLowerCase();
+      if (CONTAINER_TAGS.has(tag) || CONTAINER_ROLES.has(role)) {
+        return {
+          tag: tag,
+          role: role,
+          accessible_name: computeAccessibleName(cur),
+          selector: stableAnchorSelector(cur) || "",
+        };
+      }
+      cur = cur.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  function findLabelText(el) {
+    // For inputs / textareas / selects, the visible label text. We
+    // already roll some of this into accessibleName; expose it
+    // separately for replay strategies that need the label literally.
+    if (!el) return "";
+    const tag = (el.tagName || "").toLowerCase();
+    if (!["input", "textarea", "select"].includes(tag)) return "";
+    if (el.id) {
+      try {
+        const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+        if (lab) return (lab.innerText || lab.textContent || "").trim().slice(0, 80);
+      } catch (e) {}
+    }
+    // Wrapping <label>
+    let p = el.parentElement;
+    let depth = 0;
+    while (p && depth < 3) {
+      if ((p.tagName || "").toLowerCase() === "label") {
+        return (p.innerText || p.textContent || "").trim().slice(0, 80);
+      }
+      p = p.parentElement;
+      depth++;
+    }
+    return "";
+  }
+
+  function siblingIndexOf(el) {
+    if (!el || !el.parentElement) return -1;
+    const tag = el.tagName;
+    let idx = 0;
+    for (const sib of el.parentElement.children) {
+      if (sib === el) return idx;
+      if (sib.tagName === tag) idx++;
+    }
+    return -1;
+  }
+
+  function ngReflectAttrs(el) {
+    // Dump ng-reflect-* attributes — Angular's data-binding hints.
+    // Stable across class-hash changes; often carry semantic info
+    // ("ng-reflect-form-control-name=email", "ng-reflect-router-
+    // link=/admin/roles"). Returns object, empty when none present.
+    if (!el || !el.attributes) return {};
+    const out = {};
+    for (const a of el.attributes) {
+      const n = a.name || "";
+      if (n.startsWith("ng-reflect-")) {
+        const key = n.slice("ng-reflect-".length);
+        out[key] = String(a.value || "").slice(0, 80);
+      }
+    }
+    return out;
+  }
+
   function describeTarget(el) {
     if (!el) return null;
     return {
@@ -161,6 +401,15 @@ _CAPTURE_TEMPLATE = r"""
       title: attr(el, "title"),
       selector: bestSelector(el),
       rect: rectOf(el),
+      // Phase Z.1 — Tricentis-grade fingerprint additions.
+      accessible_name: computeAccessibleName(el),
+      component_anchor: findComponentAnchor(el),
+      container: findContainer(el),
+      label_text: findLabelText(el),
+      sibling_index: siblingIndexOf(el),
+      ng_reflect: ngReflectAttrs(el),
+      form_control: attr(el, "formcontrolname")
+        || attr(el, "ng-reflect-name") || "",
     };
   }
 

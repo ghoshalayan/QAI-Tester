@@ -496,6 +496,26 @@ function RecordingControls({
     },
   });
 
+  // Pause-chunk: parks the recording WITHOUT closing the browser. The
+  // submodule's events stay in the buffer; the operator can pick a
+  // different submodule and Start chunk again. Stop reading remains
+  // the only way to end the whole session.
+  const pauseChunkMut = useMutation({
+    mutationFn: () => api.setActiveSubmodule(projectId, runId, null),
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["recording-state", projectId, runId],
+      });
+      toast.message("Chunk paused", {
+        description: "Captured events kept. Pick another submodule + Start chunk to continue.",
+      });
+    },
+    onError: (e: Error) => {
+      const msg = e instanceof ApiError ? e.message : e.message;
+      toast.error("Could not pause chunk", { description: msg });
+    },
+  });
+
   const findPlanIdFromState = () => {
     // The state endpoint doesn't return plan_id, but we can read it
     // from the agent-run query cache populated by the parent.
@@ -673,14 +693,25 @@ function RecordingControls({
           onClick={() => pickedId !== null && startChunkMut.mutate(pickedId)}
           disabled={pickedId === null || startChunkMut.isPending}
           className="rounded-md border border-emerald-600 bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          title="Attribute subsequent events to the selected submodule"
         >
           {startChunkMut.isPending ? "Switching…" : "▶ Start chunk"}
+        </button>
+        <button
+          type="button"
+          onClick={() => pauseChunkMut.mutate()}
+          disabled={activeSubmoduleId === null || pauseChunkMut.isPending}
+          className="rounded-md border border-amber-500 bg-amber-500 px-3 py-1 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+          title="Pause attribution — captured events kept; pick another submodule next"
+        >
+          {pauseChunkMut.isPending ? "Pausing…" : "⏸ Pause chunk"}
         </button>
         <button
           type="button"
           onClick={onStop}
           disabled={stopping}
           className="rounded-md bg-rose-600 px-3 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-60"
+          title="End the recording session and save all submodule chunks"
         >
           {stopping ? "Stopping…" : "⬛ Stop reading"}
         </button>
@@ -1071,6 +1102,34 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+  // Phase W.6 — per-submodule recording-check diagnostic. Fires
+  // for EVERY submodule whether or not a recording is present, so
+  // the operator can see why some replay and some don't (frozen_path
+  // wiped, overwritten by agent_freeze, or empty).
+  if (type === "submodule_recording_check") {
+    const willReplay = !!data.will_replay;
+    const kind = (data.recording_kind as string | undefined) ?? "none";
+    const count = typeof data.action_count === "number" ? data.action_count : 0;
+    const skip = (data.skip_reason as string | undefined) ?? "";
+    const title = (data.title as string | undefined) ?? "";
+    const reasonLabel =
+      skip === "no_frozen_path" ? "no recording on submodule"
+      : skip === "wrong_kind" ? `overwritten by ${kind}`
+      : skip === "empty_actions" ? "recording is empty"
+      : `${count} actions · kind=${kind}`;
+    return (
+      <Row
+        icon={
+          willReplay
+            ? <Sparkles className="size-3.5 text-emerald-500" />
+            : <AlertTriangle className="size-3.5 text-amber-500" />
+        }
+        label={willReplay ? "replay · recording found" : "replay · skipped (agent will run)"}
+        title={title || undefined}
+        sublabel={reasonLabel}
+      />
+    );
+  }
   // Replay-of-reading events (fired during agentic runs that
   // find a saved reading on a submodule).
   if (type === "submodule_recording_detected") {
@@ -1118,6 +1177,43 @@ function EventRow({ event }: { event: LiveEvent }) {
         label={`step ${(data.action_index as number ?? 0) + 1} · ${data.kind ?? "?"} · FAILED`}
         title={desc || txt || undefined}
         sublabel={data.error as string | undefined}
+      />
+    );
+  }
+  // Phase W.9 — per-action self-heal events. Fired when replay
+  // can't resolve a single action and hands it to the agent for a
+  // one-shot vision-assisted fix. Recording stays canonical; agent
+  // only patches the ONE failed step.
+  if (type === "recording_replay_self_heal_attempting") {
+    const desc = (data.description as string | undefined) ?? "";
+    return (
+      <Row
+        icon={<Sparkles className="size-3.5 text-amber-500" />}
+        label={`step ${(data.action_index as number ?? 0) + 1} · agent healing…`}
+        title={desc || undefined}
+        sublabel={data.error as string | undefined}
+      />
+    );
+  }
+  if (type === "recording_replay_self_healed") {
+    const desc = (data.description as string | undefined) ?? "";
+    return (
+      <Row
+        icon={<CheckCircle2 className="size-3.5 text-emerald-500" />}
+        label={`step ${(data.action_index as number ?? 0) + 1} · healed by agent`}
+        title={desc || undefined}
+        sublabel="vision found the right element — walk continues"
+      />
+    );
+  }
+  if (type === "recording_replay_self_heal_failed") {
+    const desc = (data.description as string | undefined) ?? "";
+    return (
+      <Row
+        icon={<XCircle className="size-3.5 text-rose-500" />}
+        label={`step ${(data.action_index as number ?? 0) + 1} · heal failed`}
+        title={desc || undefined}
+        sublabel="agent could not locate the element — counted as failed"
       />
     );
   }

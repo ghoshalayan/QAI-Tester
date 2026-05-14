@@ -1,0 +1,30 @@
+{"t": "2026-05-13T18:56:14.424865+00:00", "kind": "init", "module_id": 467, "target_url": "https://included-depot-emphasis-submission.trycloudflare.com/", "viewport": {"width": 1920, "height": 1040}}
+{"t": "2026-05-13T18:56:14.477636+00:00", "kind": "init_reentrant", "module_id": 467, "target_url": "https://included-depot-emphasis-submission.trycloudflare.com/", "viewport": {"width": 1920, "height": 1040}}
+{"t": "2026-05-13T18:56:27.446050+00:00", "kind": "set_active_submodule", "submodule_id": 468}
+{"t": "2026-05-13T18:56:32.103798+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 1, "kinds": ["navigate"]}
+{"t": "2026-05-13T18:56:35.301579+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 2, "kinds": ["click"]}
+{"t": "2026-05-13T18:56:40.266966+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 3, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:41.281579+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 4, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:43.442144+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 5, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:45.243437+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 6, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:47.524154+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 7, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:49.996268+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 8, "kinds": ["click"]}
+{"t": "2026-05-13T18:56:55.955696+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 9, "kinds": ["type"]}
+{"t": "2026-05-13T18:56:58.468967+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 10, "kinds": ["type"]}
+{"t": "2026-05-13T18:57:00.829660+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 11, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:02.079723+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 2, "total_for_active": 13, "kinds": ["click", "click"]}
+{"t": "2026-05-13T18:57:03.801930+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 14, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:06.559057+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 15, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:15.572218+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 16, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:21.511193+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 17, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:26.142820+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 18, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:29.427565+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 19, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:33.642319+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 20, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:36.899772+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 21, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:40.829970+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 22, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:43.684448+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 23, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:46.588829+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 24, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:50.004062+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 25, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:52.781356+00:00", "kind": "push_events", "active_submodule_id": 468, "written": 1, "total_for_active": 26, "kinds": ["click"]}
+{"t": "2026-05-13T18:57:56.526379+00:00", "kind": "set_active_submodule", "submodule_id": null}
+{"t": "2026-05-13T18:58:13.680331+00:00", "kind": "finalize", "saved": true, "event_count": 26, "submodules": [{"submodule_id": 468, "saved": true, "event_count": 26}], "module_id": 467}

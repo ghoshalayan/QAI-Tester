@@ -126,17 +126,33 @@ def init_buffer(
 ) -> None:
     """Create the in-memory buffer for a recording run rooted at a
     module. The active submodule starts as None — events are dropped
-    until the operator picks one via set_active_submodule."""
+    until the operator picks one via set_active_submodule.
+
+    Idempotent: the start-recording route calls this synchronously
+    (so the operator can press Start chunk immediately) and the
+    worker thread calls it again as it boots. The second call MUST
+    NOT wipe events the JS already POSTed; we only re-init when no
+    buffer exists for this run yet.
+    """
     with _buffer_lock:
-        _buffers[run_id] = {}
-        _active[run_id] = None
-        _buffer_meta[run_id] = {
-            "module_id": module_id,
-            "target_url": target_url,
-            "viewport": viewport or {"width": 1920, "height": 1040},
-        }
+        already = run_id in _buffers
+        if not already:
+            _buffers[run_id] = {}
+            _active[run_id] = None
+            _buffer_meta[run_id] = {
+                "module_id": module_id,
+                "target_url": target_url,
+                "viewport": viewport or {"width": 1920, "height": 1040},
+            }
+        elif viewport:
+            # Worker may know the real viewport — refresh metadata
+            # but keep the events + active-submodule pointer intact.
+            meta = _buffer_meta.setdefault(run_id, {})
+            meta["viewport"] = viewport
+            meta.setdefault("module_id", module_id)
+            meta.setdefault("target_url", target_url)
     _log_recording_event(
-        run_id, "init",
+        run_id, "init" if not already else "init_reentrant",
         module_id=module_id,
         target_url=target_url,
         viewport=viewport or {"width": 1920, "height": 1040},

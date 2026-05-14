@@ -1706,15 +1706,17 @@ export const api = {
     ),
   /** Phase W' — set which submodule subsequent captured events
    * attribute to. Called when the operator clicks "Start chunk"
-   * on the live presenter after picking a submodule. */
+   * on the live presenter after picking a submodule. Pass
+   * ``null`` to park the recording (Pause chunk) — events are
+   * dropped until another submodule is selected. */
   setActiveSubmodule: (
     projectId: number,
     runId: number,
-    submoduleId: number,
+    submoduleId: number | null,
   ) =>
     apiFetch<{
       run_id: number;
-      active_submodule_id: number;
+      active_submodule_id: number | null;
       per_submodule_counts: Record<string, number>;
     }>(
       `/api/projects/${projectId}/agent-runs/${runId}/active-submodule`,

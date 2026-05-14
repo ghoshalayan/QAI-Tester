@@ -632,6 +632,22 @@ def apply_tc_version_to_live(
         else _project_id_for_plan(db, plan_id)
     )
 
+    # Phase W.6 — harvest user-recorded actions BEFORE deleting the
+    # live tree. Refinement is allowed to invalidate the
+    # agent-derived ``agent_freeze`` blob (that's stale plan-side
+    # data), but it MUST NOT silently throw away ``user_actions``
+    # recordings — those are explicit, expensive operator captures.
+    # We map by original_tc_node_id below to re-attach them to the
+    # rewritten nodes that came from the same source row.
+    preserved_recordings: dict[int, dict] = {}
+    for n in existing_live:
+        fp = n.frozen_path
+        if (
+            isinstance(fp, dict)
+            and str(fp.get("recording_kind") or "") == "user_actions"
+        ):
+            preserved_recordings[n.id] = fp
+
     removed_count = 0
     for n in existing_live:
         db.delete(n)
@@ -641,10 +657,17 @@ def apply_tc_version_to_live(
     # Insert in depth order so parents exist before children.
     snap_to_live: dict[int, TcNode] = {}
     created = 0
+    preserved_reapplied = 0
     for snap in snapshots:
         parent_live = None
         if snap.parent_snapshot_id is not None:
             parent_live = snap_to_live.get(snap.parent_snapshot_id)
+        # Reattach a preserved user-recording when the snapshot links
+        # back to the live row we just deleted.
+        carried_fp = (
+            preserved_recordings.get(snap.original_tc_node_id)
+            if snap.original_tc_node_id is not None else None
+        )
         node = TcNode(
             project_id=project_id,
             plan_id=plan_id,
@@ -663,17 +686,22 @@ def apply_tc_version_to_live(
             selectable_default=snap.selectable_default,
             status="draft",
             source_requirement_ids=[],
-            frozen_path=None,  # invalidated by refinement
+            # Carry user_actions recordings across refinement;
+            # agent_freeze blobs stay invalidated.
+            frozen_path=carried_fp,
         )
         db.add(node)
         db.flush()  # need node.id for children
         snap_to_live[snap.id] = node
+        if carried_fp is not None:
+            preserved_reapplied += 1
         created += 1
 
     return {
         "created": created,
         "updated": 0,
         "removed": removed_count,
+        "preserved_recordings": preserved_reapplied,
     }
 
 
