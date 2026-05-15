@@ -417,6 +417,11 @@ OVERLAY_INIT_SCRIPT = r"""
       'opacity ' + ttl + 'ms ease-out, transform 250ms ease-out';
     ring.style.opacity = '1';
     ring.style.transform = 'scale(1)';
+    // Mark the ring so the universal click listener can ignore
+    // clicks that land on the ring itself (defensive — pointer-
+    // events:none should prevent the click from reaching it, but
+    // the dataset attr is a belt-and-braces guard).
+    ring.dataset.qaiRing = '1';
     document.body.appendChild(ring);
     // Brief pulse, then fade.
     requestAnimationFrame(() => {
@@ -430,6 +435,65 @@ OVERLAY_INIT_SCRIPT = r"""
       try { ring.remove(); } catch (e) {}
     }, ttl + 200);
   };
+
+  // ── Phase AD — universal click ring ──────────────────────────
+  //
+  // Draws the green highlight ring on ANY click that happens on
+  // the page, regardless of source:
+  //   - Agent's executor (page.mouse.click / locator.click)
+  //   - Recording playback walker (already calls __qaiHighlightRect
+  //     pre-click; this listener will add a second ring on the
+  //     actual click event — visually they overlap into one)
+  //   - Operator's manual clicks during a recording session
+  //   - Operator's manual clicks during live-watch (post-test review)
+  //
+  // Capture-phase listener so it fires before the page's own
+  // handlers — works on pages that stop event propagation in
+  // their handlers (e.g. Angular's host stopProp wrappers).
+  //
+  // Idempotent install: if a prior overlay injection on this page
+  // already wired the listener, skip — otherwise navigation +
+  // re-injection would stack listeners and duplicate rings.
+  if (!window.__qaiClickListenerInstalled) {
+    window.__qaiClickListenerInstalled = true;
+    document.addEventListener('click', function (e) {
+      try {
+        const t = e.target;
+        if (!t || !t.getBoundingClientRect) return;
+        // Skip our own UI: narration banner (id="__qai-banner"),
+        // the ring divs themselves (dataset.qaiRing="1"), and
+        // anything inside an element whose id starts with "__qai".
+        if (t.dataset && t.dataset.qaiRing) return;
+        const idStartsWithQai = function (el) {
+          return el && el.id && typeof el.id === 'string'
+            && el.id.indexOf('__qai') === 0;
+        };
+        if (idStartsWithQai(t)) return;
+        if (t.closest) {
+          let cur = t;
+          while (cur && cur !== document.documentElement) {
+            if (idStartsWithQai(cur)) return;
+            cur = cur.parentElement;
+          }
+        }
+        const r = t.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && window.__qaiHighlightRect) {
+          window.__qaiHighlightRect(r.left, r.top, r.width, r.height, 1200);
+          return;
+        }
+        // Zero-size target (svg use-element, span around an icon
+        // that takes no layout, etc.) — fall back to a small
+        // ring centred on the click coordinate.
+        if (window.__qaiHighlightRect) {
+          window.__qaiHighlightRect(
+            e.clientX - 8, e.clientY - 8, 16, 16, 1200,
+          );
+        }
+      } catch (err) {
+        // Never break the page over a highlight failure.
+      }
+    }, true);
+  }
 })();
 """
 
@@ -448,6 +512,64 @@ def install_overlay(page: Page) -> None:
         page.evaluate(OVERLAY_INIT_SCRIPT)
     except Exception as e:
         logger.warning("Failed to install overlay: %s", e)
+
+
+# Phase AF — hide the OS cursor on the page.
+#
+# When the operator is WATCHING an agentic run (not interacting),
+# their idle cursor on top of the browser clutters the view —
+# distracts from the green click-rings the overlay draws and the
+# screenshots the report captures. Inject a CSS rule that suppresses
+# the cursor whenever the mouse is over any element on the page.
+#
+# Effect is scoped to the page's content area. The Chromium chrome
+# (tabs / address bar / menu) keeps its normal cursor — only the
+# rendered viewport hides it. The operator can still position the
+# mouse there; we just don't render a cursor glyph.
+#
+# Recording mode deliberately does NOT call this — the operator needs
+# the cursor visible to click recorded elements accurately.
+
+_CURSOR_HIDE_INIT_SCRIPT = r"""
+(() => {
+  if (window.__qaiCursorHideInstalled) return;
+  window.__qaiCursorHideInstalled = true;
+  const inject = () => {
+    if (!document.documentElement) return false;
+    if (document.getElementById('__qai-cursor-hide-style')) return true;
+    const style = document.createElement('style');
+    style.id = '__qai-cursor-hide-style';
+    // ``cursor: none`` cascades through every descendant unless they
+    // override. The ``!important`` is needed because most apps set
+    // explicit cursors on buttons / inputs / links and would defeat
+    // the rule without it.
+    style.textContent =
+      '*, *::before, *::after { cursor: none !important; }';
+    document.documentElement.appendChild(style);
+    return true;
+  };
+  if (!inject()) {
+    document.addEventListener('DOMContentLoaded', inject, { once: true });
+  }
+})();
+"""
+
+
+def hide_cursor_on_page(page: Page) -> None:
+    """Inject a CSS rule that suppresses the cursor over the page.
+
+    Idempotent + safe to call after :func:`install_overlay`. Failures
+    are logged but never raise — visual polish, not load-bearing.
+
+    Use from agentic / replay runs where the operator is observing.
+    Do NOT use from recording runs (operator needs the cursor to
+    interact with the page).
+    """
+    try:
+        page.context.add_init_script(_CURSOR_HIDE_INIT_SCRIPT)
+        page.evaluate(_CURSOR_HIDE_INIT_SCRIPT)
+    except Exception as e:
+        logger.debug("Failed to install cursor hide: %s", e)
 
 
 def update_narration(

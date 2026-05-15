@@ -57,6 +57,7 @@ from app.executor import (
     execute_action,
     SpeedConfig,
     get_speed_config,
+    hide_cursor_on_page,
     hide_narration,
     install_overlay,
     update_narration,
@@ -933,6 +934,12 @@ def execute_plan(
             # per-step screenshots inherit the cursor position + banner text
             # without any extra plumbing on the timeline side.
             install_overlay(page)
+            # Phase AF — hide the OS cursor on the page content when
+            # running headed. Cleaner screenshots; the agent's click
+            # rings + narration banner aren't competing with the
+            # operator's idle mouse pointer.
+            if not headless:
+                hide_cursor_on_page(page)
 
             for idx, row in enumerate(rows):
                 if is_cancelled and is_cancelled():

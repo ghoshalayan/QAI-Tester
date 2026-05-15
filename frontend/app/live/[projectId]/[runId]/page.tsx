@@ -1458,6 +1458,30 @@ function EventRow({ event }: { event: LiveEvent }) {
       />
     );
   }
+  // Phase AE — cheap-LLM task-completion narration. Fired once
+  // per successful action (agent turn OR replayed trace step).
+  // Indented + green checkmark so completed steps stack visually
+  // under the parent submodule's step_completed row.
+  if (type === "agent_task_completed") {
+    const narration = (data.narration as string | undefined) ?? "";
+    const kind = (data.kind as string | undefined) ?? "";
+    const source = (data.source as string | undefined) ?? "";
+    const taskIdx = data.task_idx ?? "?";
+    if (!narration) return null;
+    return (
+      <div className="ml-6 flex items-start gap-2 rounded border bg-emerald-50/30 px-2 py-1 dark:bg-emerald-950/20">
+        <div className="mt-0.5 shrink-0">
+          <CheckCircle2 className="size-3.5 text-emerald-600" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+            task · {source || "done"} · #{taskIdx}{kind ? ` · ${kind}` : ""}
+          </p>
+          <p className="break-words text-xs text-foreground">{narration}</p>
+        </div>
+      </div>
+    );
+  }
   // Phase AA — operator force-pass event from the runner.
   if (type === "operator_force_pass") {
     const promoted = data.promoted_rows ?? "?";

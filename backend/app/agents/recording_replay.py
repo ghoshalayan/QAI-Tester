@@ -555,6 +555,9 @@ def replay_recording(
     self_heal_callback: Callable[
         [dict[str, Any], "Page", int, str], bool,
     ] | None = None,
+    narrate_callback: Callable[
+        [dict[str, Any], "Page", int, str], str,
+    ] | None = None,
     run_id: int | None = None,
     step_id: int | None = None,
     screenshot_every: int = 5,
@@ -803,6 +806,32 @@ def replay_recording(
                 and ((idx + 1) % screenshot_every == 0 or triggered_nav)
             ):
                 _capture("step", idx)
+            # Phase AE — task-completion narration. Cheap-LLM-driven
+            # past-tense summary of what was just accomplished, one
+            # per action. Emitted as ``agent_task_completed`` so the
+            # live presenter can render a checklist under each
+            # submodule. Failures swallowed — narration is telemetry,
+            # not load-bearing.
+            if narrate_callback is not None:
+                try:
+                    task_narration = narrate_callback(
+                        action, page, idx, description,
+                    )
+                except Exception as ncb_exc:
+                    logger.debug(
+                        "narrate_callback raised on idx %d: %s",
+                        idx, ncb_exc,
+                    )
+                    task_narration = ""
+                if task_narration:
+                    _emit(emit_event, "agent_task_completed", {
+                        "submodule_id": submodule_id,
+                        "step_id": step_id,
+                        "task_idx": idx,
+                        "kind": kind,
+                        "narration": task_narration,
+                        "source": "trace",
+                    })
             # Phase W.8 — navigation-aware settle between actions.
             #
             # If the recording shows the NEXT action happened on a

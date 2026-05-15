@@ -63,6 +63,7 @@ from app.executor import (
     browser_session,
     execute_action,
     get_speed_config,
+    hide_cursor_on_page,
     hide_narration,
     install_overlay,
     update_narration,
@@ -7176,6 +7177,55 @@ def run_agent_for_goal(
         )
         turn_log.append(rec)
 
+        # Phase AE — task-completion narration. After each successful
+        # tool turn (click / type / select / fill_form / verify), ask
+        # the cheap-tier provider to write a 1-line past-tense
+        # summary of what just happened on screen. Emitted as
+        # ``agent_task_completed`` so the live presenter can render a
+        # checklist of completed steps under the parent submodule.
+        # Skipped for failed / blocked / no-op turns (those have
+        # their own act_failed / blocked events).
+        _NARRATABLE_TOOLS = (
+            "click", "type", "select", "fill_form", "verify",
+            "navigate", "scroll", "wait",
+        )
+        if (
+            outcome.get("status") == "ok"
+            and tool in _NARRATABLE_TOOLS
+        ):
+            try:
+                # Compact args repr — strip the noisy interior dict
+                # to keep the cheap-LLM prompt short. Just the keys
+                # + first-value preview is enough context.
+                args_preview = ", ".join(
+                    f"{k}={str(v)[:40]!r}"
+                    for k, v in list(args.items())[:4]
+                ) if isinstance(args, dict) else str(args)[:120]
+                action_summary = (
+                    f"{tool}({args_preview}) — "
+                    f"{(outcome.get('narration') or '')[:120]}"
+                )
+                task_narration = _narrate_completed_task(
+                    cheap_provider or provider,
+                    page,
+                    action_summary=action_summary,
+                    fallback_text=outcome.get("narration") or tool,
+                )
+            except Exception as _nx:
+                logger.debug("task narrator failed mid-turn: %s", _nx)
+                task_narration = (
+                    outcome.get("narration") or tool
+                )[:160]
+            if task_narration:
+                _emit(emit_event, "agent_task_completed", {
+                    "step_id": submodule_step_id,
+                    "submodule_id": submodule_run_id,
+                    "task_idx": turn_idx,
+                    "kind": tool,
+                    "narration": task_narration,
+                    "source": "agent",
+                })
+
         # Phase O.3 — confidence + mistake memory.
         # 1. Track the failed approach when this turn's action failed
         #    so the next planner turn sees a "don't retry" list.
@@ -7496,6 +7546,78 @@ def _select_submodules_to_run(
     # Sort groups by their owner's path in tree order
     groups.sort(key=lambda g: (g[0].depth, g[0].parent_id or 0, g[0].ordinal))
     return groups
+
+
+def _narrate_completed_task(
+    provider: "LLMProvider | None",
+    page,  # noqa: ANN001 — playwright Page
+    *,
+    action_summary: str,
+    fallback_text: str = "",
+) -> str:
+    """Phase AE — cheap-LLM task narrator.
+
+    After a successful step (agent turn or replayed recording action),
+    ask the cheap-tier provider to write ONE past-tense sentence
+    describing what just happened. Goal: a clean, human-readable
+    line for the agent log so the operator sees tasks completing
+    one-by-one under each submodule, in plain language — instead
+    of raw tool args like ``click({target_hint: "button[name='Save']"})``.
+
+    Falls back to ``fallback_text`` (or the action_summary) when:
+    - provider is None or has no vision
+    - the cheap LLM call raises
+    - returned text is empty
+
+    Cost: 1 cheap-tier vision call per completed step. For a typical
+    3-submodule agentic run with ~30 actions total that's ~$0.05.
+    """
+    raw_fallback = (fallback_text or action_summary or "").strip()[:160]
+    if provider is None or not getattr(provider, "supports_vision", False):
+        return raw_fallback or action_summary
+    try:
+        from app.agents.page_intel import (  # noqa: PLC0415
+            capture_screenshot_for_vision,
+        )
+        from app.llm.base import ChatMessage  # noqa: PLC0415
+        shot = capture_screenshot_for_vision(page, downscale=True)
+        result = provider.chat(
+            messages=[
+                ChatMessage(
+                    role="system",
+                    content=(
+                        "You write brief task-completion log lines "
+                        "for a QA testing agent. Given the action "
+                        "just taken and the resulting screen, write "
+                        "ONE past-tense sentence (max 15 words) "
+                        "describing what was just accomplished. "
+                        "Start with a verb. Do NOT add commentary, "
+                        "speculation, or details that aren't on "
+                        "screen. Plain prose only — no markdown, no "
+                        "quotes around the whole sentence."
+                    ),
+                ),
+                ChatMessage(
+                    role="user",
+                    content=f"Action: {action_summary[:240]}",
+                    image=shot,
+                ),
+            ],
+            temperature=0.2,
+            max_output_tokens=80,
+        )
+        out = (result.text or "").strip()
+        # Trim wrapping quotes the model sometimes adds despite the
+        # instruction, then cap length.
+        if (
+            len(out) >= 2
+            and out[0] in ('"', "'") and out[-1] == out[0]
+        ):
+            out = out[1:-1].strip()
+        return (out or raw_fallback)[:200]
+    except Exception as e:
+        logger.debug("task narrator failed: %s", e)
+        return raw_fallback or action_summary
 
 
 def _run_live_watch_mode(
@@ -7887,14 +8009,34 @@ def run_qa_agent_for_plan(
     total_vision_calls = 0
 
     bs_kwargs: dict[str, Any] = {"headless": headless, "speed": speed}
-    if window_position is not None:
-        bs_kwargs["window_position"] = window_position
-    if window_size is not None:
-        bs_kwargs["window_size"] = window_size
+    # Phase AC — agentic runs use ``--start-maximized`` for the headed
+    # browser so the bottom of the page (Save / Submit / footer
+    # buttons) isn't hidden under the Windows taskbar / Mac dock.
+    # With explicit --window-size flags, Chromium ignores work-area
+    # constraints and the window drifts off-screen. The recording
+    # runner already does this; mirror it here so agentic + replay
+    # paths get the same "fully visible viewport" guarantee.
+    # ``maximize`` and explicit position/size are mutually exclusive
+    # in browser.py, so dropping the explicit hints is intentional.
+    if not headless:
+        bs_kwargs["maximize"] = True
+    else:
+        if window_position is not None:
+            bs_kwargs["window_position"] = window_position
+        if window_size is not None:
+            bs_kwargs["window_size"] = window_size
 
     try:
         with browser_session(**bs_kwargs) as page:
             install_overlay(page)
+            # Phase AF — hide the OS cursor on the page content.
+            # The operator is WATCHING this run, not interacting;
+            # their idle cursor clutters screenshots and the agent's
+            # click-ring overlay. Scoped to the rendered viewport
+            # only — the Chromium chrome (tabs, address bar) keeps
+            # the normal cursor.
+            if not headless:
+                hide_cursor_on_page(page)
 
             # Bootstrap navigation: scripted runs typically have an
             # explicit ``navigate`` step authored as the first action,
@@ -8345,6 +8487,46 @@ def run_qa_agent_for_plan(
                                 )
                                 return False
 
+                        # Phase AE — task narrator for replayed
+                        # actions. Cheap-LLM call after each
+                        # successful step writes a 1-line past-tense
+                        # summary; emitted via
+                        # ``agent_task_completed`` so the live feed
+                        # can render the checklist under this
+                        # submodule. Skip when no vision-capable
+                        # cheap provider; the replay walker falls
+                        # back to the rule-based description string.
+                        narrate_provider = heal_provider  # same tier
+                        def _narrate_replay_action(
+                            action: dict[str, Any],
+                            narrate_page,  # noqa: ANN001
+                            _action_idx: int,
+                            description: str,
+                        ) -> str:
+                            if narrate_provider is None:
+                                return ""
+                            kind = str(action.get("kind") or "")
+                            target = (
+                                action.get("target")
+                                if isinstance(action.get("target"), dict)
+                                else None
+                            )
+                            target_label = (
+                                (target.get("text") if target else "")
+                                or (target.get("aria_label") if target else "")
+                                or ""
+                            )[:60]
+                            summary = (
+                                f"{kind} {target_label!r} "
+                                f"({description})"
+                            ) if target_label else description
+                            return _narrate_completed_task(
+                                narrate_provider,
+                                narrate_page,
+                                action_summary=summary,
+                                fallback_text=description,
+                            )
+
                         rep = replay_recording(
                             page,
                             recording=rec,
@@ -8352,6 +8534,7 @@ def run_qa_agent_for_plan(
                             is_cancelled=is_cancelled,
                             submodule_id=submodule.id,
                             self_heal_callback=_heal_one_action,
+                            narrate_callback=_narrate_replay_action,
                             run_id=run_id,
                             step_id=row.id,
                         )
@@ -8427,23 +8610,28 @@ def run_qa_agent_for_plan(
                         ) + 1
                     else:
                         # status == "failed" / "cancelled" / unknown.
-                        row_status = (
-                            "cancelled" if status_raw == "cancelled"
-                            else "inconclusive"
-                        )
+                        # NOTE: execution_steps.status CHECK constraint
+                        # only allows pending/running/passed/failed/
+                        # skipped/blocked/inconclusive — NOT
+                        # "cancelled". When the inner replay loop
+                        # exited via the cancel-equivalent signal
+                        # (Stop button OR force-pass via the combined
+                        # cancel lambda), we map that to "inconclusive"
+                        # here. The post-loop branch will then either:
+                        # - cancel path: re-mark pending/running rows
+                        #   as "skipped" (this row is already terminal
+                        #   inconclusive, untouched).
+                        # - force-pass path: overwrite to "passed"
+                        #   with the operator audit narration.
+                        row_status = "inconclusive"
                         narration = (
                             f"Trace playback {status_raw or 'failed'} — "
                             f"{executed_count} executed, "
                             f"{failed_count} failed."
                         )
-                        if row_status == "cancelled":
-                            counts["cancelled"] = counts.get(
-                                "cancelled", 0,
-                            ) + 1
-                        else:
-                            counts["inconclusive"] = counts.get(
-                                "inconclusive", 0,
-                            ) + 1
+                        counts["inconclusive"] = counts.get(
+                            "inconclusive", 0,
+                        ) + 1
                     row.status = row_status
                     row.completed_at = _utcnow()
                     row.duration_ms = int(

@@ -38,6 +38,7 @@ from app.executor import (
     browser_session,
     execute_action,
     get_speed_config,
+    hide_cursor_on_page,
     hide_narration,
     install_overlay,
     update_narration,
@@ -1109,6 +1110,11 @@ def run_replay_for_plan(
     try:
         with browser_session(**bs_kwargs) as page:
             install_overlay(page)
+            # Phase AF — hide the OS cursor when the operator is
+            # watching (not interacting). Cleaner screenshots, no
+            # idle cursor over the agent's click rings.
+            if not headless:
+                hide_cursor_on_page(page)
 
             # Initial navigation — same as agentic mode.
             target_url = plan.target_url or ""

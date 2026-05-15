@@ -22,6 +22,7 @@ from app.executor.browser import (
     chromium_installed,
 )
 from app.executor.overlay import (
+    hide_cursor_on_page,
     hide_narration,
     highlight_target,
     install_overlay,
@@ -58,6 +59,7 @@ __all__ = [
     "chromium_installed",
     "execute_action",
     "get_speed_config",
+    "hide_cursor_on_page",
     "hide_narration",
     "highlight_target",
     "install_overlay",
