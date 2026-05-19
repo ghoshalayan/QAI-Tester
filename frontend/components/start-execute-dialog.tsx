@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bot,
-  Circle,
   Eye,
   EyeOff,
   Gauge,
@@ -892,8 +891,8 @@ function ModePicker({
           )}
         >
           <span className="flex items-center gap-1.5 text-sm font-medium">
-            <Circle className="size-4 fill-rose-500 text-rose-500" />
-            Read
+            <Eye className="size-4 text-sky-500" />
+            Observe the system as observer
           </span>
           <span className="text-[11px] text-muted-foreground">
             Open a browser, click/type yourself. Saved per

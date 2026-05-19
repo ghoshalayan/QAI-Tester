@@ -1,0 +1,13 @@
+{"t": "2026-05-19T03:57:38.784424+00:00", "kind": "init", "module_id": 467, "target_url": "https://included-depot-emphasis-submission.trycloudflare.com/", "viewport": {"width": 1920, "height": 1040}}
+{"t": "2026-05-19T03:57:38.794762+00:00", "kind": "init_reentrant", "module_id": 467, "target_url": "https://included-depot-emphasis-submission.trycloudflare.com/", "viewport": {"width": 1920, "height": 1040}}
+{"t": "2026-05-19T03:58:05.163335+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["navigate"]}
+{"t": "2026-05-19T03:58:14.747523+00:00", "kind": "push_events_no_active_chunk", "dropped": 2, "sample_kinds": ["click", "click"]}
+{"t": "2026-05-19T03:58:15.774771+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["click"]}
+{"t": "2026-05-19T03:58:24.079785+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["type"]}
+{"t": "2026-05-19T03:58:24.829403+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["type"]}
+{"t": "2026-05-19T03:58:26.753973+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["type"]}
+{"t": "2026-05-19T03:58:27.913366+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["type"]}
+{"t": "2026-05-19T03:58:29.587553+00:00", "kind": "push_events_no_active_chunk", "dropped": 2, "sample_kinds": ["key", "type"]}
+{"t": "2026-05-19T03:58:43.420815+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["type"]}
+{"t": "2026-05-19T03:58:44.622227+00:00", "kind": "push_events_no_active_chunk", "dropped": 3, "sample_kinds": ["type", "key", "click"]}
+{"t": "2026-05-19T03:58:59.051783+00:00", "kind": "push_events_no_active_chunk", "dropped": 1, "sample_kinds": ["click"]}
